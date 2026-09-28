@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from muze.provider.milky.models import (
     Event,
+    ForwardedMessage,
     Friend,
     Group,
     HistoryResult,
@@ -138,7 +139,7 @@ class ProtocolAdapter(ABC):
     @abstractmethod
     async def get_group_file_url(self, group_id: int, file_id: str) -> str: ...
 
-    async def get_forwarded_messages(self, forward_id: str) -> list[IncomingMessage]:
+    async def get_forwarded_messages(self, forward_id: str) -> list[ForwardedMessage]:
         raise NotSupported("forwarded messages not supported by this protocol side")
 
     async def mark_read(self, scene: str, peer_id: int, message_seq: int) -> None:
