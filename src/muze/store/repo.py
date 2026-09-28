@@ -25,9 +25,12 @@ class Repository:
         msg: IncomingMessage,
         text_content: str,
         source: str,
-        sender_name: str = "",
+        conv_name: str = "",
     ) -> bool:
-        """Insert a message; returns True when it was new (not a duplicate)."""
+        """Insert a message; returns True when it was new (not a duplicate).
+
+        conv_name is the conversation's display name (group name / friend
+        remark), stored on conversations.name when non-empty."""
         raw = msg.model_dump(mode="json", exclude_none=True)
         cur = await self.conn.execute(
             """
@@ -51,7 +54,7 @@ class Repository:
         )
         inserted = cur.rowcount > 0
         if inserted:
-            await self._touch_conversation(msg, sender_name)
+            await self._touch_conversation(msg, conv_name)
         await self.conn.commit()
         return inserted
 

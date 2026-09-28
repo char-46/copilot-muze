@@ -94,12 +94,36 @@ class ProtocolAdapter(ABC):
     @abstractmethod
     async def get_group_list(self) -> list[Group]: ...
 
+    async def get_group_info(self, group_id: int) -> Group:
+        """Single group info (name); used for lazy name resolution."""
+        raise NotSupported("get_group_info not supported by this protocol side")
+
+    async def ensure_group_name(self, group_id: int) -> str:
+        """Best-effort group display name; cached, lazy network fallback."""
+        return ""
+
     @abstractmethod
     async def get_group_member_name(self, group_id: int, user_id: int) -> str:
         """Best-effort display name for a group member (cached)."""
 
+    async def get_friend_info(self, user_id: int) -> Friend:
+        """Single friend info; used for lazy name resolution."""
+        raise NotSupported("get_friend_info not supported by this protocol side")
+
+    async def ensure_friend_name(self, user_id: int) -> str:
+        """Best-effort friend display name; cached, lazy network fallback."""
+        return ""
+
     async def get_friend_name(self, user_id: int) -> str:
         """Best-effort display name for a friend (cached). May hit network."""
+        return ""
+
+    def cached_friend_name(self, user_id: int) -> str:
+        """Sync cache-only lookup; no network."""
+        return ""
+
+    def cached_group_name(self, group_id: int) -> str:
+        """Sync cache-only lookup; no network."""
         return ""
 
     # ---- messaging ----------------------------------------------------

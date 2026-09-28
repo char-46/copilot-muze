@@ -153,6 +153,7 @@ class MilkyAdapter(ProtocolAdapter):
     # ------------------------------------------------------------ identity
     async def get_login_info(self) -> LoginInfo:
         data = await self.client.call("get_login_info", {})
+        log.debug("get_login_info raw: %r", data)
         return LoginInfo.model_validate(data or {})
 
     async def get_friend_list(self) -> list[Friend]:
@@ -162,12 +163,48 @@ class MilkyAdapter(ProtocolAdapter):
             self._friend_names[f.user_id] = f.display
         return friends
 
+    async def get_friend_info(self, user_id: int) -> Friend:
+        data = await self.client.call("get_friend_info", {"user_id": user_id})
+        f = Friend.model_validate(data or {})
+        if f.display:
+            self._friend_names[f.user_id] = f.display
+        return f
+
+    async def ensure_friend_name(self, user_id: int) -> str:
+        name = self._friend_names.get(user_id)
+        if name:
+            return name
+        try:
+            f = await self.get_friend_info(user_id)
+            return f.display
+        except (ProtocolError, Exception) as e:
+            log.debug("friend name lookup failed u=%s: %s", user_id, e)
+            return ""
+
     async def get_group_list(self) -> list[Group]:
         data = await self.client.call("get_group_list", {})
         groups = [Group.model_validate(x) for x in _first_list(data, "groups")]
         for g in groups:
             self._group_names[g.group_id] = g.group_name
         return groups
+
+    async def get_group_info(self, group_id: int) -> Group:
+        data = await self.client.call("get_group_info", {"group_id": group_id})
+        g = Group.model_validate(data or {})
+        if g.group_name:
+            self._group_names[g.group_id] = g.group_name
+        return g
+
+    async def ensure_group_name(self, group_id: int) -> str:
+        name = self._group_names.get(group_id)
+        if name:
+            return name
+        try:
+            g = await self.get_group_info(group_id)
+            return g.group_name
+        except (ProtocolError, Exception) as e:
+            log.debug("group name lookup failed g=%s: %s", group_id, e)
+            return ""
 
     async def get_group_member_name(self, group_id: int, user_id: int) -> str:
         key = (group_id, user_id)

@@ -56,6 +56,17 @@ class IngestPipeline:
             return ""
         return ""
 
+    async def conversation_name(self, msg: IncomingMessage) -> str:
+        """Display name of the conversation itself (not the message sender)."""
+        try:
+            if msg.message_scene == "group":
+                return await self.adapter.ensure_group_name(msg.peer_id)
+            if msg.message_scene == "friend":
+                return await self.adapter.ensure_friend_name(msg.peer_id)
+        except Exception:
+            return ""
+        return ""
+
     def _queue_media(self, media_id: int | None, prefer_url: str | None) -> None:
         if media_id is None:
             return
@@ -80,8 +91,9 @@ class IngestPipeline:
         if not describe_watch(self.cfg, msg.message_scene, msg.peer_id):
             return False
         name = await self.sender_display(msg)
+        conv_name = await self.conversation_name(msg)
         text = plain_text(msg.segments)
-        inserted = await self.repo.upsert_message(msg, text, source, sender_name=name)
+        inserted = await self.repo.upsert_message(msg, text, source, conv_name=conv_name)
         if not inserted:
             return False
 

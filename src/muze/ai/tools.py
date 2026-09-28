@@ -208,18 +208,27 @@ class ToolRunner:
             active_within_h=args.get("active_within_hours", 72),
             limit=min(args.get("limit", 20), 100),
         )
-        return {
-            "conversations": [
+        convs = []
+        for r in rows:
+            name = r["name"]
+            if not name:
+                try:
+                    if r["scene"] == "group":
+                        name = await self.adapter.ensure_group_name(r["peer_id"])
+                    else:
+                        name = await self.adapter.ensure_friend_name(r["peer_id"])
+                except Exception:
+                    name = ""
+            convs.append(
                 {
                     "scene": r["scene"],
                     "peer_id": r["peer_id"],
-                    "name": r["name"],
+                    "name": name,
                     "messages": r["message_count"],
                     "last_active": epoch_iso(r["last_active_at"]),
                 }
-                for r in rows
-            ]
-        }
+            )
+        return {"conversations": convs}
 
     async def t_search_messages(self, args: dict) -> dict:
         rows = await self.repo.search_messages(

@@ -72,7 +72,9 @@ actually supports and degrades lazily.
      the log. Conversations, media preview, full-text search, AI chat, pending
      confirmations, log tail, capability panel.
    - **CLI**: `uv run muze cli` — same command set; sends execute immediately
-     (your local console is you).
+     (your local console is you). `muze serve` also opens an interactive
+     console on its own stdin when running in a foreground terminal
+     (`/help`, `/shutdown`, Ctrl+C; set `MUZE_FORCE_CONSOLE=1` to force).
 
 ## Commands (QQ / Web / CLI share one implementation)
 

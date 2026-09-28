@@ -72,12 +72,12 @@ class ControlService:
             raise ValueError(f"unknown scene: {scene}")
         return scene, peer_i
 
-    @staticmethod
-    def _target_label(adapter: ProtocolAdapter, scene: str, peer: int) -> str:
+    async def target_label(self, scene: str, peer: int) -> str:
+        """Conversation label with lazily-resolved names."""
         if scene == "group":
-            name = getattr(adapter, "cached_group_name", lambda _p: "")(peer)
+            name = await self.adapter.ensure_group_name(peer)
             return f"{conv_id(scene, peer)} {name}".strip()
-        name = getattr(adapter, "cached_friend_name", lambda _p: "")(peer)
+        name = await self.adapter.ensure_friend_name(peer)
         return f"{conv_id(scene, peer)} {name}".strip()
 
     # -------------------------------------------------------------- routes
@@ -139,7 +139,7 @@ class ControlService:
         else:
             res = await self.adapter.send_private_message(peer_id, segments)
         self.chatlog.sent(scene, peer_id, res.message_seq, preview)
-        return CommandOutcome(f"已发送到 {self._target_label(self.adapter, scene, peer_id)} (seq={res.message_seq})")
+        return CommandOutcome(f"已发送到 {await self.target_label(scene, peer_id)} (seq={res.message_seq})")
 
     async def request_send(
         self,
@@ -164,7 +164,7 @@ class ControlService:
         )
         self.chatlog.confirm(action_id, f"pending send -> {conv_id(scene, peer_id)}: {preview}")
         return CommandOutcome(
-            f"待确认 #{action_id}: 将以被控号向 {self._target_label(self.adapter, scene, peer_id)} 发送:\n"
+            f"待确认 #{action_id}: 将以被控号向 {await self.target_label(scene, peer_id)} 发送:\n"
             f"-----\n{preview[:800]}\n-----\n"
             f"回复 /confirm {action_id} 发送，/cancel {action_id} 取消"
         )
@@ -187,6 +187,7 @@ class ControlService:
             "/send <scene/peer> <内容> - 以被控号发消息\n"
             "/reply <scene/peer> [seq] <内容> - 以被控号回复\n"
             "/markread <scene/peer> [seq] - 标记已读\n"
+            "/shutdown - 停止服务（仅本地 console/CLI 生效）\n"
             "其余文字将交给 AI 助手理解（需配置 llm）"
         )
 
@@ -302,7 +303,7 @@ class ControlService:
         for r in rows:
             msgs = await self.repo.get_messages(r["scene"], r["peer_id"], limit=1)
             preview = (msgs[0]["text_content"][:40] if msgs else "") or "(无文本)"
-            label = self._target_label(self.adapter, r["scene"], r["peer_id"])
+            label = await self.target_label(r["scene"], r["peer_id"])
             lines.append(f"{label} [{r['message_count']}条] {epoch_iso(r['last_active_at'])}: {preview}")
         return CommandOutcome("近24h活跃会话:\n" + "\n".join(lines))
 
@@ -316,7 +317,7 @@ class ControlService:
             return CommandOutcome(f"没有匹配 “{query}” 的消息")
         lines = []
         for r in rows[:limit]:
-            label = self._target_label(self.adapter, r["scene"], r["peer_id"])
+            label = await self.target_label(r["scene"], r["peer_id"])
             lines.append(
                 f"{label} seq={r['message_seq']} {epoch_iso(r['time'])} "
                 f"[{r['sender_id']}] {r['text_content'][:60]}"
@@ -342,7 +343,7 @@ class ControlService:
         msg = IncomingMessage.from_raw(raw)
         segs = " ".join(render_segment(s) for s in msg.segments)
         return CommandOutcome(
-            f"{self._target_label(self.adapter, scene, peer)} seq={seq}\n"
+            f"{await self.target_label(scene, peer)} seq={seq}\n"
             f"sender={row['sender_id']} time={epoch_iso(row['time'])} "
             f"recalled={bool(row['recalled'])} source={row['source']}\n"
             f"内容: {segs}\n媒体: {media_desc}"

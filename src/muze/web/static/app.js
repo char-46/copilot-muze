@@ -6,6 +6,7 @@ const $$ = (s) => document.querySelectorAll(s);
 
 let TOKEN = localStorage.getItem("muze_token") || "";
 $("#token").value = TOKEN;
+let authorized = !!TOKEN;
 
 async function api(path, opts = {}) {
   const o = Object.assign({}, opts);
@@ -15,9 +16,22 @@ async function api(path, opts = {}) {
     o.headers["Content-Type"] = "application/json";
   }
   const r = await fetch(path, o);
-  if (r.status === 401) { $("#statusdot").className = "dot off"; throw new Error("unauthorized"); }
+  if (r.status === 401) {
+    $("#statusdot").className = "dot off";
+    authorized = false;
+    const e = new Error("unauthorized");
+    e.unauthorized = true;
+    throw e;
+  }
   $("#statusdot").className = "dot on";
+  authorized = true;
   return r.json();
+}
+
+function authHint() {
+  return authorized
+    ? ""
+    : '<div class="dim pad">未授权：请把 data/logs/muze.log 中 WEBUI 行的 token 填到右上角并点“保存”</div>';
 }
 
 function esc(s) {
@@ -45,8 +59,15 @@ $$("nav button").forEach((b) => b.addEventListener("click", () => {
 $("#saveToken").addEventListener("click", () => {
   TOKEN = $("#token").value.trim();
   localStorage.setItem("muze_token", TOKEN);
-  loadInfo();
+  refreshAll();
 });
+
+/* refresh everything after (re)authorization */
+function refreshAll() {
+  loadInfo();
+  loadConversations();
+  pendingBadgeReload();
+}
 
 /* ---------------- info ---------------- */
 async function loadInfo() {
@@ -90,7 +111,9 @@ async function loadConversations() {
       box.appendChild(div);
     }
   } catch (e) {
-    box.innerHTML = '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+    box.innerHTML = e.unauthorized
+      ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
   }
 }
 
@@ -256,7 +279,9 @@ async function loadPending() {
       box.appendChild(card);
     }
   } catch (e) {
-    box.innerHTML = '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+    box.innerHTML = e.unauthorized
+      ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
   }
 }
 async function pendingBadgeReload() {
@@ -286,6 +311,5 @@ async function loadStatus() {
 }
 
 /* ---------------- boot ---------------- */
-loadInfo();
-loadConversations();
+refreshAll();
 setInterval(loadInfo, 30000);
