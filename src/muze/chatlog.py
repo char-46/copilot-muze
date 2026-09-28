@@ -19,6 +19,32 @@ from muze.version import epoch_iso
 CHAT_LOGGER = "muze.chat"
 
 
+class ConsoleStreamHandler(logging.StreamHandler):
+    """stdout handler that cooperates with the embedded console prompt.
+
+    When a fallback-mode ``muze> `` prompt is sitting on the current line,
+    clear that line back to column 0 before emitting the log record, then
+    redraw a bare prompt so the terminal stays usable.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from muze import console as _console
+
+            msg = self.format(record)
+            with _console.io_lock():
+                if _console.prompt_shown():
+                    self.stream.write(_console.clear_line_seq())
+                self.stream.write(msg + self.terminator)
+                if _console.prompt_shown():
+                    self.stream.write("muze> ")
+                self.flush()
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(log_cfg: LogConfig, storage_cfg: StorageConfig) -> Path:
     log_dir = Path(log_cfg.file or "").parent if log_cfg.file else storage_cfg.logs_dir
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -32,7 +58,7 @@ def setup_logging(log_cfg: LogConfig, storage_cfg: StorageConfig) -> Path:
     root.setLevel(getattr(logging, log_cfg.level.upper(), logging.INFO))
     root.handlers.clear()
 
-    console = logging.StreamHandler()
+    console = ConsoleStreamHandler()
     console.setFormatter(fmt)
     root.addHandler(console)
 

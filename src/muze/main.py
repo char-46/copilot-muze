@@ -122,34 +122,16 @@ class App:
         if not forced and not (sys.stdin.isatty() and sys.stdout.isatty()):
             log.info("stdin is not a tty; console disabled (use `muze cli`, the webui, or MUZE_FORCE_CONSOLE=1)")
             return
-        t = threading.Thread(target=self._console_thread, name="muze-console", daemon=True)
+        t = threading.Thread(
+            target=self._console_thread,
+            name="muze-console",
+            daemon=True,
+        )
         t.start()
 
     def _console_thread(self) -> None:
-        print("muze console: /help 命令列表 · /shutdown 停止服务 · Ctrl+C 也可退出", flush=True)
-        while not self._stop.is_set():
-            try:
-                line = input("muze> ")
-            except (EOFError, KeyboardInterrupt):
-                self._loop.call_soon_threadsafe(self._stop.set)
-                return
-            line = line.strip()
-            if not line:
-                continue
-            if line in ("/exit", "/quit", "/q"):
-                print("console closed (service keeps running)", flush=True)
-                return
-            if line == "/shutdown":
-                self._loop.call_soon_threadsafe(self._stop.set)
-                print("shutting down...", flush=True)
-                return
-            fut = asyncio.run_coroutine_threadsafe(self._exec_console(line), self._loop)
-            try:
-                fut.result(timeout=300)
-            except Exception as e:
-                print(f"[x] {e}", flush=True)
+        from muze.console import repl_thread
 
-    async def _exec_console(self, line: str) -> None:
         ctx = ControlContext(
             source="cli",
             chat_key="cli:console",
@@ -158,17 +140,11 @@ class App:
             user_label="console",
             auto_confirm=True,
         )
+        history = self.cfg.storage.data_dir / "console_history"
         try:
-            outcome = await self.service.execute(line, ctx)
-        except Exception as e:
-            print(f"[x] {e}", flush=True)
-            return
-        if outcome.is_error:
-            print(f"[x] {outcome.text}", flush=True)
-        elif outcome.text:
-            print(outcome.text, flush=True)
-        for p in outcome.media_paths:
-            print(f"  [media] {p}", flush=True)
+            repl_thread(self._loop, self.service, ctx, history, self._stop)
+        except Exception:
+            log.exception("console thread crashed")
 
     async def dispatch(self, ev: Event) -> None:
         try:

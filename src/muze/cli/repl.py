@@ -16,6 +16,7 @@ from muze.ai.agent import Agent
 from muze.ai.llm import LLMClient
 from muze.chatlog import ChatLog, setup_logging
 from muze.config import load_config
+from muze.console import repl_async
 from muze.core.service import ControlContext, ControlService, Runtime
 from muze.provider.base import ProtocolError
 from muze.provider.milky.adapter import MilkyAdapter
@@ -28,29 +29,6 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="muze cli", description="copilot-muze interactive console")
     p.add_argument("-c", "--config", default="config.yaml", help="path to config.yaml")
     return p.parse_args(argv)
-
-
-async def repl_loop(service: ControlService, ctx: ControlContext) -> None:
-    loop = asyncio.get_running_loop()
-    print("输入 /help 查看命令；直接说话交给 AI；/exit 退出。", flush=True)
-    while True:
-        try:
-            line = await loop.run_in_executor(None, lambda: input("muze> "))
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        line = line.strip()
-        if not line:
-            continue
-        if line in ("/exit", "/quit", "/q"):
-            return
-        outcome = await service.execute(line, ctx)
-        if outcome.is_error:
-            print(f"[x] {outcome.text}", flush=True)
-        elif outcome.text:
-            print(outcome.text, flush=True)
-        for p in outcome.media_paths:
-            print(f"  [media] {p}", flush=True)
 
 
 def run_cli(argv: list[str]) -> int:
@@ -88,8 +66,9 @@ def run_cli(argv: list[str]) -> int:
             auto_confirm=True,
         )
         print(f"muze {get_version()} | self={login.user_id} | db={cfg.storage.db_path}", flush=True)
+        history = cfg.storage.data_dir / "console_history"
         try:
-            await repl_loop(service, ctx)
+            await repl_async(service, ctx, history)
         finally:
             await adapter.close()
             await conn.close()
