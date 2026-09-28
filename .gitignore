@@ -1,0 +1,29 @@
+# data & runtime
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# tooling
+.mypy_cache/
+.ruff_cache/
+
+# secrets
+config.yaml
+*.local.yaml
+.env
+
+# os
+Thumbs.db
+.DS_Store

@@ -1,0 +1,37 @@
+[project]
+name = "copilot-muze"
+description = "Personal QQ copilot: message archive, roaming backfill, multimodal assistant. Speaks the Milky protocol (LLBot / Lagrange.Milky) and reserves a provider seam for raw Lagrange."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "muze" }]
+# Pre-release is bumped per feature commit; build metadata (git sha, build time)
+# is appended at runtime by muze.version.get_version().
+version = "0.1.0a1"
+dependencies = [
+    "aiohttp>=3.9",
+    "aiosqlite>=0.20",
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+    "openai>=1.40",
+]
+
+[project.scripts]
+muze = "muze.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/muze"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
