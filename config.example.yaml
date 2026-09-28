@@ -1,0 +1,60 @@
+# copilot-muze configuration
+# Copy to config.yaml and adjust. `config.yaml` is gitignored.
+
+milky:
+  # LLBot (or Lagrange.Milky) serving the Milky protocol.
+  base_url: http://127.0.0.1:8080
+  access_token: ""
+  reconnect_interval: 5      # seconds between WS reconnect attempts
+  request_timeout: 30        # seconds for HTTP API calls
+
+storage:
+  data_dir: ./data           # muze.db, media/, logs/ live under here
+
+ingest:
+  # all      -> every friend chat and every group is archived + backfilled
+  # watchlist-> only conversations in watchlist (control chats always ingested)
+  scope: all
+  watchlist:
+    friends: []              # e.g. [10001, 10002]
+    groups: []               # e.g. [123456789]
+  backfill:
+    on_start: true           # roaming pull at startup
+    max_pages_per_conv: 200  # hard stop per conversation (page = up to page_limit msgs)
+    page_limit: 30           # Milky max is 30
+    page_delay: 1.0          # seconds between pages (rate-limit safety)
+    conv_delay: 0.5          # seconds between conversations
+    rescan_interval_min: 30  # periodic rescan (catches self-sent + missed events); 0 = off
+    rescan_active_window_h: 24  # rescan only conversations active within this window
+  media_download_concurrency: 3
+
+control:
+  admin_users: []            # controller QQ uins allowed to command the copilot
+  control_group: 0           # group id used as control room; 0 = disabled
+  private_control: true      # admins may command via private chat
+  group_trigger: at_or_slash # in control group: @bot or /command; "all" = every message
+  confirm_all_sends: true    # every outgoing message requires confirmation in a control session
+  confirm_timeout_min: 30    # pending confirmations expire after this
+
+llm:
+  chat:                      # any OpenAI-compatible endpoint (GLM / DeepSeek / MiMo ...)
+    base_url: https://open.bigmodel.cn/api/paas/v4/
+    api_key: ""
+    model: glm-4.7
+    temperature: 0.4
+  vision:                    # multimodal model for images; empty model disables vision
+    base_url: ""             # empty -> reuse chat.base_url / chat.api_key
+    api_key: ""
+    model: ""                # e.g. glm-4v-plus
+  agent_max_steps: 8
+  asr_provider: ""           # reserved (voice transcription lands later)
+
+web:
+  enabled: true
+  host: 127.0.0.1
+  port: 8300
+  token: ""                  # empty -> random token generated and logged at startup
+
+log:
+  level: INFO                # DEBUG for verbose protocol traffic
+  file: ""                   # empty -> data_dir/logs/muze.log (appended, never rotated)
