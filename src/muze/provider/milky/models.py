@@ -167,15 +167,25 @@ _segment_item = TypeAdapter(KnownSegment)
 
 
 def parse_segments(raw: Any) -> list[Segment]:
+    """Accept both wire shape ({type, data:{...}}) and flat shape (model_dump)."""
     if not isinstance(raw, list):
         return []
     out: list[Segment] = []
     for item in raw:
+        if not isinstance(item, dict):
+            out.append(UnknownSeg(type="unknown", raw={}))
+            continue
+        candidate = item
+        if isinstance(item.get("data"), dict) and "type" in item:
+            candidate = {"type": item["type"], **item["data"]}
         try:
-            out.append(_segment_item.validate_python(item))
+            parsed = _segment_item.validate_python(candidate)
+            if isinstance(parsed, ReplySeg) and parsed.segments and isinstance(parsed.segments[0], dict):
+                parsed.segments = parse_segments(parsed.segments)
+            out.append(parsed)
         except Exception:
-            t = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
-            out.append(UnknownSeg(type=str(t), raw=item if isinstance(item, dict) else {}))
+            t = item.get("type", "unknown")
+            out.append(UnknownSeg(type=str(t), raw=item))
     return out
 
 
