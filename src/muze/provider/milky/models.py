@@ -6,9 +6,9 @@ types degrade gracefully per the spec's compatibility guidance.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, TypeAdapter
 
 Scene = Literal["friend", "group", "temp"]
 
@@ -45,7 +45,7 @@ class ReplySeg(_M):
     sender_id: int | None = None
     sender_name: str | None = None
     time: int | None = None
-    segments: list["Segment"] = Field(default_factory=list)
+    segments: SkipValidation[list[Segment]] = Field(default_factory=list)
 
 
 class ImageSeg(_M):
@@ -123,7 +123,8 @@ class UnknownSeg(_M):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
-Segment = Annotated[
+# Discriminated union over the known segment types (spec v1.3).
+KnownSegment = Annotated[
     TextSeg
     | MentionSeg
     | MentionAllSeg
@@ -137,12 +138,32 @@ Segment = Annotated[
     | MarketFaceSeg
     | LightAppSeg
     | XmlSeg
-    | MarkdownSeg
-    | UnknownSeg,
+    | MarkdownSeg,
     Field(discriminator="type"),
 ]
 
-_segment_list = TypeAdapter(list[Segment])
+# App-side segment value: a known segment or an UnknownSeg fallback.
+# Fields typed with Segment must use SkipValidation; parsing goes through
+# parse_segments(), which degrades unknown types per the spec.
+Segment = Union[
+    TextSeg,
+    MentionSeg,
+    MentionAllSeg,
+    FaceSeg,
+    ReplySeg,
+    ImageSeg,
+    RecordSeg,
+    VideoSeg,
+    FileSeg,
+    ForwardSeg,
+    MarketFaceSeg,
+    LightAppSeg,
+    XmlSeg,
+    MarkdownSeg,
+    UnknownSeg,
+]
+
+_segment_item = TypeAdapter(KnownSegment)
 
 
 def parse_segments(raw: Any) -> list[Segment]:
@@ -151,10 +172,10 @@ def parse_segments(raw: Any) -> list[Segment]:
     out: list[Segment] = []
     for item in raw:
         try:
-            out.append(_segment_list.validate_python([item])[0])
+            out.append(_segment_item.validate_python(item))
         except Exception:
             t = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
-            out.append(UnknownSeg(type=t, raw=item if isinstance(item, dict) else {}))
+            out.append(UnknownSeg(type=str(t), raw=item if isinstance(item, dict) else {}))
     return out
 
 
@@ -165,7 +186,7 @@ class IncomingMessage(_M):
     message_seq: int = 0
     sender_id: int = 0
     time: int = 0
-    segments: list[Segment] = Field(default_factory=list)
+    segments: SkipValidation[list[Segment]] = Field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "IncomingMessage":
@@ -179,7 +200,7 @@ class ForwardedMessage(_M):
     sender_id: int = 0
     sender_name: str = ""
     time: int = 0
-    segments: list[Segment] = Field(default_factory=list)
+    segments: SkipValidation[list[Segment]] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------- entities

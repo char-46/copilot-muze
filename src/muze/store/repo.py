@@ -1,0 +1,333 @@
+"""Data access layer over the message archive."""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Iterable
+
+import aiosqlite
+
+from muze.provider.milky.models import IncomingMessage
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+class Repository:
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self.conn = conn
+
+    # ------------------------------------------------------------ messages
+    async def upsert_message(
+        self,
+        msg: IncomingMessage,
+        text_content: str,
+        source: str,
+        sender_name: str = "",
+    ) -> bool:
+        """Insert a message; returns True when it was new (not a duplicate)."""
+        raw = msg.model_dump(mode="json", exclude_none=True)
+        cur = await self.conn.execute(
+            """
+            INSERT INTO messages
+                (scene, peer_id, message_seq, sender_id, time, raw_json,
+                 text_content, source, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (scene, peer_id, message_seq) DO NOTHING
+            """,
+            (
+                msg.message_scene,
+                msg.peer_id,
+                msg.message_seq,
+                msg.sender_id,
+                msg.time,
+                json.dumps(raw, ensure_ascii=False),
+                text_content,
+                source,
+                _now(),
+            ),
+        )
+        inserted = cur.rowcount > 0
+        if inserted:
+            await self._touch_conversation(msg, sender_name)
+        await self.conn.commit()
+        return inserted
+
+    async def _touch_conversation(self, msg: IncomingMessage, name: str) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO conversations (scene, peer_id, name, last_seq, last_active_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (scene, peer_id) DO UPDATE SET
+                last_seq = MAX(last_seq, excluded.last_seq),
+                last_active_at = MAX(COALESCE(last_active_at, 0), excluded.last_active_at),
+                name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END
+            """,
+            (msg.message_scene, msg.peer_id, name, msg.message_seq, msg.time),
+        )
+
+    async def set_recalled(self, scene: str, peer_id: int, message_seq: int) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE messages SET recalled = 1 WHERE scene = ? AND peer_id = ? AND message_seq = ?",
+            (scene, peer_id, message_seq),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def get_watermark(self, scene: str, peer_id: int) -> int:
+        async with self.conn.execute(
+            "SELECT last_seq FROM conversations WHERE scene = ? AND peer_id = ?",
+            (scene, peer_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_message_row(self, scene: str, peer_id: int, message_seq: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM messages WHERE scene = ? AND peer_id = ? AND message_seq = ?",
+            (scene, peer_id, message_seq),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_messages(
+        self,
+        scene: str,
+        peer_id: int,
+        before_seq: int | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Newest-first window; pass before_seq to page backwards in time."""
+        limit = max(1, min(int(limit), 200))
+        if before_seq is not None:
+            sql = (
+                "SELECT * FROM messages WHERE scene=? AND peer_id=? AND message_seq<? "
+                "ORDER BY message_seq DESC LIMIT ?"
+            )
+            args: Iterable[Any] = (scene, peer_id, before_seq, limit)
+        else:
+            sql = (
+                "SELECT * FROM messages WHERE scene=? AND peer_id=? "
+                "ORDER BY message_seq DESC LIMIT ?"
+            )
+            args = (scene, peer_id, limit)
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def search_messages(
+        self,
+        query: str,
+        scene: str | None = None,
+        peer_id: int | None = None,
+        limit: int = 30,
+    ) -> list[dict]:
+        esc = query.replace("/", "//").replace("%", "/%").replace("_", "/_")
+        pattern = f"%{esc}%"
+        sql = "SELECT * FROM messages WHERE text_content LIKE ? ESCAPE '/'"
+        args: list[Any] = [pattern]
+        if scene:
+            sql += " AND scene = ?"
+            args.append(scene)
+        if peer_id is not None:
+            sql += " AND peer_id = ?"
+            args.append(peer_id)
+        sql += " ORDER BY time DESC, message_seq DESC LIMIT ?"
+        args.append(max(1, min(int(limit), 100)))
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------- conversations
+    async def list_conversations(
+        self, active_within_h: float | None = None, limit: int = 200
+    ) -> list[dict]:
+        sql = "SELECT * FROM conversations"
+        args: list[Any] = []
+        if active_within_h:
+            sql += " WHERE last_active_at >= ?"
+            args.append(int(time.time()) - int(active_within_h * 3600))
+        sql += " ORDER BY last_active_at DESC LIMIT ?"
+        args.append(max(1, min(int(limit), 1000)))
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            async with self.conn.execute(
+                "SELECT COUNT(*) AS c FROM messages WHERE scene=? AND peer_id=?",
+                (d["scene"], d["peer_id"]),
+            ) as cur:
+                d["message_count"] = (await cur.fetchone())[0]
+            out.append(d)
+        return out
+
+    async def get_conversation(self, scene: str, peer_id: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM conversations WHERE scene=? AND peer_id=?", (scene, peer_id)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    # --------------------------------------------------------------- media
+    async def add_media(self, row: dict) -> int | None:
+        cur = await self.conn.execute(
+            """
+            INSERT INTO media
+                (scene, peer_id, message_seq, seg_index, kind, resource_id, file_id,
+                 file_name, file_hash, width, height, duration, summary,
+                 status, created_at, updated_at)
+            VALUES (:scene, :peer_id, :message_seq, :seg_index, :kind, :resource_id,
+                    :file_id, :file_name, :file_hash, :width, :height, :duration,
+                    :summary, :status, :created_at, :updated_at)
+            ON CONFLICT (scene, peer_id, message_seq, seg_index) DO NOTHING
+            """,
+            {
+                **row,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        )
+        await self.conn.commit()
+        if cur.rowcount > 0:
+            async with self.conn.execute("SELECT last_insert_rowid()") as c2:
+                return (await c2.fetchone())[0]
+        return None
+
+    async def update_media(
+        self, media_id: int, *, status: str, file_path: str | None = None,
+        file_size: int | None = None, error: str | None = None,
+    ) -> None:
+        await self.conn.execute(
+            """
+            UPDATE media SET status=?, file_path=COALESCE(?, file_path),
+                             file_size=COALESCE(?, file_size), error=?, updated_at=?
+            WHERE id=?
+            """,
+            (status, file_path, file_size, error, _now(), media_id),
+        )
+        await self.conn.commit()
+
+    async def media_by_id(self, media_id: int) -> dict | None:
+        async with self.conn.execute("SELECT * FROM media WHERE id=?", (media_id,)) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def media_for_message(self, scene: str, peer_id: int, message_seq: int) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM media WHERE scene=? AND peer_id=? AND message_seq=? ORDER BY seg_index",
+            (scene, peer_id, message_seq),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def media_pending(self, limit: int = 100) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM media WHERE status IN ('pending','failed') ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def media_stats(self) -> dict:
+        out: dict[str, int] = {}
+        for status in ("done", "failed", "pending", "skipped"):
+            async with self.conn.execute(
+                "SELECT COUNT(*) FROM media WHERE status=?", (status,)
+            ) as cur:
+                out[status] = (await cur.fetchone())[0]
+        async with self.conn.execute(
+            "SELECT COALESCE(SUM(file_size),0) FROM media WHERE status='done'"
+        ) as cur:
+            out["bytes"] = (await cur.fetchone())[0]
+        return out
+
+    # ------------------------------------------------------ pending actions
+    async def create_action(
+        self,
+        kind: str,
+        scene: str,
+        peer_id: int,
+        payload: dict,
+        control_scene: str,
+        control_peer_id: int,
+        created_by: str,
+    ) -> int:
+        cur = await self.conn.execute(
+            """
+            INSERT INTO pending_actions
+                (kind, scene, peer_id, payload_json, control_scene, control_peer_id,
+                 status, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                kind,
+                scene,
+                peer_id,
+                json.dumps(payload, ensure_ascii=False),
+                control_scene,
+                control_peer_id,
+                created_by,
+                _now(),
+                _now(),
+            ),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid)
+
+    async def get_action(self, action_id: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM pending_actions WHERE id=?", (action_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_pending_actions(self, scene: str | None = None, peer_id: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM pending_actions WHERE status='pending'"
+        args: list[Any] = []
+        if scene:
+            sql += " AND control_scene=?"
+            args.append(scene)
+        if peer_id is not None:
+            sql += " AND control_peer_id=?"
+            args.append(peer_id)
+        sql += " ORDER BY id"
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def set_action_status(self, action_id: int, status: str) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE pending_actions SET status=?, updated_at=? WHERE id=? AND status='pending'",
+            (status, _now(), action_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def expire_actions(self, older_than_min: float) -> int:
+        cur = await self.conn.execute(
+            """
+            UPDATE pending_actions SET status='expired', updated_at=?
+            WHERE status='pending' AND created_at < ?
+            """,
+            (_now(), _now() - int(older_than_min * 60)),
+        )
+        await self.conn.commit()
+        return cur.rowcount
+
+    # ---------------------------------------------------------------- stats
+    async def stats(self) -> dict:
+        out: dict[str, Any] = {}
+        async with self.conn.execute("SELECT COUNT(*) FROM conversations") as cur:
+            out["conversations"] = (await cur.fetchone())[0]
+        async with self.conn.execute("SELECT COUNT(*) FROM messages") as cur:
+            out["messages"] = (await cur.fetchone())[0]
+        async with self.conn.execute(
+            "SELECT scene, COUNT(*) FROM messages GROUP BY scene"
+        ) as cur:
+            out["messages_by_scene"] = {r[0]: r[1] for r in await cur.fetchall()}
+        out["media"] = await self.media_stats()
+        out["pending_actions"] = len(await self.list_pending_actions())
+        return out
