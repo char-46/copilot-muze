@@ -61,3 +61,20 @@ def test_message_from_raw_keeps_unknown_segments():
         }
     )
     assert len(m.segments) == 2 and m.segments[1].type == "wat"
+
+
+def test_llbot_field_aliases():
+    """LLBot returns uin/nickname/remark/card instead of the spec names."""
+    from muze.provider.milky.models import Friend, GroupMember, LoginInfo
+
+    li = LoginInfo.model_validate({"uin": 1000000002, "nickname": "我"})
+    assert li.user_id == 1000000002 and li.user_name == "我"
+
+    f = Friend.model_validate({"user_id": 5, "nickname": "雪貂", "remark": "雪宝"})
+    assert f.user_name == "雪貂" and f.user_remark == "雪宝" and f.display == "雪宝"
+
+    m = GroupMember.model_validate({"user_id": 7, "nickname": "小明", "card": "群名片"})
+    assert m.user_name == "小明" and m.card_name == "群名片" and m.display == "群名片"
+
+    spec = LoginInfo.model_validate({"user_id": 9, "user_name": "x"})
+    assert spec.user_id == 9 and spec.user_name == "x"

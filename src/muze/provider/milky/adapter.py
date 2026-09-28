@@ -36,6 +36,16 @@ def _first_list(data: Any, *keys: str) -> list[dict]:
     return []
 
 
+def _unwrap(data: Any, *keys: str) -> Any:
+    """Some implementations nest the entity (e.g. {'member': {...}})."""
+    if isinstance(data, dict):
+        for k in keys:
+            v = data.get(k)
+            if isinstance(v, dict):
+                return v
+    return data
+
+
 class MilkyAdapter(ProtocolAdapter):
     """Talks to LLBot / Lagrange.Milky over the Milky standard interface."""
 
@@ -165,7 +175,7 @@ class MilkyAdapter(ProtocolAdapter):
 
     async def get_friend_info(self, user_id: int) -> Friend:
         data = await self.client.call("get_friend_info", {"user_id": user_id})
-        f = Friend.model_validate(data or {})
+        f = Friend.model_validate(_unwrap(data, "friend", "user") or {})
         if f.display:
             self._friend_names[f.user_id] = f.display
         return f
@@ -190,7 +200,7 @@ class MilkyAdapter(ProtocolAdapter):
 
     async def get_group_info(self, group_id: int) -> Group:
         data = await self.client.call("get_group_info", {"group_id": group_id})
-        g = Group.model_validate(data or {})
+        g = Group.model_validate(_unwrap(data, "group") or {})
         if g.group_name:
             self._group_names[g.group_id] = g.group_name
         return g
@@ -220,7 +230,7 @@ class MilkyAdapter(ProtocolAdapter):
             data = await self.client.call(
                 "get_group_member_info", {"group_id": group_id, "user_id": user_id}
             )
-            member = GroupMember.model_validate(data or {})
+            member = GroupMember.model_validate(_unwrap(data, "member") or {})
             name = member.display
             self._member_names[key] = name
             if not fut.done():

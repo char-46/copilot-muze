@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation, TypeAdapter
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SkipValidation, TypeAdapter
 
 Scene = Literal["friend", "group", "temp"]
 
@@ -214,10 +214,16 @@ class ForwardedMessage(_M):
 
 
 # ---------------------------------------------------------------- entities
+# Field aliases: the spec says user_name/user_remark/card_name, but real
+# implementations (LLBot) return nickname/remark/card — accept both.
 class Friend(_M):
     user_id: int = 0
-    user_name: str = ""
-    user_remark: str = ""
+    user_name: str = Field(
+        default="", validation_alias=AliasChoices("user_name", "nickname")
+    )
+    user_remark: str = Field(
+        default="", validation_alias=AliasChoices("user_remark", "remark")
+    )
 
     @property
     def display(self) -> str:
@@ -236,8 +242,12 @@ class Group(_M):
 
 class GroupMember(_M):
     user_id: int = 0
-    user_name: str = ""
-    card_name: str = ""
+    user_name: str = Field(
+        default="", validation_alias=AliasChoices("user_name", "nickname")
+    )
+    card_name: str = Field(
+        default="", validation_alias=AliasChoices("card_name", "card")
+    )
 
     @property
     def display(self) -> str:
@@ -256,8 +266,12 @@ class HistoryResult(_M):
 
 
 class LoginInfo(_M):
-    user_id: int = 0
-    user_name: str = ""
+    user_id: int = Field(
+        default=0, validation_alias=AliasChoices("user_id", "uin")
+    )
+    user_name: str = Field(
+        default="", validation_alias=AliasChoices("user_name", "nickname")
+    )
     user_remark: str = ""
 
 

@@ -61,7 +61,7 @@ class Agent:
         runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            *[-h for h in history[:-1]][-MAX_HISTORY:],
+            *history[:-1][-MAX_HISTORY:],
             {"role": "user", "content": text},
         ]
 
