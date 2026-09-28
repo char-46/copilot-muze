@@ -40,6 +40,7 @@ def create_app(service: ControlService, repo: Repository, runtime: Runtime, toke
             auto_confirm=False,
         )
 
+    # ------------------------------------------------------------------
     @web.middleware
     async def auth(request: web.Request, handler):
         if request.path.startswith("/api/"):
@@ -48,23 +49,6 @@ def create_app(service: ControlService, repo: Repository, runtime: Runtime, toke
             if not secrets.compare_digest(supplied, token):
                 return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
-
-    app = web.Application(middlewares=[auth])
-    app.router.add_get("/", index)
-    app.router.add_static("/static/", STATIC_DIR, show_index=False)
-    app.router.add_get("/api/info", api_info)
-    app.router.add_get("/api/conversations", api_conversations)
-    app.router.add_get("/api/messages/{scene}/{peer}", api_messages)
-    app.router.add_get("/api/message/{scene}/{peer}/{seq}", api_message_detail)
-    app.router.add_get("/api/search", api_search)
-    app.router.add_get("/api/mediafile/{media_id}", api_mediafile)
-    app.router.add_post("/api/command", api_command)
-    app.router.add_post("/api/agent", api_agent)
-    app.router.add_post("/api/agent/reset", api_agent_reset)
-    app.router.add_get("/api/pending", api_pending)
-    app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)
-    app.router.add_get("/api/logs/tail", api_logs_tail)
-    return app
 
     # ------------------------------------------------------------------
     async def index(_request: web.Request) -> web.FileResponse:
@@ -212,6 +196,23 @@ def create_app(service: ControlService, repo: Repository, runtime: Runtime, toke
         except OSError as e:
             return web.json_response({"error": str(e)}, status=500)
         return web.json_response({"lines": tail})
+
+    app = web.Application(middlewares=[auth])
+    app.router.add_get("/", index)
+    app.router.add_static("/static/", STATIC_DIR, show_index=False)
+    app.router.add_get("/api/info", api_info)
+    app.router.add_get("/api/conversations", api_conversations)
+    app.router.add_get("/api/messages/{scene}/{peer}", api_messages)
+    app.router.add_get("/api/message/{scene}/{peer}/{seq}", api_message_detail)
+    app.router.add_get("/api/search", api_search)
+    app.router.add_get("/api/mediafile/{media_id}", api_mediafile)
+    app.router.add_post("/api/command", api_command)
+    app.router.add_post("/api/agent", api_agent)
+    app.router.add_post("/api/agent/reset", api_agent_reset)
+    app.router.add_get("/api/pending", api_pending)
+    app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)
+    app.router.add_get("/api/logs/tail", api_logs_tail)
+    return app
 
 
 async def start_web(

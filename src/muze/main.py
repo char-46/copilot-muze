@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 from muze.ai.agent import Agent
@@ -47,6 +48,14 @@ class App:
         self.chatlog = ChatLog()
         self.runtime = Runtime()
         self._stop = asyncio.Event()
+        self.conn = None
+        self.repo = None
+        self.adapter = None
+        self.media = None
+        self.pipeline = None
+        self.backfiller = None
+        self.service = None
+        self.web_runner = None
 
     async def setup(self) -> None:
         cfg = self.cfg
@@ -156,13 +165,16 @@ class App:
     async def shutdown(self) -> None:
         log.info("shutting down...")
         self._stop.set()
-        await self.backfiller.stop()
-        runner = getattr(self, "web_runner", None)
-        if runner is not None:
-            await runner.cleanup()
-        await self.pipeline.drain_media(timeout=5)
-        await self.adapter.close()
-        await self.conn.close()
+        if self.backfiller is not None:
+            await self.backfiller.stop()
+        if self.web_runner is not None:
+            await self.web_runner.cleanup()
+        if self.pipeline is not None:
+            await self.pipeline.drain_media(timeout=5)
+        if self.adapter is not None:
+            await self.adapter.close()
+        if self.conn is not None:
+            await self.conn.close()
 
 
 def run_main(argv: list[str]) -> int:
@@ -170,7 +182,7 @@ def run_main(argv: list[str]) -> int:
     try:
         cfg = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
-        print(f"config error: {e}", encoding="utf-8")
+        print(f"config error: {e}", file=sys.stderr)
         return 2
 
     log_path = setup_logging(cfg.log, cfg.storage)
@@ -191,5 +203,12 @@ def run_main(argv: list[str]) -> int:
 
 
 async def _bootstrap(app: App) -> None:
-    await app.setup()
+    try:
+        await app.setup()
+    except BaseException:
+        try:
+            await app.shutdown()
+        except Exception:
+            log.exception("cleanup after failed setup crashed")
+        raise
     await app.run()

@@ -58,7 +58,7 @@ def run_cli(argv: list[str]) -> int:
     try:
         cfg = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
-        print(f"config error: {e}", encoding="utf-8")
+        print(f"config error: {e}", file=sys.stderr)
         return 2
 
     setup_logging(cfg.log, cfg.storage)  # keep the shared chat log growing
@@ -70,7 +70,7 @@ def run_cli(argv: list[str]) -> int:
         try:
             login = await adapter.start()
         except ProtocolError as e:
-            print(f"协议端不可用: {e}\n请先启动 LLBot/Lagrange.Milky 并检查配置。", encoding="utf-8")
+            print(f"协议端不可用: {e}\n请先启动 LLBot/Lagrange.Milky 并检查配置。", file=sys.stderr)
             await adapter.close()
             return
         runtime = Runtime()
