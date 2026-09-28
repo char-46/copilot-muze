@@ -237,6 +237,28 @@ class ControlService:
             )
         return CommandOutcome("\n".join(lines) + "\n/confirm id 或 /cancel id")
 
+    async def confirm_action(self, action_id: int, ctx: ControlContext) -> CommandOutcome:
+        """Confirm a pending send from any privileged front (Web/CLI)."""
+        action = await self.repo.get_action(action_id)
+        if not action or action["status"] != "pending":
+            return CommandOutcome(f"#{action_id} 不存在或已失效", is_error=True)
+        await self.repo.set_action_status(action_id, "executed")
+        payload = json.loads(action["payload_json"])
+        outcome = await self.send_as_bot(
+            action["scene"], action["peer_id"], payload.get("segments", []),
+            payload.get("preview", ""),
+        )
+        self.chatlog.confirm(action_id, f"confirmed by {ctx.user_label or ctx.chat_key}")
+        return outcome
+
+    async def cancel_action(self, action_id: int, ctx: ControlContext) -> CommandOutcome:
+        action = await self.repo.get_action(action_id)
+        if not action or action["status"] != "pending":
+            return CommandOutcome(f"#{action_id} 不存在或已失效", is_error=True)
+        await self.repo.set_action_status(action_id, "cancelled")
+        self.chatlog.confirm(action_id, f"cancelled by {ctx.user_label or ctx.chat_key}")
+        return CommandOutcome(f"已取消 #{action_id}")
+
     async def cmd_confirm(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         rows = await self.repo.list_pending_actions(ctx.scene or None, ctx.peer_id or None)
         if not rows:

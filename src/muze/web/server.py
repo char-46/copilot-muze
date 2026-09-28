@@ -1,0 +1,229 @@
+"""WebUI: aiohttp JSON API + single-page frontend.
+
+Bound to localhost by default; every /api/* request needs the bearer token
+(generated and logged at startup when not configured).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import secrets
+from pathlib import Path
+
+from aiohttp import web
+
+from muze.chatlog import ChatLog
+from muze.config import WebConfig
+from muze.core.service import ControlContext, ControlService, Runtime
+from muze.store.repo import Repository
+from muze.version import get_version, uptime_since
+
+log = logging.getLogger("muze.web")
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+def make_token(cfg: WebConfig) -> str:
+    return cfg.token or secrets.token_urlsafe(18)
+
+
+def create_app(service: ControlService, repo: Repository, runtime: Runtime, token: str) -> web.Application:
+    def ctx(user: str = "web") -> ControlContext:
+        return ControlContext(
+            source="web",
+            chat_key="web:default",
+            scene="",
+            peer_id=0,
+            user_label=user,
+            auto_confirm=False,
+        )
+
+    @web.middleware
+    async def auth(request: web.Request, handler):
+        if request.path.startswith("/api/"):
+            hdr = request.headers.get("Authorization", "")
+            supplied = hdr[7:].strip() if hdr.startswith("Bearer ") else request.query.get("token", "")
+            if not secrets.compare_digest(supplied, token):
+                return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+
+    app = web.Application(middlewares=[auth])
+    app.router.add_get("/", index)
+    app.router.add_static("/static/", STATIC_DIR, show_index=False)
+    app.router.add_get("/api/info", api_info)
+    app.router.add_get("/api/conversations", api_conversations)
+    app.router.add_get("/api/messages/{scene}/{peer}", api_messages)
+    app.router.add_get("/api/message/{scene}/{peer}/{seq}", api_message_detail)
+    app.router.add_get("/api/search", api_search)
+    app.router.add_get("/api/mediafile/{media_id}", api_mediafile)
+    app.router.add_post("/api/command", api_command)
+    app.router.add_post("/api/agent", api_agent)
+    app.router.add_post("/api/agent/reset", api_agent_reset)
+    app.router.add_get("/api/pending", api_pending)
+    app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)
+    app.router.add_get("/api/logs/tail", api_logs_tail)
+    return app
+
+    # ------------------------------------------------------------------
+    async def index(_request: web.Request) -> web.FileResponse:
+        return web.FileResponse(STATIC_DIR / "index.html")
+
+    async def api_info(_request: web.Request) -> web.Response:
+        stats = await repo.stats()
+        bf = runtime.backfiller.status() if runtime.backfiller else {}
+        return web.json_response(
+            {
+                "version": get_version(),
+                "self_id": runtime.self_id,
+                "uptime": uptime_since(runtime.started_at),
+                "backfill": bf,
+                "stats": stats,
+                "agent": service.agent is not None,
+                "capabilities": service.adapter.caps.summary_lines(),
+                "confirm_all_sends": service.cfg.control.confirm_all_sends,
+            }
+        )
+
+    async def api_conversations(request: web.Request) -> web.Response:
+        active_h = float(request.query.get("active_h", 0)) or None
+        limit = int(request.query.get("limit", 100))
+        rows = await repo.list_conversations(active_within_h=active_h, limit=limit)
+        return web.json_response({"conversations": rows})
+
+    async def api_messages(request: web.Request) -> web.Response:
+        scene = request.match_info["scene"]
+        peer = int(request.match_info["peer"])
+        before_seq = request.query.get("before_seq")
+        limit = int(request.query.get("limit", 50))
+        rows = await repo.get_messages(
+            scene, peer, before_seq=int(before_seq) if before_seq else None, limit=limit
+        )
+        return web.json_response({"messages": list(reversed(rows))})
+
+    async def api_message_detail(request: web.Request) -> web.Response:
+        scene = request.match_info["scene"]
+        peer = int(request.match_info["peer"])
+        seq = int(request.match_info["seq"])
+        row = await repo.get_message_row(scene, peer, seq)
+        if not row:
+            return web.json_response({"error": "not found"}, status=404)
+        media = await repo.media_for_message(scene, peer, seq)
+        return web.json_response({"message": row, "media": media})
+
+    async def api_search(request: web.Request) -> web.Response:
+        q = request.query.get("q", "").strip()
+        if not q:
+            return web.json_response({"error": "missing q"}, status=400)
+        scene = request.query.get("scene") or None
+        peer = request.query.get("peer")
+        limit = int(request.query.get("limit", 30))
+        rows = await repo.search_messages(
+            q, scene=scene, peer_id=int(peer) if peer else None, limit=limit
+        )
+        return web.json_response({"matches": rows})
+
+    async def api_mediafile(request: web.Request) -> web.Response:
+        media_id = int(request.match_info["media_id"])
+        row = await repo.media_by_id(media_id)
+        if not row or not row["file_path"] or row["status"] != "done":
+            return web.json_response({"error": "media unavailable"}, status=404)
+        p = Path(row["file_path"])
+        if not p.exists():
+            return web.json_response({"error": "file missing"}, status=404)
+        return web.FileResponse(p)
+
+    async def api_command(request: web.Request) -> web.Response:
+        data = await request.json()
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return web.json_response({"error": "missing text"}, status=400)
+        outcome = await service.execute(text, ctx())
+        return web.json_response(
+            {
+                "text": outcome.text,
+                "media_paths": outcome.media_paths,
+                "is_error": outcome.is_error,
+            }
+        )
+
+    async def api_agent(request: web.Request) -> web.Response:
+        data = await request.json()
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return web.json_response({"error": "missing text"}, status=400)
+        if service.agent is None:
+            return web.json_response({"error": "LLM 未配置"}, status=503)
+        outcome = await service.agent.converse(text, ctx())
+        return web.json_response(
+            {"text": outcome.text, "media_paths": outcome.media_paths, "is_error": outcome.is_error}
+        )
+
+    async def api_agent_reset(_request: web.Request) -> web.Response:
+        if service.agent is not None:
+            service.agent.reset("web:default")
+        return web.json_response({"ok": True})
+
+    async def api_pending(_request: web.Request) -> web.Response:
+        rows = await repo.list_pending_actions()
+        out = []
+        for r in rows:
+            payload = json.loads(r["payload_json"])
+            out.append(
+                {
+                    "id": r["id"],
+                    "scene": r["scene"],
+                    "peer_id": r["peer_id"],
+                    "preview": payload.get("preview", ""),
+                    "segments": payload.get("segments", []),
+                    "created_by": r["created_by"],
+                    "control": f"{r['control_scene']}/{r['control_peer_id']}",
+                }
+            )
+        return web.json_response({"pending": out})
+
+    async def api_pending_op(request: web.Request) -> web.Response:
+        action_id = int(request.match_info["action_id"])
+        op = request.match_info["op"]
+        if op not in ("confirm", "cancel"):
+            return web.json_response({"error": "bad op"}, status=400)
+        outcome = (
+            await service.confirm_action(action_id, ctx())
+            if op == "confirm"
+            else await service.cancel_action(action_id, ctx())
+        )
+        return web.json_response(
+            {"text": outcome.text, "is_error": outcome.is_error}
+        )
+
+    async def api_logs_tail(request: web.Request) -> web.Response:
+        lines = max(10, min(int(request.query.get("lines", 300)), 3000))
+        path = Path(runtime.log_path)
+        if not path.exists():
+            return web.json_response({"lines": []})
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 2_000_000))
+                chunk = fh.read().decode("utf-8", errors="replace")
+            tail = chunk.splitlines()[-lines:]
+        except OSError as e:
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"lines": tail})
+
+
+async def start_web(
+    cfg: WebConfig, service: ControlService, repo: Repository, runtime: Runtime, chatlog: ChatLog
+) -> tuple[web.AppRunner, str]:
+    token = make_token(cfg)
+    app = create_app(service, repo, runtime, token)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, cfg.host, cfg.port)
+    await site.start()
+    url = f"http://{cfg.host}:{cfg.port}/"
+    log.info("webui listening on %s", url)
+    chatlog.log.info("WEBUI      | %s (token: %s)", url, token)
+    return runner, token

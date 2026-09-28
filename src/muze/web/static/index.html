@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muze · QQ copilot</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">muze <span id="version" class="dim"></span></div>
+  <div id="statusdot" class="dot off" title="API 状态"></div>
+  <input id="token" type="password" placeholder="access token" autocomplete="off">
+  <button id="saveToken">保存</button>
+</header>
+
+<nav>
+  <button data-tab="chats" class="active">会话</button>
+  <button data-tab="search">搜索</button>
+  <button data-tab="ai">AI</button>
+  <button data-tab="pending">待确认 <span id="pendingBadge" class="badge hidden">0</span></button>
+  <button data-tab="logs">日志</button>
+  <button data-tab="status">状态</button>
+</nav>
+
+<main>
+  <!-- chats -->
+  <section id="tab-chats" class="tab active">
+    <div class="split">
+      <div id="convlist" class="pane list"><div class="dim pad">加载中…</div></div>
+      <div id="msgpane" class="pane grow">
+        <div id="msghead" class="panehead dim pad">选择左侧会话</div>
+        <div id="msglist" class="msglist"></div>
+        <button id="older" class="block">加载更早消息</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- search -->
+  <section id="tab-search" class="tab">
+    <div class="bar">
+      <input id="searchq" placeholder="关键词…">
+      <button id="searchBtn">搜索</button>
+    </div>
+    <div id="searchresults"></div>
+  </section>
+
+  <!-- ai -->
+  <section id="tab-ai" class="tab">
+    <div class="bar">
+      <span class="dim">与 copilot 对话（可用自然语言查询档案、代发消息等）</span>
+      <button id="aiReset">清空上下文</button>
+    </div>
+    <div id="aichat" class="aichat"></div>
+    <div class="bar">
+      <input id="aiinput" placeholder="输入消息，回车发送…">
+      <button id="aiSend">发送</button>
+    </div>
+  </section>
+
+  <!-- pending -->
+  <section id="tab-pending" class="tab">
+    <div id="pendinglist"><div class="dim pad">加载中…</div></div>
+  </section>
+
+  <!-- logs -->
+  <section id="tab-logs" class="tab">
+    <div class="bar">
+      <button id="logRefresh">刷新</button>
+      <span class="dim" id="logpath"></span>
+    </div>
+    <pre id="logview" class="logview"></pre>
+  </section>
+
+  <!-- status -->
+  <section id="tab-status" class="tab">
+    <pre id="statusview" class="logview"></pre>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
