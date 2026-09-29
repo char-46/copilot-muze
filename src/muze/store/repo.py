@@ -382,6 +382,121 @@ class Repository:
         )
         await self.conn.commit()
 
+    # ------------------------------------------------------------ digests
+    async def upsert_digest(
+        self, date: str, report: str, window_hours: float, stats: dict
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO daily_digests (date, created_at, window_hours, report, stats_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (date) DO UPDATE SET
+                created_at=excluded.created_at, window_hours=excluded.window_hours,
+                report=excluded.report, stats_json=excluded.stats_json
+            """,
+            (date, _now(), window_hours, report, json.dumps(stats, ensure_ascii=False)),
+        )
+        await self.conn.commit()
+
+    async def get_digest(self, date: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM daily_digests WHERE date=?", (date,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_digests(self, limit: int = 30) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT date, created_at, window_hours, length(report) AS report_len "
+            "FROM daily_digests ORDER BY date DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def latest_digest(self) -> dict | None:
+        rows = await self.list_digests(limit=1)
+        return rows[0] if rows else None
+
+    async def conversations_active_between(
+        self, start_ts: int, end_ts: int, limit: int = 6
+    ) -> list[dict]:
+        """Busiest conversations whose messages fall in [start_ts, end_ts)."""
+        async with self.conn.execute(
+            """
+            SELECT scene, peer_id, COUNT(*) AS cnt
+            FROM messages
+            WHERE time >= ? AND time < ? AND recalled = 0
+            GROUP BY scene, peer_id
+            ORDER BY cnt DESC LIMIT ?
+            """,
+            (start_ts, end_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            conv = await self.get_conversation(r["scene"], r["peer_id"])
+            d["name"] = (conv or {}).get("name", "")
+            out.append(d)
+        return out
+
+    async def messages_between(
+        self, scene: str, peer_id: int, start_ts: int, end_ts: int, limit: int = 50
+    ) -> list[dict]:
+        """Newest-first window within [start_ts, end_ts); returns chronological."""
+        async with self.conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE scene=? AND peer_id=? AND time >= ? AND time < ? AND recalled = 0
+            ORDER BY time DESC, message_seq DESC LIMIT ?
+            """,
+            (scene, peer_id, start_ts, end_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    # ---------------------------------------------------------------- memories
+    async def add_memory(
+        self, kind: str, subject: str, content: str, source: str = "",
+        confidence: float = 1.0,
+    ) -> int:
+        cur = await self.conn.execute(
+            """
+            INSERT INTO memories (kind, subject, content, source, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (kind, subject, content, source, confidence, _now(), _now()),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid)
+
+    async def list_memories(
+        self, subject: str | None = None, active_only: bool = True, limit: int = 200
+    ) -> list[dict]:
+        sql = "SELECT * FROM memories"
+        conds, args = [], []
+        if active_only:
+            conds.append("active=1")
+        if subject:
+            conds.append("subject=?")
+            args.append(subject)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def retire_memory(self, memory_id: int) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE memories SET active=0, updated_at=? WHERE id=? AND active=1",
+            (_now(), memory_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
     # ---------------------------------------------------------------- stats
     async def stats(self) -> dict:
         out: dict[str, Any] = {}

@@ -102,6 +102,7 @@ class App:
         self.scheduler = Scheduler(self.repo, self.service, self.chatlog)
         self.runtime.scheduler = self.scheduler
         await self.scheduler.start()
+        await self.scheduler.ensure_daily_digest()
 
         self.reloader = Reloader(
             config_path=self.config_path,

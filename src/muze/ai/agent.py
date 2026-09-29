@@ -57,14 +57,24 @@ class Agent:
     def reset_all(self) -> None:
         self._histories.clear()
 
-    def _system_prompt(self) -> str:
+    async def _system_prompt(self) -> str:
+        parts = [SYSTEM_PROMPT]
         skills = getattr(self.service.runtime, "skills", None)
-        if skills is None:
-            return SYSTEM_PROMPT
-        lines = skills.index_lines()
-        if not lines:
-            return SYSTEM_PROMPT
-        return SYSTEM_PROMPT + "\n\n已安装技能（相关时先 read_skill 读全文再操作）:\n" + "\n".join(lines)
+        if skills is not None:
+            lines = skills.index_lines()
+            if lines:
+                parts.append("已安装技能（相关时先 read_skill 读全文再操作）:\n" + "\n".join(lines))
+        # long-term memories (grown by nightly dreaming + remember tool)
+        try:
+            rows = await self.repo.list_memories(limit=25)
+        except Exception:
+            rows = []
+        if rows:
+            lines = [f"- [{r['subject']}] {r['content']}" for r in reversed(rows)]
+            parts.append(
+                "长期记忆（做梦沉淀，回答时可利用，也可用 remember 工具随时补充）:\n" + "\n".join(lines)
+            )
+        return "\n\n".join(parts)
 
     # ------------------------------------------------------------ converse
     async def converse(self, text: str, ctx: ControlContext) -> CommandOutcome:
@@ -76,7 +86,7 @@ class Agent:
 
         runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         messages: list[dict] = [
-            {"role": "system", "content": self._system_prompt()},
+            {"role": "system", "content": await self._system_prompt()},
             *history[:-1][-MAX_HISTORY:],
             {"role": "user", "content": text},
         ]

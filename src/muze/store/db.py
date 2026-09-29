@@ -95,6 +95,27 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks (status, next_run_at);
+
+CREATE TABLE IF NOT EXISTS daily_digests (
+    date         TEXT PRIMARY KEY,        -- local YYYY-MM-DD
+    created_at   INTEGER NOT NULL,
+    window_hours REAL,
+    report       TEXT NOT NULL,
+    stats_json   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,            -- identity | preference | relation | fact
+    subject     TEXT NOT NULL,            -- 'owner' | '<uin>' | 'group/<gid>'
+    content     TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT '', -- dream:<date> | chat | command
+    confidence  REAL NOT NULL DEFAULT 1.0,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memories_subject ON memories (subject, active);
 """
 
 
@@ -114,15 +135,15 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         has_meta = await cur.fetchone()
     if not has_meta:
         await conn.executescript(SCHEMA_V1)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')")
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')")
         await conn.commit()
-        log.info("database created (schema v2)")
+        log.info("database created (schema v4)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
     version = int(row[0]) if row else 0
-    if version < 2:
+    if version < 4:
         await conn.executescript(SCHEMA_V1)  # CREATE IF NOT EXISTS: applies missing tables
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')")
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')")
         await conn.commit()
-        log.info("database migrated to schema v2")
+        log.info("database migrated to schema v4")

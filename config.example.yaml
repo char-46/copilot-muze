@@ -55,6 +55,18 @@ web:
   port: 8300
   token: ""                  # empty -> random token generated and logged at startup
 
+digest:
+  # Nightly "dream": summarize each passed day (fixed 01:00), catch up
+  # missing days automatically, and distill long-term memories about the
+  # user and their contacts (fed back into the agent's prompts).
+  enabled: true
+  at: "01:00"              # local time
+  top_conversations: 6     # busiest conversations per day
+  messages_per_conversation: 40
+  deliver: true            # send the report to the control conversation
+  extract_memories: true   # second LLM pass: distill identity/preferences
+  max_memories_per_night: 8
+
 log:
   level: INFO                # DEBUG for verbose protocol traffic
   file: ""                   # empty -> data_dir/logs/muze.log (appended, never rotated)

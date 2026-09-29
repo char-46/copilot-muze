@@ -112,6 +112,38 @@ class Scheduler:
         )
         return await self.repo.get_task(task_id)
 
+    # ------------------------------------------------------------- builtin
+    DIGEST_NOTE = "builtin:daily-digest"
+
+    async def ensure_daily_digest(self) -> int | None:
+        """Idempotently create the nightly digest ("dream") task."""
+        if not self.service.cfg.digest.enabled:
+            return None
+        rows = await self.repo.list_tasks()
+        if any(r.get("note") == self.DIGEST_NOTE and r["status"] == "active" for r in rows):
+            return None
+        from muze.digest import next_run_for_hhmm
+
+        cfg = self.service.cfg
+        next_at = next_run_for_hhmm(cfg.digest.at)
+        ctx = ControlContext(source="system", chat_key="system", scene="", peer_id=0)
+        scene, peer = self.resolve_delivery(ctx)
+        if not scene:
+            log.warning("digest task not created: no control conversation configured")
+            return None
+        task_id = await self.repo.create_task(
+            "interval",
+            "/dream night",
+            scene,
+            peer,
+            next_at,
+            86400,
+            "builtin",
+            self.DIGEST_NOTE,
+        )
+        log.info("daily digest task #%s created, next run per cfg.digest.at", task_id)
+        return task_id
+
     # ------------------------------------------------------------- execute
     async def execute(self, row: dict) -> None:
         task_id = row["id"]
@@ -127,7 +159,12 @@ class Scheduler:
         try:
             outcome = await self.service.execute(row["prompt"], ctx)
             result_text = outcome.text or "(无输出)"
-            await self.service.deliver(ctx, outcome)
+            skip_deliver = (
+                row.get("note") == self.DIGEST_NOTE
+                and not self.service.cfg.digest.deliver
+            )
+            if not skip_deliver:
+                await self.service.deliver(ctx, outcome)
         except Exception as e:
             log.exception("task #%s execution failed", task_id)
             await self.repo.finish_task(task_id, "error", f"执行失败: {e}")

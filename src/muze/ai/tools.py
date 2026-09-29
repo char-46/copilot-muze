@@ -151,6 +151,42 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "recall_dream",
+            "description": (
+                "回顾「做梦报告」（系统每天自动生成的全天消息总结）。用户问'昨天/前几天"
+                "聊了什么''上周有什么事'时先查这里，比翻原始消息快。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "YYYY-MM-DD；缺省=最新一份"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "把一条长期有用的事实写入长期记忆（身份/关系/偏好/约定）。"
+                "用户主动告诉你关于他自己或联系人stable的信息时、或对话中确认了重要事实时调用。"
+                "临时性内容不要记。subject 用 'owner'（被控号主人）、'<QQ号>' 或 'group/<群号>'。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "content": {"type": "string", "description": "一句话中文事实"},
+                    "kind": {"type": "string", "enum": ["identity", "preference", "relation", "fact"]},
+                },
+                "required": ["subject", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_skill",
             "description": (
                 "阅读一个已安装技能的完整说明（先 cli({\"command\":\"skills\"}) 看列表）。"
@@ -326,6 +362,27 @@ class ToolRunner:
         except Exception as e:
             return {"error": str(e)}
         return {"url": url, "content": text}
+
+    async def t_recall_dream(self, args: dict) -> dict:
+        date = str(args.get("date", "")).strip()
+        if date:
+            row = await self.repo.get_digest(date)
+        else:
+            latest = await self.repo.latest_digest()
+            row = await self.repo.get_digest(latest["date"]) if latest else None
+        if not row:
+            return {"error": "没有做梦报告", "hint": "cli({\"command\":\"dream list\"})"}
+        return {"date": row["date"], "report": row["report"][:8000]}
+
+    async def t_remember(self, args: dict) -> dict:
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"error": "content 不能为空"}
+        subject = str(args.get("subject", "owner")).strip() or "owner"
+        kind = str(args.get("kind", "fact")).strip()
+        mid = await self.repo.add_memory(kind, subject, content, source="chat")
+        log.info("MEM        | + [%s/%s] %s (via remember tool)", subject, kind, content)
+        return {"saved": True, "id": mid}
 
     async def t_read_skill(self, args: dict) -> dict:
         skills = self.service.runtime.skills

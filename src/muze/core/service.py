@@ -428,6 +428,89 @@ class ControlService:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text[:3500])
 
+    @slash("dream", "/dream [night|now|日期|list]", "每日总结（做梦）：night=补做缺失日（内置），now=总结今天")
+    async def cmd_dream(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        from muze.digest import local_date as _local_date
+
+        sub = (args[0].lower() if args else "").strip()
+
+        if sub == "list":
+            rows = await self.repo.list_digests()
+            if not rows:
+                return CommandOutcome("还没有任何做梦报告；/dream now 立即生成一次")
+            return CommandOutcome(
+                "做梦报告:\n" + "\n".join(f"{r['date']} ({r['report_len']}字)" for r in rows)
+            )
+
+        if sub in ("night", "now"):
+            if self.agent is None or not self.agent.llm.configured:
+                return CommandOutcome.err("LLM 未配置，无法做梦")
+            from muze.digest import dream_night, run_digest
+
+            try:
+                if sub == "night":
+                    text = await dream_night(
+                        self.repo, self.agent.llm, self.cfg, self.chatlog,
+                        adapter=self.adapter,
+                    )
+                else:
+                    report = await run_digest(
+                        self.repo, self.agent.llm, self.cfg, self.chatlog,
+                        date=_local_date(), adapter=self.adapter,
+                    )
+                    text = f"[{_local_date()} 做梦报告]\n\n{report[:2800]}"
+            except Exception as e:
+                return CommandOutcome.err(f"做梦失败: {e}")
+            return CommandOutcome(text[:3200])
+
+        if sub:
+            if not __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}", sub):
+                return CommandOutcome.err("日期格式: YYYY-MM-DD，或用 night/now/list")
+            row = await self.repo.get_digest(sub)
+            if not row:
+                return CommandOutcome.err(f"{sub} 没有做梦报告；/dream list 查看已有日期")
+            return CommandOutcome(f"[{sub} 做梦报告]\n\n{row['report'][:3000]}")
+
+        row = await self.repo.latest_digest()
+        if not row:
+            return CommandOutcome(
+                "还没有做梦报告；/dream now 立即生成，每晚按 digest.at 自动做（缺的天会补）"
+            )
+        full = await self.repo.get_digest(row["date"])
+        return CommandOutcome(
+            f"[{row['date']} 做梦报告（最新）]\n\n{full['report'][:3000]}\n\n"
+            "/dream list 看全部，/dream now 总结今天，/dream night 补缺"
+        )
+
+    @slash("memories", "/memories [subject|关键词]", "长期记忆列表（做梦沉淀+对话补充）")
+    async def cmd_memories(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        q = args[0] if args else ""
+        rows = await self.repo.list_memories(limit=100)
+        if q:
+            rows = [
+                r for r in rows
+                if q in r["subject"] or q in r["content"] or q in r["kind"]
+            ]
+        if not rows:
+            return CommandOutcome("没有匹配的长期记忆")
+        lines = [
+            f"#{r['id']} [{r['subject']}/{r['kind']}] {r['content']}"[:120] for r in rows[:30]
+        ]
+        return CommandOutcome(
+            f"长期记忆 {len(rows)} 条（来源: {rows[0]['source'] if rows else '-'} 等）:\n"
+            + "\n".join(lines)
+            + "\n/forget <id> 停用某条"
+        )
+
+    @slash("forget", "/forget <id>", "停用一条长期记忆")
+    async def cmd_forget(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            return CommandOutcome.err("用法: /forget <id>（/memories 查 id）")
+        ok = await self.repo.retire_memory(int(args[0]))
+        if not ok:
+            return CommandOutcome.err(f"#{args[0]} 不存在或已停用")
+        return CommandOutcome(f"已停用记忆 #{args[0]}")
+
     @slash("help", "/help", "命令列表（自动扫描生成）")
     async def cmd_help(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(COMMANDS.help_text())

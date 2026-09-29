@@ -93,9 +93,35 @@ class WebConfig(BaseModel):
     token: str = ""  # empty -> generated at startup and logged
 
 
+class DigestConfig(BaseModel):
+    """Nightly "dream": summarize the day's messages into a stored report."""
+
+    enabled: bool = True
+    at: str = "23:30"  # local time, daily
+    window_hours: float = 24.0
+    top_conversations: int = 6
+    messages_per_conversation: int = 40
+    deliver: bool = True  # send the report to the control conversation
+    model_hint: str = ""  # optional override: use llm.chat as-is when empty
+
+
 class LogConfig(BaseModel):
     level: str = "INFO"
     file: str = ""  # empty -> data_dir/logs/muze.log, appended forever
+
+
+class DigestConfig(BaseModel):
+    """Daily digest a.k.a. "dreaming": once per night, reflect on the passed
+    day's archive, store the report, and grow long-term memories. Missing
+    days are caught up automatically on the next run."""
+
+    enabled: bool = True
+    at: str = "01:00"  # local HH:MM (nightly)
+    top_conversations: int = 6
+    messages_per_conversation: int = 40
+    deliver: bool = True
+    extract_memories: bool = True
+    max_memories_per_night: int = 8
 
 
 class MuzeConfig(BaseModel):
@@ -106,6 +132,7 @@ class MuzeConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     log: LogConfig = Field(default_factory=LogConfig)
+    digest: DigestConfig = Field(default_factory=DigestConfig)
 
 
 def load_config(path: str | Path) -> MuzeConfig:
