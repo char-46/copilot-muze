@@ -428,18 +428,23 @@ class ControlService:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text[:3500])
 
-    @slash("dream", "/dream [night|now|日期|list]", "每日总结（做梦）：night=补做缺失日（内置），now=总结今天")
+    @slash("dream", "/dream [night|now|日|周|月|list]", "层级做梦：night=补链(内置) now=今天 2026-W40=周 2026-09=月")
     async def cmd_dream(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
 
         sub = (args[0].lower() if args else "").strip()
 
         if sub == "list":
-            rows = await self.repo.list_digests()
+            rows = await self.repo.list_digests(limit=50)
             if not rows:
                 return CommandOutcome("还没有任何做梦报告；/dream now 立即生成一次")
+            tag = {"day": "日", "week": "周", "month": "月"}
             return CommandOutcome(
-                "做梦报告:\n" + "\n".join(f"{r['date']} ({r['report_len']}字)" for r in rows)
+                "做梦报告:\n"
+                + "\n".join(
+                    f"{r['date']} [{tag.get(r.get('period', 'day'), '?')}] ({r['report_len']}字)"
+                    for r in rows
+                )
             )
 
         if sub in ("night", "now"):
@@ -464,22 +469,24 @@ class ControlService:
             return CommandOutcome(text[:3200])
 
         if sub:
-            if not __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}", sub):
-                return CommandOutcome.err("日期格式: YYYY-MM-DD，或用 night/now/list")
+            import re as _re
+
+            if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{4}-W\d{1,2}|\d{4}-\d{2}", sub):
+                return CommandOutcome.err("格式: YYYY-MM-DD / YYYY-Www(周) / YYYY-MM(月)，或 night/now/list")
             row = await self.repo.get_digest(sub)
             if not row:
-                return CommandOutcome.err(f"{sub} 没有做梦报告；/dream list 查看已有日期")
+                return CommandOutcome.err(f"{sub} 没有做梦报告；/dream list 查看已有报告")
             return CommandOutcome(f"[{sub} 做梦报告]\n\n{row['report'][:3000]}")
 
         row = await self.repo.latest_digest()
         if not row:
             return CommandOutcome(
-                "还没有做梦报告；/dream now 立即生成，每晚按 digest.at 自动做（缺的天会补）"
+                "还没有做梦报告；/dream now 立即生成，每晚按 digest.at 自动做（缺的天自动补）"
             )
         full = await self.repo.get_digest(row["date"])
         return CommandOutcome(
             f"[{row['date']} 做梦报告（最新）]\n\n{full['report'][:3000]}\n\n"
-            "/dream list 看全部，/dream now 总结今天，/dream night 补缺"
+            "/dream list 看全部（含周/月报告），/dream now 总结今天，/dream night 补链"
         )
 
     @slash("memories", "/memories [subject|关键词]", "长期记忆列表（做梦沉淀+对话补充）")

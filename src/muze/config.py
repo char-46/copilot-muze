@@ -122,6 +122,9 @@ class DigestConfig(BaseModel):
     deliver: bool = True
     extract_memories: bool = True
     max_memories_per_night: int = 8
+    # hierarchical rollups for long-term context compression
+    weekly_enabled: bool = True
+    monthly_enabled: bool = True
 
 
 class MuzeConfig(BaseModel):

@@ -57,7 +57,8 @@ web:
 
 digest:
   # Nightly "dream": summarize each passed day (fixed 01:00), catch up
-  # missing days automatically, and distill long-term memories about the
+  # missing days automatically, roll completed weeks/months into compressed
+  # reports (hierarchical memory), and distill long-term memories about the
   # user and their contacts (fed back into the agent's prompts).
   enabled: true
   at: "01:00"              # local time
@@ -66,6 +67,8 @@ digest:
   deliver: true            # send the report to the control conversation
   extract_memories: true   # second LLM pass: distill identity/preferences
   max_memories_per_night: 8
+  weekly_enabled: true     # roll up completed weeks (2026-W40 style reports)
+  monthly_enabled: true    # roll up completed months (2026-09 style reports)
 
 log:
   level: INFO                # DEBUG for verbose protocol traffic

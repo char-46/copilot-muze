@@ -62,9 +62,55 @@ MEMORY_PROMPT = """你是个人 QQ copilot 的"记忆提炼"模块。基于做�
 # 输出（严格 JSON 数组，不要其他文字；最多 {maxn} 条）
 [{{"action":"add","subject":"...","kind":"identity|preference|relation|fact","content":"一句话中文事实"}}, ...]"""
 
+ROLLUP_PROMPT = """你是个人 QQ copilot 的"层级做梦"模块。以下是 {scope}（{key}）的下一级做梦报告，请压缩提炼成一份{scope}报告，供长期上下文压缩使用。
+
+# 输入（{n} 份子报告）
+{inputs}
+
+# 要求
+## 结构
+- 概览：这段时间的主线是什么（2-3 句）
+- 主题脉络：按话题归并（不是按天罗列），每个话题：涉及谁、来龙去脉、当前状态
+- 待办跟进：上期提出的事项哪些已完成/仍悬置
+- 值得记住的：新沉淀的人物关系/偏好/关键节点
+
+# 原则
+- 压缩率高但信息不丢：细节留在日/周报里，这里只要脉络与结论。
+- 只依据输入报告，不要编造。控制在 {budget} 字内。"""
+
 
 def local_date(ts: float | None = None) -> str:
     return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d")
+
+
+def week_key(date_or_ts) -> str:
+    """ISO week key, e.g. 2026-W40."""
+    d = (
+        datetime.fromtimestamp(date_or_ts).astimezone()
+        if isinstance(date_or_ts, (int, float))
+        else datetime.strptime(str(date_or_ts), "%Y-%m-%d")
+    )
+    iso = d.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def week_days(week: str) -> list[str]:
+    """The seven YYYY-MM-DD keys belonging to an ISO week key."""
+    year, wnum = week.split("-W")
+    try:
+        monday = datetime.fromisocalendar(int(year), int(wnum), 1)
+    except ValueError:
+        return []
+    return [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+
+def month_key(date_or_ts) -> str:
+    d = (
+        datetime.fromtimestamp(date_or_ts).astimezone()
+        if isinstance(date_or_ts, (int, float))
+        else datetime.strptime(str(date_or_ts), "%Y-%m-%d")
+    )
+    return d.strftime("%Y-%m")
 
 
 def day_range(date: str) -> tuple[int, int]:
@@ -168,7 +214,7 @@ async def run_digest(
 
 
 # --------------------------------------------------------------------------
-# nightly flow: catch-up + memory pass
+# nightly flow: day catch-up + weekly/monthly rollups + memory pass
 # --------------------------------------------------------------------------
 async def dream_night(
     repo: Repository,
@@ -178,14 +224,15 @@ async def dream_night(
     *,
     adapter=None,
 ) -> str:
-    """The nightly builtin: catch up every missing day up to yesterday,
-    then run the memory pass over the freshest report. Returns a summary
-    text suitable for delivery."""
-    latest = await repo.latest_digest()
+    """The nightly builtin:
+    1. catch up every missing day up to yesterday (per-day windows);
+    2. roll up completed weeks/months into compressed reports (hierarchical
+       memory — inputs are child reports, not raw messages);
+    3. distill durable memories from the freshest report.
+    """
+    latest = await repo.latest_digest(period="day")
     target = yesterday_date()
     todo = missing_dates(latest["date"] if latest else None, target)
-    if not todo:
-        return f"昨天的梦已存在（{target}），无需补做。"
 
     reports: list[tuple[str, str]] = []
     for d in todo:
@@ -195,8 +242,27 @@ async def dream_night(
             log.exception("dream for %s failed", d)
             reports.append((d, f"(做梦失败: {e})"))
 
+    rollups: list[str] = []
+    if cfg.digest.weekly_enabled:
+        for w in await missing_weeks(repo, limit=4):
+            try:
+                await run_weekly(repo, llm, cfg, chatlog, week=w)
+                rollups.append(f"周报 {w}")
+            except Exception:
+                log.exception("weekly rollup %s failed", w)
+    if cfg.digest.monthly_enabled:
+        for m in await missing_months(repo, limit=2):
+            try:
+                await run_monthly(repo, llm, cfg, chatlog, month=m)
+                rollups.append(f"月报 {m}")
+            except Exception:
+                log.exception("monthly rollup %s failed", m)
+
+    if not reports and not rollups:
+        return f"昨天的梦已存在（{target}），周/月报告无缺口。"
+
     new_memories = 0
-    if cfg.digest.extract_memories and llm.configured:
+    if cfg.digest.extract_memories and llm.configured and reports:
         try:
             new_memories = await extract_memories(
                 repo, llm, cfg, date=reports[-1][0], report=reports[-1][1], chatlog=chatlog
@@ -204,12 +270,155 @@ async def dream_night(
         except Exception:
             log.exception("memory pass failed")
 
-    head = f"做梦完成：补做 {len(reports)} 天（{todo[0]} ~ {todo[-1]}），新记忆 {new_memories} 条。\n\n"
+    head = (
+        f"做梦完成：补做 {len(reports)} 天"
+        + (f"，新增 {', '.join(rollups)}" if rollups else "")
+        + f"，新记忆 {new_memories} 条。\n\n"
+    )
+    if not reports:
+        return head + "（今日日梦已存在，仅补链周/月报告）"
     if len(reports) == 1:
         return head + reports[0][1][:2800]
-    # multiple days: newest in full, others one-liners
     others = "\n".join(f"- {d}: {r[:80].replace(chr(10), ' ')}…" for d, r in reports[:-1])
     return head + others + f"\n\n== 最新（{reports[-1][0]}）==\n" + reports[-1][1][:2200]
+
+
+# --------------------------------------------------------------------------
+# weekly / monthly rollups (hierarchical compression)
+# --------------------------------------------------------------------------
+async def run_weekly(
+    repo: Repository, llm, cfg: MuzeConfig, chatlog: ChatLog, *, week: str
+) -> str:
+    subs: list[tuple[str, str]] = []
+    for dd in week_days(week):
+        row = await repo.get_digest(dd)
+        if row:
+            subs.append((dd, row["report"]))
+    if not subs:
+        raise RuntimeError(f"{week} 没有任何日报告可汇总")
+    return await _run_rollup(
+        repo, llm, cfg, chatlog, key=week, period="week", subs=subs, budget=500
+    )
+
+
+async def run_monthly(
+    repo: Repository, llm, cfg: MuzeConfig, chatlog: ChatLog, *, month: str
+) -> str:
+    # base: day reports of the month (chronological)
+    day_rows = [
+        r for r in await repo.list_digests(limit=31, period="day") if r["date"].startswith(month)
+    ]
+    subs: list[tuple[str, str]] = []
+    for r in day_rows:
+        row = await repo.get_digest(r["date"])
+        if row:
+            subs.append((r["date"], row["report"]))
+    # dense month -> compress through weekly reports covering the month
+    if len(subs) > 12:
+        week_subs: list[tuple[str, str]] = []
+        for r in await repo.list_digests(limit=10, period="week"):
+            if any(dd.startswith(month) for dd in week_days(r["date"])):
+                row = await repo.get_digest(r["date"])
+                if row:
+                    week_subs.append((r["date"], row["report"]))
+        if week_subs:
+            subs = week_subs
+    if not subs:
+        raise RuntimeError(f"{month} 没有任何下级报告可汇总")
+    subs.reverse()
+    return await _run_rollup(
+        repo, llm, cfg, chatlog, key=month, period="month", subs=subs, budget=800
+    )
+
+
+async def _run_rollup(
+    repo: Repository,
+    llm,
+    cfg: MuzeConfig,
+    chatlog: ChatLog,
+    *,
+    key: str,
+    period: str,
+    subs: list[tuple[str, str]],
+    budget: int,
+) -> str:
+    if not llm.configured:
+        raise RuntimeError("LLM 未配置")
+    scope = "周" if period == "week" else "月"
+    inputs = "\n\n---\n\n".join(f"[{k}]\n{r}" for k, r in subs)
+    if len(inputs) > 24000:
+        inputs = inputs[:24000] + "\n...(截断)"
+    prompt = ROLLUP_PROMPT.format(
+        scope=scope, key=key, n=len(subs), inputs=inputs, budget=budget
+    )
+    msg = await llm.chat([{"role": "user", "content": prompt}])
+    report = (msg.get("content") or "").strip() or f"({scope}报告为空)"
+    if len(report) > 6000:
+        report = report[:6000] + "\n...(截断)"
+    await repo.upsert_digest(
+        key, report, 0.0, {"key": key, "period": period, "sub_keys": [k for k, _ in subs]},
+        period=period,
+    )
+    chatlog.log.info(
+        "DREAM      | %s rollup saved (%s sub-reports, %s chars)", key, len(subs), len(report)
+    )
+    if cfg.digest.extract_memories:
+        try:
+            await extract_memories(repo, llm, cfg, date=key, report=report, chatlog=chatlog)
+        except Exception:
+            log.exception("memory pass for %s failed", key)
+    return report
+
+
+async def missing_weeks(repo: Repository, limit: int = 4) -> list[str]:
+    """Completed ISO weeks that have day reports but no week report."""
+    earliest = await repo.earliest_day_digest_date()
+    if not earliest:
+        return []
+    existing = {r["date"] for r in await repo.list_digests(limit=500, period="week")}
+    today_week = week_key(datetime.now().timestamp())
+    out: list[str] = []
+    monday = datetime.strptime(earliest, "%Y-%m-%d")
+    monday = monday - timedelta(days=monday.weekday())
+    while len(out) < limit:
+        wk = week_key(monday.strftime("%Y-%m-%d"))
+        if wk >= today_week:
+            break  # current week is not complete yet
+        if wk not in existing:
+            has_day = False
+            for dd in week_days(wk):
+                if await repo.get_digest(dd):
+                    has_day = True
+                    break
+            if has_day:
+                out.append(wk)
+        monday += timedelta(days=7)
+    return out
+
+
+async def missing_months(repo: Repository, limit: int = 2) -> list[str]:
+    """Completed months that have child reports but no month report."""
+    earliest = await repo.earliest_day_digest_date()
+    if not earliest:
+        return []
+    existing = {r["date"] for r in await repo.list_digests(limit=100, period="month")}
+    now = datetime.now().astimezone()
+    out: list[str] = []
+    cur = datetime.strptime(earliest[:7], "%Y-%m")
+    while len(out) < limit:
+        key = cur.strftime("%Y-%m")
+        if key >= now.strftime("%Y-%m"):
+            break  # current month not complete
+        if key not in existing:
+            has_child = any(
+                r["date"].startswith(key)
+                for r in await repo.list_digests(limit=40)
+            )
+            if has_child:
+                out.append(key)
+        # next month
+        cur = (cur + timedelta(days=32)).replace(day=1)
+    return out
 
 
 async def extract_memories(

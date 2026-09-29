@@ -384,17 +384,18 @@ class Repository:
 
     # ------------------------------------------------------------ digests
     async def upsert_digest(
-        self, date: str, report: str, window_hours: float, stats: dict
+        self, date: str, report: str, window_hours: float, stats: dict,
+        period: str = "day",
     ) -> None:
         await self.conn.execute(
             """
-            INSERT INTO daily_digests (date, created_at, window_hours, report, stats_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO daily_digests (date, period, created_at, window_hours, report, stats_json)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (date) DO UPDATE SET
                 created_at=excluded.created_at, window_hours=excluded.window_hours,
                 report=excluded.report, stats_json=excluded.stats_json
             """,
-            (date, _now(), window_hours, report, json.dumps(stats, ensure_ascii=False)),
+            (date, period, _now(), window_hours, report, json.dumps(stats, ensure_ascii=False)),
         )
         await self.conn.commit()
 
@@ -405,18 +406,35 @@ class Repository:
             row = await cur.fetchone()
         return dict(row) if row else None
 
-    async def list_digests(self, limit: int = 30) -> list[dict]:
-        async with self.conn.execute(
-            "SELECT date, created_at, window_hours, length(report) AS report_len "
-            "FROM daily_digests ORDER BY date DESC LIMIT ?",
-            (limit,),
-        ) as cur:
+    async def list_digests(
+        self, limit: int = 30, period: str | None = None
+    ) -> list[dict]:
+        if period:
+            sql = (
+                "SELECT date, period, created_at, window_hours, length(report) AS report_len "
+                "FROM daily_digests WHERE period=? ORDER BY date DESC LIMIT ?"
+            )
+            args: list = [period, limit]
+        else:
+            sql = (
+                "SELECT date, period, created_at, window_hours, length(report) AS report_len "
+                "FROM daily_digests ORDER BY date DESC LIMIT ?"
+            )
+            args = [limit]
+        async with self.conn.execute(sql, args) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def latest_digest(self) -> dict | None:
-        rows = await self.list_digests(limit=1)
+    async def latest_digest(self, period: str = "day") -> dict | None:
+        rows = await self.list_digests(limit=1, period=period)
         return rows[0] if rows else None
+
+    async def earliest_day_digest_date(self) -> str | None:
+        async with self.conn.execute(
+            "SELECT MIN(date) FROM daily_digests WHERE period='day'"
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row and row[0] else None
 
     async def conversations_active_between(
         self, start_ts: int, end_ts: int, limit: int = 6

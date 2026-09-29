@@ -97,7 +97,8 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks (status, next_run_at);
 
 CREATE TABLE IF NOT EXISTS daily_digests (
-    date         TEXT PRIMARY KEY,        -- local YYYY-MM-DD
+    date         TEXT PRIMARY KEY,        -- day: YYYY-MM-DD | week: YYYY-Www | month: YYYY-MM
+    period       TEXT NOT NULL DEFAULT 'day',  -- day | week | month
     created_at   INTEGER NOT NULL,
     window_hours REAL,
     report       TEXT NOT NULL,
@@ -130,20 +131,32 @@ async def open_db(path: str) -> aiosqlite.Connection:
     return conn
 
 
+async def _migrate_v5_add_period(conn: aiosqlite.Connection) -> None:
+    """daily_digests gained a `period` column in v5 (existing rows are days)."""
+    async with conn.execute("PRAGMA table_info(daily_digests)") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    if "period" not in cols:
+        await conn.execute(
+            "ALTER TABLE daily_digests ADD COLUMN period TEXT NOT NULL DEFAULT 'day'"
+        )
+        await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
     if not has_meta:
         await conn.executescript(SCHEMA_V1)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')")
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
         await conn.commit()
-        log.info("database created (schema v4)")
+        log.info("database created (schema v5)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
     version = int(row[0]) if row else 0
-    if version < 4:
+    if version < 5:
         await conn.executescript(SCHEMA_V1)  # CREATE IF NOT EXISTS: applies missing tables
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')")
+        await _migrate_v5_add_period(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
         await conn.commit()
-        log.info("database migrated to schema v4")
+        log.info("database migrated to schema v5")

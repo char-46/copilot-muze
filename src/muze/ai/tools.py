@@ -153,13 +153,17 @@ SPEC = [
         "function": {
             "name": "recall_dream",
             "description": (
-                "回顾「做梦报告」（系统每天自动生成的全天消息总结）。用户问'昨天/前几天"
-                "聊了什么''上周有什么事'时先查这里，比翻原始消息快。"
+                "回顾「做梦报告」（层级总结：日报/周报/月报）。查历史聊天内容时优先用这个而非翻原始消息："
+                "问'昨天/某天'用日期 YYYY-MM-DD；问'上周/某周'用周报 YYYY-Www（如 2026-W40，一份抵七天）；"
+                "问'上个月/某月趋势'用月报 YYYY-MM。缺省=最新日报。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "date": {"type": "string", "description": "YYYY-MM-DD；缺省=最新一份"},
+                    "date": {
+                        "type": "string",
+                        "description": "YYYY-MM-DD | YYYY-Www | YYYY-MM；缺省=最新日报",
+                    },
                 },
             },
         },
