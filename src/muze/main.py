@@ -44,11 +44,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 class App:
-    def __init__(self, cfg: MuzeConfig) -> None:
+    def __init__(self, cfg: MuzeConfig, config_path: str) -> None:
         self.cfg = cfg
+        self.config_path = config_path
         self.chatlog = ChatLog()
         self.runtime = Runtime()
         self._stop = asyncio.Event()
+        self.restart_requested = False
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -85,12 +87,48 @@ class App:
         )
         self.service.agent = self.agent
 
+        # skills / scheduler / reloader
+        from pathlib import Path
+
+        from muze.reloader import Reloader
+        from muze.scheduler import Scheduler
+        from muze.skills import SkillStore
+
+        repo_root = Path(__file__).resolve().parents[2]
+        self.skills = SkillStore([repo_root / "skills", cfg.storage.data_dir / "skills"])
+        self.skills.reload()
+        self.runtime.skills = self.skills
+
+        self.scheduler = Scheduler(self.repo, self.service, self.chatlog)
+        self.runtime.scheduler = self.scheduler
+        await self.scheduler.start()
+
+        self.reloader = Reloader(
+            config_path=self.config_path,
+            cfg=cfg,
+            skills=self.skills,
+            llm=self.llm,
+            agent=self.agent,
+            runtime=self.runtime,
+        )
+        self.runtime.reloader = self.reloader
+        self.runtime.request_restart = self._request_restart
+        self.runtime.request_stop = self._request_stop
+
         if cfg.web.enabled:
             from muze.web.server import start_web
 
             self.web_runner, _token = await start_web(
                 cfg.web, self.service, self.repo, self.runtime, self.chatlog
             )
+
+    def _request_restart(self) -> None:
+        self.restart_requested = True
+        self._stop.set()
+
+    def _request_stop(self) -> None:
+        self.restart_requested = False
+        self._stop.set()
 
     # ------------------------------------------------------------- events
     async def run(self) -> None:
@@ -210,6 +248,9 @@ class App:
     async def shutdown(self) -> None:
         log.info("shutting down...")
         self._stop.set()
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None:
+            await scheduler.stop()
         if self.backfiller is not None:
             await self.backfiller.stop()
         if self.web_runner is not None:
@@ -220,6 +261,9 @@ class App:
             await self.adapter.close()
         if self.conn is not None:
             await self.conn.close()
+
+
+RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve
 
 
 def run_main(argv: list[str]) -> int:
@@ -234,7 +278,7 @@ def run_main(argv: list[str]) -> int:
     log.info("muze %s starting (config=%s)", get_version(), args.config)
     log.info("log file: %s (never rotated)", log_path)
 
-    app = App(cfg)
+    app = App(cfg, args.config)
     try:
         asyncio.run(_bootstrap(app))
     except KeyboardInterrupt:
@@ -244,6 +288,9 @@ def run_main(argv: list[str]) -> int:
         log.error("protocol side unreachable or misconfigured: %s", e)
         log.error("check: LLBot/Lagrange.Milky is running, milky.base_url & access_token are correct")
         return 3
+    if app.restart_requested:
+        log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
+        return RESTART_EXIT
     return 0
 
 

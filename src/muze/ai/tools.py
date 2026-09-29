@@ -1,7 +1,9 @@
 """Agent tool schema definitions and execution against the archive.
 
-Tools are executed with the requesting ControlContext bound in, so
-`send_message` goes through the same confirmation flow as commands.
+Design (why not MCP): one generic `cli` tool drives every slash command —
+tiny schema footprint, discoverable via `cli('help')`, no giant tool
+definitions eating context. A few focused tools remain where a plain
+command reply is a poor fit (image description, skills, sends).
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ from muze.core.service import ControlContext, ControlService
 from muze.provider.base import ProtocolAdapter, ProtocolError
 from muze.provider.milky.models import out_reply, out_text
 from muze.store.repo import Repository
-from muze.version import get_version
 
 log = logging.getLogger("muze.ai")
 
@@ -22,34 +23,22 @@ SPEC = [
     {
         "type": "function",
         "function": {
-            "name": "list_conversations",
-            "description": "列出会话（好友私聊与群），按最近活跃排序",
+            "name": "cli",
+            "description": (
+                "执行 muze 内部命令（与 /help 列出的一致，不要带斜杠）。"
+                "例: cli({\"command\": \"search 报价 20\"})、cli({\"command\": \"msg group/123 456\"})。"
+                "查询/搜索/读取消息/展开转发/标记已读/定时任务等都走这个工具；"
+                "不确定用法时先 cli({\"command\": \"help\"})。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "active_within_hours": {
-                        "type": "integer",
-                        "description": "只看最近 N 小时内活跃的会话，默认 72",
-                    },
-                    "limit": {"type": "integer", "description": "默认 20，最大 100"},
+                    "command": {
+                        "type": "string",
+                        "description": "命令行（不含斜杠），如 'unread'、'summary friend/123 60'",
+                    }
                 },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_messages",
-            "description": "按关键词搜索已存档的消息全文",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "scene": {"type": "string", "enum": ["friend", "group"]},
-                    "peer_id": {"type": "integer"},
-                    "limit": {"type": "integer", "description": "默认 20，最大 50"},
-                },
-                "required": ["query"],
+                "required": ["command"],
             },
         },
     },
@@ -57,7 +46,7 @@ SPEC = [
         "type": "function",
         "function": {
             "name": "get_recent_messages",
-            "description": "读取某会话最近的消息（含文本内容与媒体状态）",
+            "description": "读取某会话最近的消息（含文本与媒体状态），需要逐条看内容时用",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -66,22 +55,6 @@ SPEC = [
                     "limit": {"type": "integer", "description": "默认 30，最大 100"},
                 },
                 "required": ["scene", "peer_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_message_detail",
-            "description": "查看单条消息的完整内容（所有消息段）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scene": {"type": "string", "enum": ["friend", "group"]},
-                    "peer_id": {"type": "integer"},
-                    "message_seq": {"type": "integer"},
-                },
-                "required": ["scene", "peer_id", "message_seq"],
             },
         },
     },
@@ -104,26 +77,10 @@ SPEC = [
     {
         "type": "function",
         "function": {
-            "name": "get_forwarded_messages",
-            "description": "展开合并转发消息的内容（若协议端支持）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scene": {"type": "string", "enum": ["friend", "group"]},
-                    "peer_id": {"type": "integer"},
-                    "message_seq": {"type": "integer"},
-                },
-                "required": ["scene", "peer_id", "message_seq"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "send_message",
             "description": (
-                "以被控号的名义向某会话发送文本消息。受确认机制约束："
-                "通常返回一个待确认编号，需要控制者 /confirm 后才真正发出。"
+                "以被控号的名义向某会话发送文本。受确认机制约束：通常返回待确认编号，"
+                "需控制者 /confirm 后才真正发出。"
             ),
             "parameters": {
                 "type": "object",
@@ -131,10 +88,7 @@ SPEC = [
                     "scene": {"type": "string", "enum": ["friend", "group"]},
                     "peer_id": {"type": "integer"},
                     "text": {"type": "string"},
-                    "reply_seq": {
-                        "type": "integer",
-                        "description": "可选：引用回复某条消息的 seq",
-                    },
+                    "reply_seq": {"type": "integer", "description": "可选：引用回复的消息 seq"},
                 },
                 "required": ["scene", "peer_id", "text"],
             },
@@ -143,24 +97,70 @@ SPEC = [
     {
         "type": "function",
         "function": {
-            "name": "mark_conversation_read",
-            "description": "把某会话标记为已读（若协议端支持）",
+            "name": "schedule_task",
+            "description": (
+                "创建计划任务：到点后系统会把 prompt 原样交给 AI 执行，并把结果发送到控制者的"
+                "控制会话。用户说「两小时后提醒我X」「每两小时发一次总结」「明早9点…」时用这个工具。"
+                "你必须把用户的自然语言时间换算成参数：相对时间→delay_sec；"
+                "绝对时间(如'明天早上9点')→at_iso(本地时区ISO)；周期→interval_sec。"
+                "prompt 写成给未来 AI 的完整指令，如「总结 friend/123 最近 50 条并给出待办」。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "scene": {"type": "string", "enum": ["friend", "group"]},
-                    "peer_id": {"type": "integer"},
+                    "prompt": {"type": "string", "description": "到期执行的指令（给 AI 的自然语言或 /命令）"},
+                    "delay_sec": {"type": "integer", "description": "多少秒后执行（一次性，与 at_iso/interval_sec 互斥）"},
+                    "at_iso": {"type": "string", "description": "绝对执行时间，本地时区 ISO 格式"},
+                    "interval_sec": {"type": "integer", "description": "周期执行的间隔秒数"},
+                    "note": {"type": "string", "description": "任务备注（用户原话）"},
                 },
-                "required": ["scene", "peer_id"],
+                "required": ["prompt"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "system_status",
-            "description": "查看系统状态（版本、消息量、补拉状态、能力）",
-            "parameters": {"type": "object", "properties": {}},
+            "name": "read_document",
+            "description": (
+                "读取本地文档全文（QQ 收到的文件已自动落盘，配合 cli 的 msg/media 命令找到路径）。"
+                "支持 docx/txt/md/html/csv/json；doc/pdf 暂不支持会明确报错。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "本地文件绝对路径"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "抓取 URL 的文本内容（网页/在线文档）。遇到金山文档/腾讯文档等需要 JS 或登录的页面"
+                "会返回具体可行的替代建议；QQ 小程序卡片先读 doc-sources 技能找直链。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill",
+            "description": (
+                "阅读一个已安装技能的完整说明（先 cli({\"command\":\"skills\"}) 看列表）。"
+                "当任务与某技能描述相关时，务必先读该技能再操作。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
         },
     },
 ]
@@ -185,12 +185,14 @@ class ToolRunner:
         try:
             handler = getattr(self, f"t_{name}")
             result = await handler(args)
-            return json.dumps(result, ensure_ascii=False, default=str)
+            payload = json.dumps(result, ensure_ascii=False, default=str)
         except ProtocolError as e:
-            return json.dumps({"error": f"协议端错误: {e}"}, ensure_ascii=False)
+            payload = json.dumps({"error": f"协议端错误: {e}"}, ensure_ascii=False)
         except Exception as e:
             log.warning("tool %s failed: %s", name, e)
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
+            payload = json.dumps({"error": str(e)}, ensure_ascii=False)
+        log.info("LLM tool  | %s(%s) -> %s", name, _args_brief(args), payload[:4000])
+        return payload
 
     # ----------------------------------------------------------- helpers
     def _row_brief(self, r: dict) -> dict:
@@ -203,45 +205,16 @@ class ToolRunner:
         }
 
     # ------------------------------------------------------------- tools
-    async def t_list_conversations(self, args: dict) -> dict:
-        rows = await self.repo.list_conversations(
-            active_within_h=args.get("active_within_hours", 72),
-            limit=min(args.get("limit", 20), 100),
-        )
-        convs = []
-        for r in rows:
-            name = r["name"]
-            if not name:
-                try:
-                    if r["scene"] == "group":
-                        name = await self.adapter.ensure_group_name(r["peer_id"])
-                    else:
-                        name = await self.adapter.ensure_friend_name(r["peer_id"])
-                except Exception:
-                    name = ""
-            convs.append(
-                {
-                    "scene": r["scene"],
-                    "peer_id": r["peer_id"],
-                    "name": name,
-                    "messages": r["message_count"],
-                    "last_active": epoch_iso(r["last_active_at"]),
-                }
-            )
-        return {"conversations": convs}
-
-    async def t_search_messages(self, args: dict) -> dict:
-        rows = await self.repo.search_messages(
-            args["query"],
-            scene=args.get("scene"),
-            peer_id=args.get("peer_id"),
-            limit=min(args.get("limit", 20), 50),
-        )
+    async def t_cli(self, args: dict) -> dict:
+        command = str(args.get("command", "")).strip().lstrip("/")
+        if not command:
+            return {"error": "empty command", "hint": "cli({\"command\":\"help\"})"}
+        outcome = await self.service.run_command(command, self.ctx)
+        if outcome.is_error:
+            return {"is_error": True, "output": outcome.text}
         return {
-            "matches": [
-                {**self._row_brief(r), "scene": r["scene"], "peer_id": r["peer_id"]}
-                for r in rows
-            ]
+            "output": outcome.text,
+            "media": outcome.media_paths,
         }
 
     async def t_get_recent_messages(self, args: dict) -> dict:
@@ -267,20 +240,6 @@ class ToolRunner:
             out.append(item)
         return {"messages": out}
 
-    async def t_get_message_detail(self, args: dict) -> dict:
-        r = await self.repo.get_message_row(args["scene"], args["peer_id"], args["message_seq"])
-        if not r:
-            return {"error": "消息不存在"}
-        medias = await self.repo.media_for_message(args["scene"], args["peer_id"], args["message_seq"])
-        return {
-            **self._row_brief(r),
-            "raw": json.loads(r["raw_json"]),
-            "media": [
-                {"kind": m["kind"], "status": m["status"], "file": m["file_path"]}
-                for m in medias
-            ],
-        }
-
     async def t_describe_image(self, args: dict) -> dict:
         medias = await self.repo.media_for_message(
             args["scene"], args["peer_id"], args["message_seq"]
@@ -295,31 +254,6 @@ class ToolRunner:
             out.append(desc)
         return {"descriptions": out}
 
-    async def t_get_forwarded_messages(self, args: dict) -> dict:
-        r = await self.repo.get_message_row(args["scene"], args["peer_id"], args["message_seq"])
-        if not r:
-            return {"error": "消息不存在"}
-        raw = json.loads(r["raw_json"])
-        forward_id = ""
-        for seg in raw.get("segments", []):
-            if seg.get("type") == "forward":
-                forward_id = seg.get("data", {}).get("forward_id", "")
-        if not forward_id:
-            return {"error": "该消息不是合并转发"}
-        msgs = await self.adapter.get_forwarded_messages(forward_id)
-        from muze.chatlog import render_segment
-
-        return {
-            "messages": [
-                {
-                    "sender": m.sender_name or str(m.sender_id),
-                    "time": epoch_iso(m.time),
-                    "content": " ".join(render_segment(s) for s in m.segments),
-                }
-                for m in msgs
-            ]
-        }
-
     async def t_send_message(self, args: dict) -> dict:
         text = args["text"]
         segments = [out_text(text)]
@@ -330,22 +264,83 @@ class ToolRunner:
         )
         return {"result": outcome.text, "is_error": outcome.is_error}
 
-    async def t_mark_conversation_read(self, args: dict) -> dict:
-        rows = await self.repo.get_messages(args["scene"], args["peer_id"], limit=1)
-        if not rows:
-            return {"result": "会话无消息"}
-        try:
-            await self.adapter.mark_read(args["scene"], args["peer_id"], rows[0]["message_seq"])
-            return {"result": "已标记已读"}
-        except ProtocolError as e:
-            return {"result": f"失败: {e}"}
+    async def t_schedule_task(self, args: dict) -> dict:
+        scheduler = self.service.runtime.scheduler
+        if scheduler is None:
+            return {"error": "scheduler 未装配"}
+        prompt = str(args.get("prompt", "")).strip()
+        if not prompt:
+            return {"error": "prompt 不能为空"}
+        kwargs: dict = {}
+        if args.get("interval_sec"):
+            kwargs["interval_sec"] = int(args["interval_sec"])
+        elif args.get("at_iso"):
+            from datetime import datetime
 
-    async def t_system_status(self, args: dict) -> dict:
-        stats = await self.repo.stats()
-        bf = self.service.runtime.backfiller.status() if self.service.runtime.backfiller else {}
+            try:
+                dt = datetime.fromisoformat(str(args["at_iso"]))
+                if dt.tzinfo is None:
+                    dt = dt.astimezone()
+                kwargs["at_ts"] = int(dt.timestamp())
+            except ValueError as e:
+                return {"error": f"at_iso 解析失败: {e}"}
+        elif args.get("delay_sec") is not None:
+            kwargs["delay_sec"] = int(args["delay_sec"])
+        else:
+            return {"error": "需要 delay_sec / at_iso / interval_sec 之一"}
+        try:
+            task = await scheduler.create(
+                prompt=prompt, ctx=self.ctx, created_by="agent",
+                note=str(args.get("note", ""))[:200],
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        from muze.chatlog import epoch_iso
+
         return {
-            "version": get_version(),
-            "stats": stats,
-            "backfill": bf,
-            "capabilities": self.adapter.caps.summary_lines(),
+            "created": True,
+            "task_id": task["id"],
+            "kind": task["kind"],
+            "next_run": epoch_iso(task["next_run_at"]),
+            "hint": "已创建；可用 cli({\"command\":\"tasks\"}) 查看，取消用 cli({\"command\":\"canceltask <id>\"})",
         }
+
+    async def t_read_document(self, args: dict) -> dict:
+        from muze.docs import read_document
+
+        path = str(args.get("path", "")).strip()
+        try:
+            text = await __import__("asyncio").to_thread(read_document, path)
+        except (FileNotFoundError, ValueError) as e:
+            return {"error": str(e)}
+        return {"path": path, "content": text}
+
+    async def t_fetch_url(self, args: dict) -> dict:
+        from muze.docs import fetch_url
+
+        url = str(args.get("url", "")).strip()
+        if not url.startswith(("http://", "https://")):
+            return {"error": "仅支持 http(s) URL"}
+        try:
+            text = await fetch_url(url)
+        except Exception as e:
+            return {"error": str(e)}
+        return {"url": url, "content": text}
+
+    async def t_read_skill(self, args: dict) -> dict:
+        skills = self.service.runtime.skills
+        if skills is None:
+            return {"error": "skills 未启用"}
+        name = str(args.get("name", "")).strip()
+        sk = skills.get(name)
+        if sk is None:
+            return {
+                "error": f"技能 {name} 不存在",
+                "available": [s.name for s in skills.list()],
+            }
+        return {"name": sk.name, "body": sk.body[:8000]}
+
+
+def _args_brief(args: dict) -> str:
+    s = json.dumps(args, ensure_ascii=False, default=str)
+    return s[:300]

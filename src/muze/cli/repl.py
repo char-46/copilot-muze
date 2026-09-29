@@ -57,6 +57,15 @@ def run_cli(argv: list[str]) -> int:
         service = ControlService(cfg, adapter, repo, chatlog, runtime)
         llm = LLMClient(cfg.llm)
         service.agent = Agent(service, repo, llm, chatlog, cfg.llm.agent_max_steps)
+
+        from pathlib import Path
+
+        from muze.skills import SkillStore
+
+        repo_root = Path(__file__).resolve().parents[3]
+        skills = SkillStore([repo_root / "skills", cfg.storage.data_dir / "skills"])
+        skills.reload()
+        runtime.skills = skills
         ctx = ControlContext(
             source="cli",
             chat_key="cli:console",

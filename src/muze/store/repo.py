@@ -320,6 +320,68 @@ class Repository:
         await self.conn.commit()
         return cur.rowcount
 
+    # ------------------------------------------------------ scheduled tasks
+    async def create_task(
+        self,
+        kind: str,
+        prompt: str,
+        control_scene: str,
+        control_peer_id: int,
+        next_run_at: int,
+        interval_sec: int | None,
+        created_by: str = "",
+        note: str = "",
+    ) -> int:
+        cur = await self.conn.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (kind, prompt, control_scene, control_peer_id, next_run_at,
+                 interval_sec, status, created_by, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+            """,
+            (kind, prompt, control_scene, control_peer_id, next_run_at,
+             interval_sec, created_by, note, _now(), _now()),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid)
+
+    async def due_tasks(self, now_ts: int | None = None) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE status='active' AND next_run_at <= ? ORDER BY next_run_at",
+            (now_ts or _now(),),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def list_tasks(self, active_only: bool = True) -> list[dict]:
+        sql = "SELECT * FROM scheduled_tasks"
+        if active_only:
+            sql += " WHERE status='active'"
+        sql += " ORDER BY next_run_at DESC LIMIT 100"
+        async with self.conn.execute(sql) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_task(self, task_id: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE id=?", (task_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def finish_task(self, task_id: int, status: str, last_result: str = "",
+                          next_run_at: int | None = None) -> None:
+        await self.conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status=?, last_result=?, updated_at=?,
+                next_run_at=COALESCE(?, next_run_at)
+            WHERE id=?
+            """,
+            (status, last_result[:1000], _now(), next_run_at, task_id),
+        )
+        await self.conn.commit()
+
     # ---------------------------------------------------------------- stats
     async def stats(self) -> dict:
         out: dict[str, Any] = {}
