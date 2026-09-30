@@ -40,6 +40,12 @@ actually supports and degrades lazily.
 - `get_history_messages` roaming pull recovers messages that arrived while the
   copilot was offline — including already-read and self-sent ones (there is no
   `message_sent` push event in the standard, so periodic rescans pick those up).
+  Each conversation keeps **resumable watermarks** (`last_seq` high-water plus a
+  persisted cursor/target for an unfinished deep pull), so an interrupted,
+  page-capped or crash-killed pull continues where it stopped instead of leaving
+  a hole that only `/sync force` could fill. The account DB also records
+  `login_at` / `last_seen_at` / `last_shutdown_at` so the downtime window is
+  visible on the next start.
 - `get_resource_temp_url` + file download APIs let muze persist every image /
   voice / video / file to disk before temp URLs expire. Blobs are sniffed by
   magic bytes (correct extension), and SILK voice is decoded to a playable

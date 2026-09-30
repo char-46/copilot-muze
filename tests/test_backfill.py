@@ -242,3 +242,119 @@ async def test_deep_pull_ignores_watermark(repo):
     assert new == 60  # 31..90 pulled despite watermark at 90
     stats = await repo.coverage_stats("friend", 100)
     assert stats["n"] == 90 and stats["min_seq"] == 1
+
+
+# ---------------------------------------------- multi-watermark resume (v8)
+async def _msg_count(repo, scene, peer):
+    async with repo.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE scene=? AND peer_id=?", (scene, peer)
+    ) as cur:
+        return (await cur.fetchone())[0]
+
+
+async def test_backfill_resumes_interrupted_pull(repo):
+    """A page-capped pull persists cursor/target; the next run continues the
+    hole instead of stopping at the raised last_seq (= the old bug)."""
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    bf.cfg.ingest.backfill.max_pages_per_conv = 1
+
+    await bf.run_once([("friend", 100)])
+    assert await repo.get_watermark("friend", 100) == 90  # newest page stored
+    assert await _msg_count(repo, "friend", 100) == 30    # only page 1
+    state = await repo.get_bf_state("friend", 100)
+    assert state.get("cursor") == 31 and state.get("target") == 0
+    assert ("friend", 100) in await repo.pending_bf_conversations()
+
+    # "restart": pages are re-served by the fake; the resume must go DOWN
+    bf.cfg.ingest.backfill.max_pages_per_conv = 10
+    adapter2 = FakeAdapter(
+        {("friend", 100): [
+            {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+            {"start": 1, "seqs": list(range(1, 31)), "next": None},
+        ]}
+    )
+    bf.adapter = adapter2
+    await bf.run_once([("friend", 100)])
+    assert await _msg_count(repo, "friend", 100) == 90  # hole filled
+    assert await repo.get_bf_state("friend", 100) == {}  # state cleared
+    assert ("friend", 100) not in await repo.pending_bf_conversations()
+
+
+async def test_backfill_clears_state_on_completion(repo):
+    pages = [{"start": 1, "seqs": [1, 2, 3], "next": None}]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    await bf.run_once([("friend", 100)])
+    assert await repo.get_bf_state("friend", 100) == {}
+    assert await repo.pending_bf_conversations() == []
+
+
+async def test_force_cap_leaves_resumable_full_pull(repo):
+    """A page-capped force pull records target=0 so the next run continues."""
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    bf.cfg.ingest.backfill.max_pages_per_conv = 1
+    await bf.run_once([("friend", 100)], force=True)
+    state = await repo.get_bf_state("friend", 100)
+    assert state.get("cursor") == 31 and state.get("target") == 0
+
+
+async def test_meta_roundtrip(repo):
+    assert await repo.get_meta("login_at") is None
+    await repo.set_meta("login_at", "1700000000")
+    await repo.set_meta("login_at", "1700000001")  # upsert
+    assert await repo.get_meta("login_at") == "1700000001"
+
+
+async def test_bf_only_row_hidden_from_lists(repo):
+    """A conversation row existing solely for resume state must not show up
+    in /unread or inflate stats — but rescan still sees it as pending."""
+    await repo.set_bf_state("friend", 5, cursor=10, target=0)
+    assert all(c["peer_id"] != 5 for c in await repo.list_conversations())
+    assert (await repo.stats())["conversations"] == 0
+    assert ("friend", 5) in await repo.pending_bf_conversations()
+    await repo.clear_bf_state("friend", 5)
+    assert await repo.pending_bf_conversations() == []
+
+
+async def test_migration_v7_to_v8_adds_columns(tmp_path):
+    import aiosqlite
+
+    path = str(tmp_path / "old.db")
+    conn = await aiosqlite.connect(path)
+    await conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE conversations (
+            scene TEXT NOT NULL, peer_id INTEGER NOT NULL,
+            name TEXT NOT NULL DEFAULT '', last_seq INTEGER NOT NULL DEFAULT 0,
+            last_active_at INTEGER, PRIMARY KEY (scene, peer_id));
+        INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+        """
+    )
+    await conn.commit()
+    await conn.close()
+
+    from muze.store.db import open_db
+
+    conn = await open_db(path)
+    async with conn.execute("PRAGMA table_info(conversations)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    assert {"bf_cursor_seq", "bf_target_seq", "bf_last_run_at", "last_op_at"} <= cols
+    async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
+        assert (await cur.fetchone())[0] == "8"
+    await conn.close()

@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     name          TEXT    NOT NULL DEFAULT '',
     last_seq      INTEGER NOT NULL DEFAULT 0,
     last_active_at INTEGER,
+    -- multi-watermark backfill state (schema v8):
+    bf_cursor_seq INTEGER,          -- resume cursor: next_message_seq of the
+                                    -- last page of an UNFINISHED deep pull
+    bf_target_seq INTEGER,          -- resume lower bound: pull until oldest
+                                    -- seq <= this (NULL = no pending pull)
+    bf_last_run_at REAL,            -- wall clock of the last backfill run
+    last_op_at    REAL,             -- wall clock of the last stored message
     PRIMARY KEY (scene, peer_id)
 );
 
@@ -164,14 +171,41 @@ async def _migrate_v7_media_time(conn: aiosqlite.Connection) -> None:
         await conn.commit()
 
 
+_V8_CONVERSATION_COLUMNS = (
+    ("bf_cursor_seq", "ALTER TABLE conversations ADD COLUMN bf_cursor_seq INTEGER"),
+    ("bf_target_seq", "ALTER TABLE conversations ADD COLUMN bf_target_seq INTEGER"),
+    ("bf_last_run_at", "ALTER TABLE conversations ADD COLUMN bf_last_run_at REAL"),
+    ("last_op_at", "ALTER TABLE conversations ADD COLUMN last_op_at REAL"),
+)
+
+
+async def _migrate_v8_bf_watermarks(conn: aiosqlite.Connection) -> None:
+    """v8: conversations gained multi-watermark backfill state + op timestamps.
+
+    bf_cursor_seq/bf_target_seq let an interrupted (or page-capped, or
+    crash-killed) pull resume exactly where it stopped instead of leaving a
+    silent hole below last_seq that only /sync force could recover.
+    """
+    async with conn.execute("PRAGMA table_info(conversations)") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    changed = False
+    for col, ddl in _V8_CONVERSATION_COLUMNS:
+        if col not in cols:
+            await conn.execute(ddl)
+            changed = True
+    if changed:
+        await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
     if not has_meta:
         await conn.executescript(SCHEMA_V1)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '7')")
+        await _migrate_v8_bf_watermarks(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '8')")
         await conn.commit()
-        log.info("database created (schema v7)")
+        log.info("database created (schema v8)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -184,3 +218,9 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '7')")
         await conn.commit()
         log.info("database migrated to schema v7")
+        version = 7
+    if version < 8:
+        await _migrate_v8_bf_watermarks(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '8')")
+        await conn.commit()
+        log.info("database migrated to schema v8 (backfill resume watermarks)")

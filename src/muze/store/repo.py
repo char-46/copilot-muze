@@ -91,14 +91,15 @@ class Repository:
     async def _touch_conversation(self, msg: IncomingMessage, name: str) -> None:
         await self.conn.execute(
             """
-            INSERT INTO conversations (scene, peer_id, name, last_seq, last_active_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO conversations (scene, peer_id, name, last_seq, last_active_at, last_op_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (scene, peer_id) DO UPDATE SET
                 last_seq = MAX(last_seq, excluded.last_seq),
                 last_active_at = MAX(COALESCE(last_active_at, 0), excluded.last_active_at),
+                last_op_at = excluded.last_op_at,
                 name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END
             """,
-            (msg.message_scene, msg.peer_id, name, msg.message_seq, msg.time),
+            (msg.message_scene, msg.peer_id, name, msg.message_seq, msg.time, _now()),
         )
 
     async def set_recalled(self, scene: str, peer_id: int, message_seq: int) -> bool:
@@ -116,6 +117,69 @@ class Repository:
         ) as cur:
             row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+    # ---------------------------------------------- backfill resume state
+    async def get_bf_state(self, scene: str, peer_id: int) -> dict:
+        """Multi-watermark pull state: cursor (where an unfinished deep pull
+        stopped) + target (its lower bound). Empty dict when none pending."""
+        async with self.conn.execute(
+            "SELECT bf_cursor_seq, bf_target_seq FROM conversations "
+            "WHERE scene = ? AND peer_id = ?",
+            (scene, peer_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or row["bf_target_seq"] is None:
+            return {}
+        return {"cursor": row["bf_cursor_seq"], "target": row["bf_target_seq"]}
+
+    async def set_bf_state(
+        self, scene: str, peer_id: int, cursor: int, target: int
+    ) -> None:
+        """Persist resume progress (called after every completed page so a
+        crash never loses more than one page of work)."""
+        await self.conn.execute(
+            """
+            INSERT INTO conversations (scene, peer_id, bf_cursor_seq, bf_target_seq, bf_last_run_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (scene, peer_id) DO UPDATE SET
+                bf_cursor_seq = excluded.bf_cursor_seq,
+                bf_target_seq = excluded.bf_target_seq,
+                bf_last_run_at = excluded.bf_last_run_at
+            """,
+            (scene, peer_id, cursor, target, _now()),
+        )
+        await self.conn.commit()
+
+    async def clear_bf_state(self, scene: str, peer_id: int) -> None:
+        await self.conn.execute(
+            "UPDATE conversations SET bf_cursor_seq = NULL, bf_target_seq = NULL, "
+            "bf_last_run_at = ? WHERE scene = ? AND peer_id = ?",
+            (_now(), scene, peer_id),
+        )
+        await self.conn.commit()
+
+    async def pending_bf_conversations(self) -> list[tuple[str, int]]:
+        """Conversations with an unfinished (hole-filling) pull pending."""
+        async with self.conn.execute(
+            "SELECT scene, peer_id FROM conversations WHERE bf_target_seq IS NOT NULL"
+        ) as cur:
+            return [(r[0], r[1]) for r in await cur.fetchall()]
+
+    # ------------------------------------------------------------ meta kv
+    async def get_meta(self, key: str) -> str | None:
+        async with self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return str(row[0]) if row else None
+
+    async def set_meta(self, key: str, value: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await self.conn.commit()
 
     async def get_message_row(self, scene: str, peer_id: int, message_seq: int) -> dict | None:
         async with self.conn.execute(
@@ -179,8 +243,11 @@ class Repository:
     ) -> list[dict]:
         sql = "SELECT * FROM conversations"
         args: list[Any] = []
+        # a row may exist only to hold backfill resume state (no messages yet):
+        # those are surfaced via pending_bf_conversations(), not as chats
+        sql += " WHERE last_seq > 0"
         if active_within_h:
-            sql += " WHERE last_active_at >= ?"
+            sql += " AND last_active_at >= ?"
             args.append(int(time.time()) - int(active_within_h * 3600))
         sql += " ORDER BY last_active_at DESC LIMIT ?"
         args.append(max(1, min(int(limit), 1000)))
@@ -653,7 +720,9 @@ class Repository:
     # ---------------------------------------------------------------- stats
     async def stats(self) -> dict:
         out: dict[str, Any] = {}
-        async with self.conn.execute("SELECT COUNT(*) FROM conversations") as cur:
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE last_seq > 0"
+        ) as cur:
             out["conversations"] = (await cur.fetchone())[0]
         async with self.conn.execute("SELECT COUNT(*) FROM messages") as cur:
             out["messages"] = (await cur.fetchone())[0]

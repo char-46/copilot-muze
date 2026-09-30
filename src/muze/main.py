@@ -53,6 +53,14 @@ from muze.version import get_version
 log = logging.getLogger("muze.main")
 
 
+def _ts(v: str | float | None) -> str:
+    """Unix epoch (string or number) -> local 'YYYY-mm-dd HH:MM:SS', or '-'."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(v)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "-"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="muze serve", description="copilot-muze daemon")
     p.add_argument("-c", "--config", default="config.yaml", help="path to config.yaml")
@@ -75,6 +83,7 @@ class App:
         self._shutdown_done = False
         self._mt_task = None
         self._sup_task = None
+        self._last_seen_write = 0.0
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -107,6 +116,7 @@ class App:
                 f"数据目录 {acct} 已绑定账号 {conflict}，"
                 f"当前登录的是 {login.user_id}。请勿手工挪用账号数据目录。"
             )
+        await self._record_login()
 
         self.blobstore = BlobStore(cfg.storage.data_dir / "blobs")
         self.media = MediaStore(
@@ -162,6 +172,34 @@ class App:
     def _request_stop(self) -> None:
         self.restart_requested = False
         self._stop.set()
+
+    async def _record_login(self) -> None:
+        """Persist this session's start; log the previous online window so the
+        downtime (and thus what backfill may need to recover) is visible."""
+        prev_login = await self.repo.get_meta("login_at")
+        prev_seen = await self.repo.get_meta("last_seen_at")
+        prev_shutdown = await self.repo.get_meta("last_shutdown_at")
+        if prev_login or prev_seen:
+            log.info(
+                "[%s] 上次在线: %s ~ %s%s",
+                self.spec.name, _ts(prev_login), _ts(prev_seen or prev_shutdown),
+                f"（正常关闭于 {_ts(prev_shutdown)}）" if prev_shutdown else "",
+            )
+        now = time.time()
+        self._last_seen_write = now
+        await self.repo.set_meta("login_at", str(now))
+        await self.repo.set_meta("last_seen_at", str(now))
+
+    async def _touch_seen(self) -> None:
+        """Record 'last operation' time, throttled to one write per minute."""
+        now = time.time()
+        if now - self._last_seen_write < 60:
+            return
+        self._last_seen_write = now
+        try:
+            await self.repo.set_meta("last_seen_at", str(now))
+        except Exception:
+            log.exception("last_seen update failed")
 
     def _stop_quiet(self) -> None:
         """Stop this account WITHOUT changing its restart intent.
@@ -251,6 +289,7 @@ class App:
 
     async def dispatch(self, ev: Event) -> None:
         try:
+            await self._touch_seen()
             if ev.event_type == "message_receive" and isinstance(ev.data, MessageEventData):
                 await self.on_message(ev.data)
             elif ev.event_type == "message_recall" and isinstance(ev.data, MessageRecallData):
@@ -323,6 +362,7 @@ class App:
                     log.info("media retry recovered %s file(s)", fixed)
             except Exception:
                 log.exception("maintenance cycle failed")
+            await self._touch_seen()  # keep the last-operation time fresh
 
     async def shutdown(self) -> None:
         if getattr(self, "_shutdown_done", False):
@@ -330,6 +370,10 @@ class App:
         self._shutdown_done = True
         log.info("[%s] shutting down...", self.spec.name)
         self._stop.set()
+        try:
+            await self.repo.set_meta("last_shutdown_at", str(time.time()))
+        except Exception:
+            pass
 
         async def _safe(what: str, coro, timeout: float) -> None:
             try:

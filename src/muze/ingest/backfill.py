@@ -4,6 +4,13 @@ messages) from the protocol side until the stored watermark is covered.
 This is the mechanism that makes the copilot resilient to downtime: messages
 that arrived while offline are recovered from server-side roaming on startup
 and on every periodic rescan.
+
+Watermarks (schema v8): each conversation keeps a high-water mark
+(``last_seq`` = newest stored seq) plus a resumable deep-pull state
+(``bf_cursor_seq`` + ``bf_target_seq``). A pull pages from newest down to
+``target`` and persists progress after every page, so an interruption — crash,
+page cap, restart — resumes exactly where it stopped instead of leaving a
+silent hole below ``last_seq`` (which previously required ``/sync force``).
 """
 
 from __future__ import annotations
@@ -88,12 +95,31 @@ class Backfiller:
             return 0
 
         watermark = await self.repo.get_watermark(scene, peer_id)
-        # force: ignore the watermark stop — keep paging to the roaming end
-        # (duplicates are upsert-deduped, this catches anything missed)
-        stop_watermark = 0 if force else watermark
+        # Multi-watermark pull: `target` is the lower bound to page down to and
+        # `cursor` is where an unfinished pull left off (both persisted, so a
+        # crash / page-cap / restart resumes instead of leaving a silent hole).
+        if force:
+            target: int = 0
+            cursor: int | None = None
+        else:
+            resume = await self.repo.get_bf_state(scene, peer_id)
+            if resume:
+                target = int(resume["target"])
+                cursor = resume["cursor"]
+                log.info(
+                    "backfill %s resuming interrupted pull (cursor=%s target=%s)",
+                    conv_id(scene, peer_id), cursor, target,
+                )
+            else:
+                target, cursor = watermark, None
+        stop_watermark = target
         total_new = 0
         pages = 0
-        cursor: int | None = None
+        done = False  # reached the target / the roaming end / the pager's end
+
+        # record intent up front so even a crash during the first page can be
+        # resumed (otherwise the partial upserts raise last_seq and hide the hole)
+        await self.repo.set_bf_state(scene, peer_id, cursor=cursor, target=stop_watermark)
 
         while pages < bf.max_pages_per_conv and not self._stop.is_set():
             try:
@@ -112,9 +138,9 @@ class Backfiller:
             oldest = None
             for m in res.messages:  # ascending by message_seq
                 oldest = m.message_seq if oldest is None else min(oldest, m.message_seq)
-                # force: feed EVERYTHING through upsert — the primary key
-                # dedupes what's stored, recovering holes below the watermark
-                if force or m.message_seq > watermark:
+                # upsert everything above the target (dedup keeps it cheap);
+                # holes below last_seq — but above target — get recovered here
+                if m.message_seq > stop_watermark:
                     if await self.pipeline.handle_message(m, source="backfill"):
                         page_new += 1
             total_new += page_new
@@ -123,23 +149,39 @@ class Backfiller:
                 await reporter.maybe_tick()
 
             # Stop conditions:
-            #  - server says no more pages
-            #  - we covered the watermark (everything older is already stored)
-            #    [skipped in force mode]
-            #  - cursor stopped moving (safety against implementation quirks)
+            #  - server says no more pages (roaming end)
+            #  - we paged down to the target (everything older is covered)
+            #  - cursor stopped moving (safety against pager quirks)
             if res.next_message_seq is None:
+                done = True
                 break
             if oldest is not None and oldest <= stop_watermark:
+                done = True
                 break
             if cursor is not None and res.next_message_seq >= cursor:
+                done = True
                 break
+
             cursor = res.next_message_seq
+            # persist progress so an interruption never loses more than a page
+            await self.repo.set_bf_state(
+                scene, peer_id, cursor=cursor, target=stop_watermark
+            )
             await asyncio.sleep(bf.page_delay)
+
+        if done:
+            await self.repo.clear_bf_state(scene, peer_id)
+        else:
+            log.info(
+                "backfill %s paused (page cap/interrupt) at %s pages; "
+                "will resume (cursor=%s target=%s)",
+                conv_id(scene, peer_id), pages, cursor, stop_watermark,
+            )
 
         if total_new or force:
             log.info(
-                "backfill %s +%s new (pages=%s, watermark was %s, force=%s)",
-                conv_id(scene, peer_id), total_new, pages, watermark, force,
+                "backfill %s +%s new (pages=%s, watermark was %s, target=%s, force=%s)",
+                conv_id(scene, peer_id), total_new, pages, watermark, stop_watermark, force,
             )
         return total_new
 
@@ -332,10 +374,12 @@ class Backfiller:
                 log.warning("rescan failed: %s", e)
 
     async def _rescan_targets(self) -> list[tuple[str, int]]:
-        """Rescan recently-active conversations plus control conversations."""
+        """Rescan recently-active conversations plus control conversations,
+        plus any conversation with an unfinished deep pull (hole to resume)."""
         bf = self.cfg.ingest.backfill
         rows = await self.repo.list_conversations(active_within_h=bf.rescan_active_window_h)
         targets = [(r["scene"], r["peer_id"]) for r in rows]
+        targets.extend(await self.repo.pending_bf_conversations())
         cfg = self.cfg
         if cfg.control.control_group:
             targets.append(("group", cfg.control.control_group))
