@@ -165,17 +165,46 @@ Agent turns are asynchronous and session-tracked:
   is a *silence* limit between chunks — a slow but producing model is never
   cut, while a dead connection and hung tools (`llm.turn_timeout_sec`) are.
 
+### Identity profiles & RAG
+
+- **Identity profiles** (`profiles.*`): the LLM periodically distills a short
+  markdown "who is who" doc per active conversation (`profiles` table) —
+  members, nicknames/aliases that map to the same person, which account is
+  whom, relations. A compact index is injected into every agent prompt;
+  `/who [friend/123|group/456]` reads one, and the agent can read/write them
+  with `profile_get` / `profile_update` (the latter is write-gated).
+- **Vector retrieval** (`rag.*`, opt-in): with `rag.enabled` and a usable
+  `rag.embedding`, profiles, long-term memories and dream digests are indexed
+  into a **sqlite-vec** store; the `semantic_search` tool (and a `semantic`
+  block merged into `search_archive`) answers fuzzy-recall queries
+  ("谁抱怨过加班") that keyword search misses. Set `rag.chat: true` to also
+  index consecutive chat windows (per conversation, incremental).
+- **Local-first embeddings**: default `Qwen/Qwen3-Embedding-0.6B`
+  (`rag.embedding.backend: st`, install `uv sync --extra rag-local`; ONNX via
+  `--extra rag-onnx`). The **device** is chosen per pass by a resource
+  governor: GPU when the model fits in free VRAM *and* the GPU is quiet,
+  otherwise CPU with a dynamically reduced thread count. A remote
+  OpenAI-compatible endpoint is used only as a fallback when configured
+  (`rag.embedding.remote_model`). One model id == one vector space, so
+  changing the model rebuilds the index.
+- **Idle-scheduled & interruptible**: indexing runs only on AC power, while
+  CPU/GPU are below their idle thresholds and the user has been quiet for
+  `rag.min_idle_sec`; it stops promptly when that stops being true (cursors
+  resume next pass), throttles between batches, backs off (cooldown) after
+  repeated failures, and can unload the local model when idle.
+
 ### Permissions (agent & commands)
 
 - **Reads are unconditional anywhere**: archive search/browse, structured
   `search_archive` / `activity` / `directory`, message detail, media, stats,
-  dreams, memories (`memory_search`), skills, `fetch_url`, `read_document`,
+  dreams, memories (`memory_search`), identity profiles (`profile_get`),
+  semantic recall (`semantic_search`), skills, `fetch_url`, `read_document`,
   `describe_image`, `ocr_image`, `make_chart`, `web_search`, `research`.
 - **Writes run freely only in the controller's session**: the control
   conversation (control group / authority DM) or a local front (CLI/WebUI/
   console). That covers `send_message`, `send_media` (archive media or a
   local file/chart), `schedule_task`, `remember`, `memory_update`,
-  `memory_delete`, and write-capable `cli` commands.
+  `memory_delete`, `profile_update`, and write-capable `cli` commands.
 - **Anywhere else, every write is routed to the controller**: sends
   (text/media), scheduled tasks, memory writes, and write-capable `cli`
   commands become a pending request sent to the controller

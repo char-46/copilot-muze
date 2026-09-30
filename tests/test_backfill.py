@@ -361,8 +361,12 @@ async def test_migration_v7_to_v10_adds_columns(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table' AND name='ai_sessions'"
     ) as cur:
         assert await cur.fetchone()  # v10 created the persistent session table
+    async with conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_docs'"
+    ) as cur:
+        assert await cur.fetchone()  # v11 added profiles + RAG tables
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
-        assert (await cur.fetchone())[0] == "10"
+        assert (await cur.fetchone())[0] == "11"
     await conn.close()
 
 

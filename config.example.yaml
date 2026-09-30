@@ -122,6 +122,46 @@ digest:
   inject_month_chars: 450
   inject_max_memories: 25
 
+profiles:                     # per-conversation identity docs ("who is who")
+  auto: true                  # periodically (re)build them from recent chats
+  interval_min: 360           # refresh cadence
+  active_window_h: 48         # only conversations active within this window
+  messages_per_conv: 120
+  max_chars: 1200
+  inject: true                # add a compact "who is who" index to agent prompts
+  inject_chars: 80
+
+rag:                          # vector retrieval over summaries (+ optional chats)
+  enabled: false              # master switch; needs a usable rag.embedding
+  chat: false                 # ALSO index chat message windows (opt-in)
+  top_k: 6
+  window_messages: 12
+  window_chars: 900
+  index_interval_min: 15      # background indexing cadence (still idle-gated)
+  require_ac_power: true      # only index on AC power (needs psutil battery)
+  idle_cpu_pct: 25            # only while CPU busy% is below this
+  idle_gpu_pct: 20            # and GPU utilisation below this
+  min_idle_sec: 120           # and no user activity for this long
+  embedding:
+    provider: auto            # auto (local-first, remote fallback if configured) | local | openai
+    backend: st               # st (sentence-transformers/torch, Qwen) | fastembed (ONNX)
+    model: Qwen/Qwen3-Embedding-0.6B   # local model (install: uv sync --extra rag-local)
+    query_instruction: ""     # optional instruction prefix for queries
+    device: auto              # auto (GPU if it fits & is quiet, else CPU) | cuda | cpu
+    gpu_weight_gb: 1.6        # VRAM the model needs (0.6B fp16 + overhead)
+    gpu_reserve_gb: 0.8       # free VRAM kept as headroom
+    gpu_max_util: 30          # use GPU only while its utilisation is below this
+    cpu_max_threads: 4        # cap for CPU inference (scaled down when busy)
+    batch: 16
+    min_interval_sec: 0.05    # pause between local batches
+    max_retries: 3            # local failures before the cooldown
+    cooldown_sec: 300         # back-off after repeated failure
+    unload_idle_sec: 1800     # release the local model after this idle (0=never)
+    remote_model: ""          # set to ENABLE the OpenAI-compatible fallback
+    base_url: ""              # empty -> reuse llm.chat.base_url
+    api_key: ""               # empty -> reuse llm.chat.api_key
+    dims: 0                   # 0 = infer from the first embedding
+
 log:
   level: INFO                 # DEBUG for verbose protocol traffic
   file: ""                    # empty -> data_dir/logs/muze.log (appended, never rotated)

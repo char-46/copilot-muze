@@ -782,6 +782,123 @@ class Repository:
         await self.conn.execute("DELETE FROM ai_sessions WHERE id=?", (sid,))
         await self.conn.commit()
 
+    # --------------------------------------------------------- profiles
+    async def upsert_profile(self, subject: str, name: str, content: str) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO profiles (subject, name, content, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(subject) DO UPDATE SET
+                name=excluded.name, content=excluded.content,
+                updated_at=excluded.updated_at
+            """,
+            (subject, name or "", content or "", time.time()),
+        )
+        await self.conn.commit()
+
+    async def get_profile(self, subject: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM profiles WHERE subject=?", (subject,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_profiles(self, limit: int = 300) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM profiles ORDER BY updated_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # --------------------------------------------------------------- rag
+    async def upsert_rag_doc(
+        self,
+        kind: str,
+        ref: str,
+        text: str,
+        *,
+        scene: str | None = None,
+        peer_id: int | None = None,
+        time_start: int | None = None,
+        time_end: int | None = None,
+        model: str = "",
+    ) -> int:
+        """Insert/replace one RAG document (kind+ref keyed); returns its id."""
+        await self.conn.execute(
+            """
+            INSERT INTO rag_docs
+                (kind, ref, scene, peer_id, time_start, time_end, text, model, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, ref) DO UPDATE SET
+                scene=excluded.scene, peer_id=excluded.peer_id,
+                time_start=excluded.time_start, time_end=excluded.time_end,
+                text=excluded.text, model=excluded.model, updated_at=excluded.updated_at
+            """,
+            (kind, ref, scene, peer_id, time_start, time_end, text, model, time.time()),
+        )
+        await self.conn.commit()
+        async with self.conn.execute(
+            "SELECT id FROM rag_docs WHERE kind=? AND ref=?", (kind, ref)
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0])
+
+    async def get_rag_doc(self, kind: str, ref: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM rag_docs WHERE kind=? AND ref=?", (kind, ref)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def rag_docs_by_ids(self, ids: list[int]) -> dict[int, dict]:
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        async with self.conn.execute(
+            f"SELECT * FROM rag_docs WHERE id IN ({marks})", ids
+        ) as cur:
+            rows = await cur.fetchall()
+        return {int(r["id"]): dict(r) for r in rows}
+
+    async def list_rag_docs(self, kind: str | None = None, limit: int = 1000) -> list[dict]:
+        sql = "SELECT * FROM rag_docs"
+        args: list = []
+        if kind:
+            sql += " WHERE kind=?"
+            args.append(kind)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def rag_get_state(self, key: str) -> str | None:
+        async with self.conn.execute(
+            "SELECT value FROM rag_state WHERE key=?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def rag_set_state(self, key: str, value: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO rag_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        await self.conn.commit()
+
+    async def messages_after(
+        self, scene: str, peer_id: int, seq: int, limit: int = 200
+    ) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM messages WHERE scene=? AND peer_id=? AND message_seq>? "
+            "ORDER BY message_seq ASC LIMIT ?",
+            (scene, peer_id, int(seq), max(1, int(limit))),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     # ---------------------------------------------------------------- stats
     async def stats(self) -> dict:
         out: dict[str, Any] = {}

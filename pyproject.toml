@@ -7,7 +7,7 @@ license = { text = "MIT" }
 authors = [{ name = "muze" }]
 # Pre-release is bumped per feature commit; build metadata (git sha, build time)
 # is appended at runtime by muze.version.get_version().
-version = "0.1.0a55"
+version = "0.1.0a56"
 dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
@@ -18,10 +18,17 @@ dependencies = [
     "python-docx>=1.1",
     "pillow>=12.3.0",
     "pilk>=0.2.4",
+    "sqlite-vec>=0.1.9",
 ]
 
 [project.scripts]
 muze = "muze.__main__:main"
+
+[project.optional-dependencies]
+# local Qwen embeddings (torch) + GPU/CPU + power/idle probes
+rag-local = ["sentence-transformers>=3.0", "torch>=2.2", "psutil>=5.9", "nvidia-ml-py>=12"]
+# lightweight ONNX alternative (no torch)
+rag-onnx = ["fastembed>=0.3"]
 
 [dependency-groups]
 dev = [

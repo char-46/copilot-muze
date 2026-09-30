@@ -1048,6 +1048,28 @@ class ControlService:
             )
         return CommandOutcome(session.render())
 
+    @slash("who", "/who [friend/123|group/456]", "身份档案（谁是谁）；无参列出已知档案")
+    async def cmd_who(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            rows = await self.repo.list_profiles(limit=40)
+            if not rows:
+                return CommandOutcome("暂无身份档案（会自动归纳，或让 AI 用 profile_update 写入）")
+            lines = []
+            for p in rows:
+                first = ""
+                for line in (p["content"] or "").splitlines():
+                    line = line.strip().lstrip("#-* ").strip()
+                    if line:
+                        first = line
+                        break
+                lines.append(f"{p['subject']} {p['name']}: {first[:50]}")
+            return CommandOutcome("\n".join(lines) + "\n/who <会话> 查看全文")
+        subject = args[0].replace("：", "/").replace(":", "/").strip()
+        p = await self.repo.get_profile(subject)
+        if not p:
+            return CommandOutcome.err(f"没有 {subject} 的身份档案（/who 列出已知）")
+        return CommandOutcome(f"# {subject} {p['name']}\n{p['content']}")
+
     @slash("pending", "/pending", "待确认的代发列表")
     async def cmd_pending(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         rows = await self.repo.list_pending_actions(

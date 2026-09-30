@@ -23,7 +23,7 @@ log = logging.getLogger("muze.ai")
 # the controller's session but are routed to the controller for approval in
 # any other conversation (see ControlService.requires_approval).
 # send_message routes itself via ControlService.request_send.
-WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete"}
+WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update"}
 
 SPEC = [
     {
@@ -394,6 +394,59 @@ SPEC = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": (
+                "语义检索（向量）：按意思而非字面查找身份档案/长期记忆/梦境报告"
+                "（开启 rag.chat 时也含聊天片段）。适合模糊回忆（“谁抱怨过加班”）。"
+                "精确关键词/日期请用 search_archive；未启用时本工具会明确报错。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "k": {"type": "integer", "description": "返回条数，默认配置值"},
+                    "kind": {"type": "string", "enum": ["profile", "memory", "digest", "chat"]},
+                    "scene": {"type": "string", "enum": ["friend", "group"]},
+                    "peer_id": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "profile_get",
+            "description": "读取某个会话的身份档案（谁是谁）。subject 形如 friend/123 或 group/456",
+            "parameters": {
+                "type": "object",
+                "properties": {"subject": {"type": "string"}},
+                "required": ["subject"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "profile_update",
+            "description": (
+                "创建/更新某会话的身份档案（谁是谁、昵称映射、账号归属、关系）。"
+                "只在确有把握时写入；会与现有内容合并。subject 形如 friend/123 或 group/456"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "content": {"type": "string", "description": "完整 Markdown 档案内容"},
+                    "name": {"type": "string", "description": "会话显示名（可空）"},
+                },
+                "required": ["subject", "content"],
+            },
+        },
+    },
 ]
 
 
@@ -436,6 +489,8 @@ class ToolRunner:
             return f"写入长期记忆 [{args.get('subject', 'owner')}]: {str(args.get('content', ''))[:120]}"
         if name == "cli":
             return f"执行命令: /{args.get('command', '')}"
+        if name == "profile_update":
+            return f"更新身份档案 [{args.get('subject', '')}]: {str(args.get('content', ''))[:120]}"
         return f"{name}({_args_brief(args)})"
 
     async def _gate(self, name: str, args: dict) -> str:
@@ -523,7 +578,32 @@ class ToolRunner:
             peer_id=args.get("peer_id"),
             limit=min(int(args.get("limit", 20)), 100),
         )
-        return {"count": len(rows), "matches": [self._row_brief(r) for r in rows]}
+        out = {"count": len(rows), "matches": [self._row_brief(r) for r in rows]}
+        # hybrid: when vector RAG is on, add semantically-similar chat hits the
+        # keyword pass missed (fuzzy recall)
+        rag = getattr(self.service.runtime, "rag", None)
+        if rag is not None and getattr(rag, "enabled", False) and self._rag_has_chat():
+            sem = await rag.search(
+                q, k=3, kind="chat",
+                scene=args.get("scene") or None,
+                peer_id=args.get("peer_id"),
+            )
+            if sem:
+                out["semantic"] = [
+                    {
+                        "conv": f"{h['scene']}/{h['peer_id']}",
+                        "score": h.get("score"),
+                        "text": h["text"][:400],
+                    }
+                    for h in sem
+                ]
+        return out
+
+    def _rag_has_chat(self) -> bool:
+        try:
+            return bool(self.service.cfg.rag.enabled and self.service.cfg.rag.chat)
+        except Exception:
+            return False
 
     async def t_activity(self, args: dict) -> dict:
         import time as _t
@@ -930,6 +1010,44 @@ class ToolRunner:
                 "available": [s.name for s in skills.list()],
             }
         return {"name": sk.name, "body": sk.body[:8000]}
+
+    async def t_semantic_search(self, args: dict) -> dict:
+        rag = getattr(self.service.runtime, "rag", None)
+        if rag is None or not getattr(rag, "enabled", False):
+            return {"error": "语义检索未启用（需 rag.enabled 且配置 rag.embedding）"}
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return {"error": "query 不能为空"}
+        peer = args.get("peer_id")
+        hits = await rag.search(
+            q,
+            k=args.get("k"),
+            kind=args.get("kind") or None,
+            scene=args.get("scene") or None,
+            peer_id=int(peer) if peer not in (None, "") else None,
+        )
+        return {"query": q, "count": len(hits), "results": hits}
+
+    async def t_profile_get(self, args: dict) -> dict:
+        subject = str(args.get("subject", "")).strip()
+        if not subject:
+            return {"error": "subject 不能为空（friend/123 或 group/456）"}
+        p = await self.repo.get_profile(subject)
+        if not p:
+            return {"subject": subject, "found": False}
+        return {
+            "subject": subject, "found": True, "name": p["name"],
+            "content": p["content"], "updated_at": epoch_iso(p["updated_at"]),
+        }
+
+    async def t_profile_update(self, args: dict) -> dict:
+        subject = str(args.get("subject", "")).strip()
+        content = str(args.get("content", "")).strip()
+        if not subject or not content:
+            return {"error": "subject/content 不能为空"}
+        await self.repo.upsert_profile(subject, str(args.get("name", "") or ""), content)
+        log.info("PROFILE    | updated %s (%s chars)", subject, len(content))
+        return {"ok": True, "subject": subject}
 
 
 def _args_brief(args: dict) -> str:

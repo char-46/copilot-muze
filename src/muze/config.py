@@ -162,6 +162,65 @@ class ResearchConfig(BaseModel):
     timeout: float = 20.0
 
 
+class ProfilesConfig(BaseModel):
+    """Per-conversation identity docs ("who is who"), maintained by the LLM."""
+
+    auto: bool = True  # periodically (re)build identity docs for active chats
+    interval_min: float = 360.0  # how often the refresh pass runs
+    active_window_h: float = 48.0  # only conversations active within this window
+    messages_per_conv: int = 120  # messages fed to the summarizer
+    max_chars: int = 1200  # max length of one identity doc
+    inject: bool = True  # add a compact "who is who" index to the system prompt
+    inject_chars: int = 80  # per-profile snippet injected
+
+
+class RagEmbedding(BaseModel):
+    """Embedding backend. Local-first (Qwen3-Embedding), remote only as a
+    configured fallback. One model id = one vector space: switching models
+    rebuilds the index (see VecStore)."""
+
+    provider: str = "auto"  # auto (local-first, remote fallback if configured) | local | openai
+    backend: str = "st"  # st (sentence-transformers/torch, supports Qwen) | fastembed
+    model: str = "Qwen/Qwen3-Embedding-0.6B"  # local model id
+    query_instruction: str = ""  # optional instruction prefix for queries
+    base_url: str = ""  # remote fallback endpoint (empty -> reuse llm.chat.*)
+    api_key: str = ""
+    remote_model: str = ""  # set to ENABLE the remote fallback
+    dims: int = 0  # 0 = infer from the first embedding
+    batch: int = 16
+    min_interval_sec: float = 0.05  # throttle between local batches
+    max_retries: int = 3  # local failures before the cooldown kicks in
+    cooldown_sec: float = 300.0  # back-off after repeated failure
+    device: str = "auto"  # auto (GPU if it fits & is idle, else CPU) | cuda | cpu
+    gpu_weight_gb: float = 1.6  # VRAM the model needs (0.6B fp16 + overhead)
+    gpu_reserve_gb: float = 0.8  # free VRAM kept as headroom when picking GPU
+    gpu_max_util: float = 30.0  # use GPU only while utilisation is below this
+    cpu_max_threads: int = 4  # cap for CPU inference (dynamic below this)
+    unload_idle_sec: float = 1800.0  # free the local model after this idle (0=never)
+
+
+class RagConfig(BaseModel):
+    """Vector retrieval over summaries (profiles/memories/digests) and,
+    opt-in, chat message windows. Indexing is idle-scheduled: it only runs on
+    AC power, when CPU/GPU are quiet and the user hasn't been active, and it
+    can be interrupted at any time."""
+
+    enabled: bool = False  # master switch (needs a usable rag.embedding)
+    chat: bool = False  # ALSO index message windows (opt-in, default off)
+    embedding: RagEmbedding = Field(default_factory=RagEmbedding)
+    top_k: int = 6
+    window_messages: int = 12  # chat window size (messages)
+    window_chars: int = 900  # and/or chars per chat window
+    max_doc_chars: int = 2000  # truncate a doc before embedding
+    index_interval_min: float = 15.0  # background indexing cadence
+    # --- resource governor (best-effort; skipped when psutil/pynvml missing) ---
+    require_ac_power: bool = True  # only run on AC power (needs psutil battery)
+    idle_cpu_pct: float = 25.0  # run only while CPU busy% is below this
+    idle_gpu_pct: float = 20.0  # and GPU utilisation below this
+    min_idle_sec: float = 120.0  # and no user activity for this long
+    governor_poll_sec: float = 30.0  # re-check cadence while indexing
+
+
 class DigestConfig(BaseModel):
     """Daily digest a.k.a. "dreaming": once per night, reflect on the passed
     day's archive, store the report, and grow long-term memories. Missing
@@ -196,6 +255,8 @@ class MuzeConfig(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
+    profiles: ProfilesConfig = Field(default_factory=ProfilesConfig)
+    rag: RagConfig = Field(default_factory=RagConfig)
 
 
 ENDPOINT_KEYS = tuple(MilkyEndpoint.model_fields)

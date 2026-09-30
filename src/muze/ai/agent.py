@@ -68,6 +68,7 @@ SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）�
 - 被要求代发消息时调用 send_message；系统通常要求控制者确认后才真正发出，如实转达确认提示。
 - 列出的技能（skills）与任务相关时，先 read_skill 读全文再照做。
 - 长期记忆：写入用 remember；检索用 memory_search；修订/停用用 memory_update/memory_delete（后两者控制者会话外需审批）。
+- 身份档案（谁是谁、昵称映射、账号归属）：读取用 profile_get；归纳后用 profile_update 写入（控制者会话外需审批）。语义检索（模糊回忆）用 semantic_search。
 - 回答使用简体中文，简洁准确；引用消息时带上 会话/seq/时间 方便核对。
 - 不要编造未在工具结果中看到的内容。"""
 
@@ -409,6 +410,22 @@ class Agent:
                 bg_meta.get("day", "-"), bg_meta.get("week", "-"),
                 bg_meta.get("month", "-"), n_mems,
             )
+
+        # --- identity profiles ("who is who") ---
+        pc = getattr(self.service.cfg, "profiles", None)
+        if pc is not None and getattr(pc, "inject", True):
+            try:
+                profiles = await self.repo.list_profiles(limit=60)
+            except Exception:
+                profiles = []
+            if profiles:
+                from muze.profiles import index_lines
+
+                lines = index_lines(profiles, int(getattr(pc, "inject_chars", 80)))
+                parts.append(
+                    "身份档案索引（谁是谁；需要全文用 profile_get 或 /who <会话>）:\n"
+                    + "\n".join(lines)
+                )
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ converse

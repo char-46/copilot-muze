@@ -85,6 +85,7 @@ class App:
         self._sup_task = None
         self._last_seen_write = 0.0
         self._offline_since: float | None = None  # set on bot_offline, cleared on reconnect
+        self._last_activity = time.time()  # in-memory clock for the RAG idle governor
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -136,6 +137,30 @@ class App:
             self.service, self.repo, self.llm, self.chatlog, cfg.llm.agent_max_steps
         )
         self.service.agent = self.agent
+
+        # vector RAG (summaries + optional chat windows) + identity profiles
+        from muze.ai.embeddings import Embedder
+        from muze.rag import RagIndexer, VecStore
+        from muze.rag_resource import ResourceGovernor
+
+        self.vec = VecStore(self.repo)
+        await self.vec.setup()
+        emb = cfg.rag.embedding
+        if not emb.base_url:
+            emb.base_url = cfg.llm.chat.base_url
+        if not emb.api_key:
+            emb.api_key = cfg.llm.chat.api_key
+        self.embedder = Embedder(emb)
+        self.governor = ResourceGovernor(cfg.rag)
+        self.rag = RagIndexer(
+            self.repo, self.vec, self.embedder, cfg,
+            governor=self.governor, activity_fn=lambda: self._last_activity,
+        )
+        self.runtime.rag = self.rag
+        self._last_activity = time.time()
+        self._last_rag_index = 0.0
+        self._last_profile_refresh = 0.0
+        self._enrich_task = None
 
         # skills / scheduler / reloader
         from muze.reloader import Reloader
@@ -197,6 +222,7 @@ class App:
     async def _touch_seen(self) -> None:
         """Record 'last operation' time, throttled to one write per minute."""
         now = time.time()
+        self._last_activity = now  # in-memory idle clock for the RAG governor
         if now - self._last_seen_write < 60:
             return
         self._last_seen_write = now
@@ -282,6 +308,7 @@ class App:
             await self.agent.load_sessions()  # restore suspended/continued turns
         await self.backfiller.start_background()
         self._mt_task = asyncio.create_task(self._maintenance_loop())
+        self._enrich_task = asyncio.create_task(self._startup_enrich())
         if os.environ.get("MUZE_SUPERVISOR_PID"):
             self._sup_task = asyncio.create_task(self._supervisor_watch())
         if spawn_console:
@@ -416,7 +443,33 @@ class App:
         await svc.deliver(ctx, outcome)
 
     # --------------------------------------------------------- maintenance
+    async def _startup_enrich(self) -> None:
+        """After the startup backfill has had a moment, build identity docs and
+        index summaries for semantic retrieval."""
+        from muze.profiles import refresh_profiles
+
+        try:
+            await asyncio.sleep(20)
+            if self._stop.is_set():
+                return
+            if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
+                n = await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
+                self._last_profile_refresh = time.time()
+                if n:
+                    log.info("[%s] profiles refreshed: %s", self.spec.name, n)
+            if getattr(self, "rag", None) is not None and self.rag.enabled:
+                n = await self.rag.run_once()
+                self._last_rag_index = time.time()
+                if n:
+                    log.info("[%s] RAG indexed %s docs", self.spec.name, n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("startup enrichment failed")
+
     async def _maintenance_loop(self) -> None:
+        from muze.profiles import refresh_profiles
+
         while not self._stop.is_set():
             await asyncio.sleep(600)
             try:
@@ -429,6 +482,15 @@ class App:
                 fixed = await self.media.retry_failed(limit=20)
                 if fixed:
                     log.info("media retry recovered %s file(s)", fixed)
+                now = time.time()
+                if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
+                    if now - self._last_profile_refresh >= self.cfg.profiles.interval_min * 60:
+                        self._last_profile_refresh = now
+                        await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
+                if getattr(self, "rag", None) is not None and self.rag.enabled:
+                    if now - self._last_rag_index >= self.cfg.rag.index_interval_min * 60:
+                        self._last_rag_index = now
+                        await self.rag.run_once()
             except Exception:
                 log.exception("maintenance cycle failed")
             await self._touch_seen()  # keep the last-operation time fresh
@@ -456,6 +518,8 @@ class App:
 
         if self._mt_task is not None:
             self._mt_task.cancel()
+        if getattr(self, "_enrich_task", None) is not None:
+            self._enrich_task.cancel()
         scheduler = getattr(self, "scheduler", None)
         if scheduler is not None:
             await _safe("scheduler.stop", scheduler.stop(), 5)

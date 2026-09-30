@@ -145,6 +145,34 @@ CREATE TABLE IF NOT EXISTS ai_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_ai_sessions_chat ON ai_sessions (chat_key, updated);
 CREATE INDEX IF NOT EXISTS idx_ai_sessions_status ON ai_sessions (status, updated);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    subject    TEXT PRIMARY KEY,           -- friend/<uin> | group/<gid>
+    name       TEXT NOT NULL DEFAULT '',
+    content    TEXT NOT NULL DEFAULT '',   -- markdown identity doc
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rag_docs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,              -- profile|memory|digest|chat
+    ref        TEXT NOT NULL,              -- stable key
+    scene      TEXT,
+    peer_id    INTEGER,
+    time_start INTEGER,
+    time_end   INTEGER,
+    text       TEXT NOT NULL,
+    model      TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    UNIQUE (kind, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_rag_docs_kind ON rag_docs (kind);
+CREATE INDEX IF NOT EXISTS idx_rag_docs_conv ON rag_docs (scene, peer_id);
+
+CREATE TABLE IF NOT EXISTS rag_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -156,6 +184,15 @@ async def open_db(path: str) -> aiosqlite.Connection:
     await conn.execute("PRAGMA busy_timeout=5000")
     await conn.execute("PRAGMA foreign_keys=ON")
     await migrate(conn)
+    # sqlite-vec powers semantic (vector) retrieval; best-effort — RAG just
+    # stays unavailable if the extension can't be loaded.
+    try:
+        import sqlite_vec
+
+        await conn.enable_load_extension(True)
+        await conn.load_extension(sqlite_vec.loadable_path())
+    except Exception as e:  # pragma: no cover - environment dependent
+        log.warning("sqlite-vec not loaded (%s); vector RAG disabled", e)
     return conn
 
 
@@ -252,6 +289,40 @@ async def _migrate_v10_ai_sessions(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _migrate_v11_rag(conn: aiosqlite.Connection) -> None:
+    """v11: identity profiles + RAG doc/state tables (vectors via sqlite-vec)."""
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS profiles (
+            subject    TEXT PRIMARY KEY,
+            name       TEXT NOT NULL DEFAULT '',
+            content    TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS rag_docs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind       TEXT NOT NULL,
+            ref        TEXT NOT NULL,
+            scene      TEXT,
+            peer_id    INTEGER,
+            time_start INTEGER,
+            time_end   INTEGER,
+            text       TEXT NOT NULL,
+            model      TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL,
+            UNIQUE (kind, ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rag_docs_kind ON rag_docs (kind);
+        CREATE INDEX IF NOT EXISTS idx_rag_docs_conv ON rag_docs (scene, peer_id);
+        CREATE TABLE IF NOT EXISTS rag_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
@@ -260,9 +331,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v8_bf_watermarks(conn)
         await _migrate_v9_bf_since(conn)
         await _migrate_v10_ai_sessions(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '10')")
+        await _migrate_v11_rag(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '11')")
         await conn.commit()
-        log.info("database created (schema v10)")
+        log.info("database created (schema v11)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -293,3 +365,9 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '10')")
         await conn.commit()
         log.info("database migrated to schema v10 (persistent agent sessions)")
+        version = 10
+    if version < 11:
+        await _migrate_v11_rag(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '11')")
+        await conn.commit()
+        log.info("database migrated to schema v11 (profiles + RAG)")
