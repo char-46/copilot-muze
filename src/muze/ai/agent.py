@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 
 from muze.ai.llm import LLMClient
 from muze.ai.sessions import Session, SessionStore
@@ -23,6 +24,10 @@ log = logging.getLogger("muze.ai")
 
 MAX_HISTORY = 30  # per control conversation
 TOOL_RESULT_LIMIT = 6000  # chars kept per tool result fed back to the model
+
+
+class AgentBusy(Exception):
+    """Raised when an account already has too many turns in flight."""
 
 
 def _compact(text: str, limit: int = TOOL_RESULT_LIMIT) -> str:
@@ -75,6 +80,12 @@ class Agent:
         self._histories: dict[str, list[dict]] = {}
         self.sessions = SessionStore()
         self._locks: dict[str, asyncio.Lock] = {}
+        # turn admission control: at most max_concurrent_turns talk to the
+        # model at once; up to max_queued_turns more may wait for a slot.
+        self._slots = asyncio.Condition()
+        self._running = 0
+        self._waiting = 0
+        self._tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------- history
     def _history(self, chat_key: str) -> list[dict]:
@@ -96,19 +107,74 @@ class Agent:
                 del history[i]
                 return
 
+    @staticmethod
+    def _commit(history: list[dict], user_entry: dict, assistant_entry: dict) -> None:
+        """Place the reply right after its own prompt so committed history
+        reads in turn-start order even when concurrent turns finish out of
+        order; trims to MAX_HISTORY from the front."""
+        for i, m in enumerate(history):
+            if m is user_entry:
+                history.insert(i + 1, assistant_entry)
+                break
+        else:
+            history.append(assistant_entry)
+        if len(history) > MAX_HISTORY:
+            del history[: len(history) - MAX_HISTORY]
+
+    # ----------------------------------------------------------- admission
+    def _max_concurrent(self) -> int:
+        cfg = getattr(self.service, "cfg", None)
+        return max(1, int(getattr(getattr(cfg, "llm", None), "max_concurrent_turns", 4) or 4))
+
+    def _max_queued(self) -> int:
+        cfg = getattr(self.service, "cfg", None)
+        return max(0, int(getattr(getattr(cfg, "llm", None), "max_queued_turns", 8) or 0))
+
+    @asynccontextmanager
+    async def _turn_slot(self):
+        """Admit one model turn. Runs immediately while under the concurrency
+        cap; otherwise waits (bounded by max_queued_turns) and raises AgentBusy
+        when the queue is already full."""
+        async with self._slots:
+            if self._running >= self._max_concurrent():
+                if self._waiting >= self._max_queued():
+                    raise AgentBusy(
+                        f"AI 任务繁忙（{self._running} 个进行中、{self._waiting} 个排队），"
+                        "请稍后再试"
+                    )
+                self._waiting += 1
+                try:
+                    await self._slots.wait_for(
+                        lambda: self._running < self._max_concurrent()
+                    )
+                finally:
+                    self._waiting -= 1
+            self._running += 1
+        try:
+            yield
+        finally:
+            async with self._slots:
+                self._running -= 1
+                self._slots.notify_all()
+
     # ------------------------------------------------------------- session
     def submit(self, text: str, ctx: ControlContext) -> Session:
         """Fire-and-forget turn: register a session, run it in the background,
         deliver the result when it lands. The caller replies to the user with
         the session id immediately; several sessions in one conversation all
-        run in parallel."""
+        run in parallel (up to the account's concurrency cap)."""
         session = self.sessions.create(ctx.chat_key, text)
-        asyncio.create_task(self._run_session(session, text, ctx))
+        task = asyncio.create_task(self._run_session(session, text, ctx))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return session
 
     async def _run_session(self, session: Session, text: str, ctx: ControlContext) -> None:
         try:
-            outcome = await self.converse(text, ctx, session=session)
+            async with self._turn_slot():
+                outcome = await self.converse(text, ctx, session=session)
+        except AgentBusy as e:
+            outcome = CommandOutcome(str(e), is_error=True)
         except Exception as e:  # safety net: converse already handles its own
             log.exception("agent session crashed")
             outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
@@ -120,11 +186,23 @@ class Agent:
     async def ask(self, text: str, ctx: ControlContext) -> CommandOutcome:
         """Synchronous variant for local fronts (webui / cli): same session
         bookkeeping; converse guards the shared history itself, so parallel
-        turns never queue."""
+        turns never queue on the history — only on the account's model slots."""
         session = self.sessions.create(ctx.chat_key, text)
-        outcome = await self.converse(text, ctx, session=session)
+        try:
+            async with self._turn_slot():
+                outcome = await self.converse(text, ctx, session=session)
+        except AgentBusy as e:
+            outcome = CommandOutcome(str(e), is_error=True)
         session.finish(ok=not outcome.is_error, preview=outcome.text)
         return outcome
+
+    async def aclose(self) -> None:
+        """Cancel any in-flight background turns (used on shutdown)."""
+        tasks = [t for t in self._tasks if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def reset(self, chat_key: str) -> None:
         self._histories.pop(chat_key, None)
@@ -439,6 +517,10 @@ class Agent:
                 f"工具执行卡死（>{int(stall)}秒无进展），本轮已中止；请稍后重试。",
                 is_error=True,
             )
+        except asyncio.CancelledError:
+            async with self._lock(ctx.chat_key):
+                self._drop(history, user_entry)  # shutdown retracts in-flight turns
+            raise
         except Exception as e:
             log.exception("agent loop failed")
             async with self._lock(ctx.chat_key):
@@ -448,9 +530,7 @@ class Agent:
         if not final_text:
             final_text = "(AI 未返回内容)"
         async with self._lock(ctx.chat_key):
-            history.append({"role": "assistant", "content": final_text})
-            if len(history) > MAX_HISTORY:
-                del history[: len(history) - MAX_HISTORY]
+            self._commit(history, user_entry, {"role": "assistant", "content": final_text})
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "out", final_text)
         return CommandOutcome(final_text)
 

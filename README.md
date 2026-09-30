@@ -89,7 +89,7 @@ actually supports and degrades lazily.
 | command | effect |
 |---|---|
 | `/status` | version+build, uptime, archive stats, capabilities |
-| `/sync [force\|时长] [target]` | roaming backfill now; `force` ignores the watermark and pulls EVERYTHING to the roaming end; a duration (`2d`, `12h`, `30m`) re-pulls just that recent window (also ignoring the watermark) — duplicates are upsert-deduped, so both recover holes; if a pull is already running, its periodic reports are forwarded here |
+| `/sync [force\|时长] [target]` | roaming backfill now; `force` ignores the watermark and pulls EVERYTHING to the roaming end; a duration (`2d`, `12h`, `30m`, `1d12h`, `1个月`) re-pulls just that recent window (also ignoring the watermark) — duplicates are upsert-deduped, so both recover holes; if a pull is already running, its periodic reports are forwarded here |
 | `/unread` | recently active conversations with previews |
 | `/search <kw> [n]` | full-text search over the archive |
 | `/day <date> [target]` | what happened on a day (`YYYY-MM-DD`/`today`/`yesterday`); scoped or overview |
@@ -134,9 +134,12 @@ Agent turns are asynchronous and session-tracked:
 - A `::` message is acknowledged **immediately** with a short session id
   (`#a1b2c3 已受理`). The turn then runs in the background — one busy
   conversation never blocks others, and a single conversation can hold
-  **several sessions at once** (no queue): they share that conversation's
-  short-term history but each edit is committed atomically, so contexts stay
-  coherent under concurrency.
+  **several sessions at once** (no history queue): they share that
+  conversation's short-term history but each edit is committed atomically,
+  and replies land in the order their prompts were sent, so contexts stay
+  coherent under concurrency. Model turns are admitted per account: up to
+  `llm.max_concurrent_turns` run at once, `llm.max_queued_turns` more may
+  wait, and beyond that a turn is refused with 忙 rather than piling up.
 - `/sess <id>` (or `/sess` to list) shows the full trace of a session:
   prompt, every model round with received output size, every tool call and
   its compact result, and the final status.

@@ -81,6 +81,8 @@ llm:
     model: ""                 # e.g. glm-4v-plus
   agent_max_steps: 12        # tool-calling rounds per request (raised from 8); tools run in parallel within a round
   turn_timeout_sec: 300      # STALL cap: a tool round stuck this long is aborted (slow-but-progressing turns are never cut)
+  max_concurrent_turns: 4    # turns talking to the model at once (per account); a chat can hold several :: sessions
+  max_queued_turns: 8        # extra turns allowed to wait for a slot; beyond this the turn is refused with 忙
   progress: true             # in-turn feedback: "still waiting" heartbeats + tool-call lines
   progress_wait_sec: 20      # silence before the first heartbeat (fast answers send nothing)
   progress_interval_sec: 60  # between subsequent heartbeats

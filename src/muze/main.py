@@ -394,6 +394,8 @@ class App:
             await _safe("backfiller.stop", self.backfiller.stop(), 5)
         if self.pipeline is not None:
             await _safe("drain_media", self.pipeline.drain_media(timeout=5), 7)
+        if getattr(self, "agent", None) is not None:
+            await _safe("agent.aclose", self.agent.aclose(), 5)
         if self.adapter is not None:
             await _safe("adapter.close", self.adapter.close(), 5)
         if self.conn is not None:

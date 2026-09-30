@@ -390,3 +390,134 @@ async def test_failed_turn_retracts_only_its_own_entry(env):
     hist = agent._histories["cli"]
     assert {"role": "assistant", "content": "旧答复"} in hist
     assert not any(m.get("content") == "会失败" for m in hist)
+
+
+async def test_concurrent_replies_commit_in_prompt_order(env):
+    """A slow turn started first must still land BEFORE a fast turn started
+    later — history reads in prompt order, not completion order."""
+    service, repo = env
+
+    class OrderLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            p = messages[-1]["content"]
+            await asyncio.sleep(0.1 if p == "慢" else 0.0)
+            return {"role": "assistant", "content": f"答:{p}"}
+
+    agent = Agent(service, repo, OrderLLM(), ChatLog(), 3)
+    c = ctx()
+    await asyncio.gather(agent.ask("慢", c), agent.ask("快", c))
+
+    hist = [(m["role"], m["content"]) for m in agent._histories["cli"]]
+    assert hist == [
+        ("user", "慢"), ("assistant", "答:慢"),
+        ("user", "快"), ("assistant", "答:快"),
+    ]
+
+
+async def test_turn_cap_refuses_when_queue_full(env):
+    """Beyond concurrency + queue, a turn is refused with 忙 instead of piling up."""
+    service, repo = env
+    service.cfg.llm.max_concurrent_turns = 1
+    service.cfg.llm.max_queued_turns = 0
+    release = asyncio.Event()
+
+    class GateLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            await release.wait()
+            return {"role": "assistant", "content": "ok"}
+
+    agent = Agent(service, repo, GateLLM(), ChatLog(), 3)
+    c = ctx()
+    t1 = asyncio.create_task(agent.ask("一", c))
+    await asyncio.sleep(0.05)  # let t1 grab the only slot
+    out2 = await agent.ask("二", c)
+    assert out2.is_error and "忙" in out2.text
+    release.set()
+    out1 = await t1
+    assert not out1.is_error and out1.text == "ok"
+
+
+async def test_turn_cap_queues_extra_turns(env):
+    """Under the cap extra turns wait for a slot, then run — nothing is lost."""
+    service, repo = env
+    service.cfg.llm.max_concurrent_turns = 1
+    service.cfg.llm.max_queued_turns = 4
+    gate = asyncio.Event()
+    entered: list[str] = []
+
+    class GateLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            entered.append(messages[-1]["content"])
+            if len(entered) < 2:
+                await gate.wait()
+            return {"role": "assistant", "content": f"答:{messages[-1]['content']}"}
+
+    agent = Agent(service, repo, GateLLM(), ChatLog(), 3)
+    c = ctx()
+    t1 = asyncio.create_task(agent.ask("甲", c))
+    await asyncio.sleep(0.05)
+    t2 = asyncio.create_task(agent.ask("乙", c))
+    await asyncio.sleep(0.05)
+    assert entered == ["甲"]  # 乙 is queued, not running yet
+    gate.set()
+    o1, o2 = await asyncio.gather(t1, t2)
+    assert entered == ["甲", "乙"]
+    assert not o1.is_error and not o2.is_error
+
+
+async def test_reset_midturn_does_not_leak_context(env):
+    """A reset while a turn is in flight discards that turn's history; the next
+    turn starts clean instead of inheriting the aborted context."""
+    service, repo = env
+    release = asyncio.Event()
+    seen: list[list[str]] = []
+
+    class GateLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            seen.append([m["content"] for m in messages if m["role"] == "user"])
+            await release.wait()
+            return {"role": "assistant", "content": "答"}
+
+    agent = Agent(service, repo, GateLLM(), ChatLog(), 3)
+    c = ctx()
+    t = asyncio.create_task(agent.ask("旧问题", c))
+    await asyncio.sleep(0.05)
+    agent.reset("cli")  # wipe context mid-turn
+    release.set()
+    await t
+    assert agent._histories.get("cli", []) == []  # reply went to the dead list
+
+    seen.clear()
+    out = await agent.ask("新问题", c)
+    assert not out.is_error
+    assert seen == [["新问题"]]  # no leak from the pre-reset turn
+
+
+async def test_aclose_cancels_inflight_session(env):
+    """Shutdown cancels background turns and retracts their unanswered prompt."""
+    service, repo = env
+    never = asyncio.Event()
+
+    class BlockLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            await never.wait()
+            return {"role": "assistant", "content": "不会到这里"}
+
+    agent = Agent(service, repo, BlockLLM(), ChatLog(), 3)
+    session = agent.submit("挂着", _qq_ctx())
+    await asyncio.sleep(0.05)
+    assert session.status == "running"
+
+    await agent.aclose()
+    await asyncio.sleep(0.05)
+    assert agent._histories.get("qq:friend:1", []) == []

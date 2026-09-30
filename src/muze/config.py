@@ -114,6 +114,10 @@ class LLMConfig(BaseModel):
     agent_max_steps: int = 12
     turn_timeout_sec: float = 300.0  # STALL cap: a tool round stuck this long
     # is aborted; there is no wall-clock cap on slow-but-progressing turns
+    # how many turns may talk to the model at once (per account); extra turns
+    # wait for a slot, and beyond max_queued_turns they are refused with 忙
+    max_concurrent_turns: int = 4
+    max_queued_turns: int = 8
     # in-turn progress feedback: "still waiting" heartbeats + tool call lines
     progress: bool = True
     progress_wait_sec: float = 20.0  # silence before the first heartbeat
