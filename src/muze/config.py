@@ -104,12 +104,18 @@ class LLMEndpoint(BaseModel):
     api_key: str = ""
     model: str = ""
     temperature: float | None = None
+    timeout: float = 120.0  # per-request total timeout (SDK default is 600s)
 
 
 class LLMConfig(BaseModel):
     chat: LLMEndpoint = Field(default_factory=LLMEndpoint)
     vision: LLMEndpoint = Field(default_factory=LLMEndpoint)
     agent_max_steps: int = 12
+    turn_timeout_sec: float = 300.0  # hard wall-clock cap per agent turn
+    # in-turn progress feedback: "still waiting" heartbeats + tool call lines
+    progress: bool = True
+    progress_wait_sec: float = 20.0  # silence before the first heartbeat
+    progress_interval_sec: float = 60.0  # between subsequent heartbeats
     asr_provider: str = ""  # reserved for a future ASR integration
 
     @property

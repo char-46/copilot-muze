@@ -77,6 +77,10 @@ llm:
     api_key: ""
     model: ""                 # e.g. glm-4v-plus
   agent_max_steps: 12        # tool-calling rounds per request (raised from 8); tools run in parallel within a round
+  turn_timeout_sec: 300      # hard wall-clock cap per agent turn; 0 = uncapped
+  progress: true             # in-turn feedback: "still waiting" heartbeats + tool-call lines
+  progress_wait_sec: 20      # silence before the first heartbeat (fast answers send nothing)
+  progress_interval_sec: 60  # between subsequent heartbeats
   asr_provider: ""            # reserved (voice transcription lands later)
 
 web:                          # app-level: one webui serves every account

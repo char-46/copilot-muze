@@ -30,6 +30,21 @@ class ScriptLLM:
         return item
 
 
+class SlowLLM(ScriptLLM):
+    """Never answers in time — used for heartbeat / timeout tests."""
+
+    def __init__(self, cfg, delay: float = 10.0):
+        super().__init__([])
+        self.cfg = cfg
+        self.delay = delay
+
+    async def chat(self, messages, tools=None):
+        self.calls += 1
+        self.last_messages = messages
+        await asyncio.sleep(self.delay)
+        return {"role": "assistant", "content": "late"}
+
+
 @pytest.fixture
 async def env(tmp_path):
     conn = await open_db(str(tmp_path / "ag.db"))
@@ -173,3 +188,85 @@ async def test_structured_query_tools(env):
 
     d2 = json.loads(await runner.run("directory", {"kind": "friends"}))
     assert d2 == {"friends": []}
+
+
+# ------------------------------------------------- progress + turn timeout
+def _llm_cfg(**kw):
+    from muze.config import LLMConfig
+
+    cfg = LLMConfig()
+    cfg.progress = kw.get("progress", True)
+    cfg.progress_wait_sec = kw.get("progress_wait_sec", 0.01)
+    cfg.progress_interval_sec = kw.get("progress_interval_sec", 0.01)
+    cfg.turn_timeout_sec = kw.get("turn_timeout_sec", 30.0)
+    return cfg
+
+
+def _qq_ctx():
+    return ControlContext(source="qq", chat_key="qq:friend:1", scene="friend", peer_id=1)
+
+
+def _sent_texts(service):
+    return [
+        seg["data"]["text"]
+        for (_scene, _peer, segs) in service.adapter.sent
+        for seg in segs
+        if seg.get("type") == "text"
+    ]
+
+
+async def test_converse_sends_tool_call_lines(env, monkeypatch):
+    service, repo = env
+
+    class FakeRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            return "{}"
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", FakeRunner)
+    llm = ScriptLLM(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "1", "function": {"name": "search_archive", "arguments": "{}"}},
+                    {"id": "2", "function": {"name": "search_archive", "arguments": "{}"}},
+                ],
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    llm.cfg = _llm_cfg()
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("查一下", _qq_ctx())
+    assert out.text == "done"
+    lines = _sent_texts(service)
+    # one compact line for the round, duplicate tool names collapsed
+    assert any(l.startswith("🔧") and l.count("search_archive") == 1 for l in lines)
+    # tool lines never enter the conversation history
+    assert not any(m.get("role") == "assistant" and str(m.get("content", "")).startswith("🔧")
+                   for m in llm.last_messages)
+
+
+async def test_converse_heartbeats_while_llm_hangs(env):
+    service, repo = env
+    llm = SlowLLM(_llm_cfg(progress_wait_sec=0.05, progress_interval_sec=0.05), delay=0.3)
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("慢点答", _qq_ctx())
+    assert out.text == "late"
+    lines = _sent_texts(service)
+    beats = [l for l in lines if l.startswith("⏳")]
+    assert any("思考中" in l for l in beats)
+    assert any("仍在等待" in l for l in beats)
+
+
+async def test_converse_turn_timeout_frees_conversation(env):
+    service, repo = env
+    llm = SlowLLM(_llm_cfg(turn_timeout_sec=0.15), delay=30.0)
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("卡住", _qq_ctx())
+    assert out.is_error and "超时" in out.text
+    # the aborted turn must not poison the history
+    assert agent._histories["qq:friend:1"] == []

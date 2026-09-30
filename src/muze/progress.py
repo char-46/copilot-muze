@@ -25,11 +25,12 @@ class ProgressReporter:
         label: str,
         emit: Callable[[str], Awaitable[None]] | None = None,
         now: Callable[[], float] | None = None,
+        key: str | None = None,
     ) -> None:
         self.label = label
-        self._subs: list[Callable[[str], Awaitable[None]]] = []
+        self._subs: list[tuple[str | None, Callable[[str], Awaitable[None]]]] = []
         if emit is not None:
-            self._subs.append(emit)
+            self._subs.append((key, emit))
         self.now = now or time.monotonic
         self.t0 = self.now()
         self.new_msgs = 0
@@ -40,17 +41,27 @@ class ProgressReporter:
         self.started_msg_sent = False
 
     # ---------------------------------------------------------- subscribers
-    def add_subscriber(self, emit: Callable[[str], Awaitable[None]]) -> None:
+    def add_subscriber(
+        self, emit: Callable[[str], Awaitable[None]], key: str | None = None
+    ) -> None:
         """Register another delivery target (e.g. a later /sync trigger).
 
-        Progress is broadcast to every subscriber, so a pull started by one
-        front can also report to whoever asks while it is still running.
+        Subscribers are keyed by delivery destination (chat_key): adding one
+        with an existing key REPLACES it, so the same conversation asking
+        twice never receives duplicated progress lines.
         """
-        if emit not in self._subs:
-            self._subs.append(emit)
+        if key is not None:
+            self._subs = [(k, e) for (k, e) in self._subs if k != key]
+        else:
+            self._subs = [(k, e) for (k, e) in self._subs if e != emit]
+        self._subs.append((key, emit))
+
+    @property
+    def subscribers(self) -> list[str | None]:
+        return [k for k, _ in self._subs]
 
     async def _emit(self, text: str) -> None:
-        for sub in list(self._subs):
+        for _key, sub in list(self._subs):
             try:
                 await sub(text)
             except Exception:

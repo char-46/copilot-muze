@@ -123,6 +123,12 @@ Multi-bot safety (several accounts in one process):
 `::` input goes to the AI agent, which can query the archive, describe
 images (vision model), expand forwarded messages, and draft sends.
 
+Long turns never wedge a conversation: each LLM request and the whole turn
+are time-boxed (`llm.chat.timeout`, `llm.turn_timeout_sec`), and while the
+model works the agent reports progress — a `⏳ 思考中…` heartbeat after
+`llm.progress_wait_sec` (then every `progress_interval_sec`) and one compact
+`🔧 工具名` line per tool round. Fast answers send no extra messages.
+
 ### Permissions (agent & commands)
 
 - **Reads are unconditional anywhere**: archive search/browse, structured

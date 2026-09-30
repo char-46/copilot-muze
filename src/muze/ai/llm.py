@@ -67,7 +67,10 @@ class LLMClient:
     def _chat_client(self) -> AsyncOpenAI:
         if self._chat is None:
             self._chat = AsyncOpenAI(
-                base_url=self.cfg.chat.base_url, api_key=self.cfg.chat.api_key
+                base_url=self.cfg.chat.base_url,
+                api_key=self.cfg.chat.api_key,
+                timeout=self.cfg.chat.timeout,
+                max_retries=1,
             )
         return self._chat
 
@@ -77,6 +80,8 @@ class LLMClient:
             self._vision = AsyncOpenAI(
                 base_url=v.base_url or self.cfg.chat.base_url,
                 api_key=v.api_key or self.cfg.chat.api_key,
+                timeout=v.timeout or self.cfg.chat.timeout,
+                max_retries=1,
             )
         return self._vision
 

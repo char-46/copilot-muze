@@ -173,6 +173,28 @@ async def test_reporter_broadcasts_to_all_subscribers():
     assert a == b and a and a[-1].startswith("✔")
 
 
+async def test_reporter_keyed_subscriber_replaces_same_destination():
+    a: list[str] = []
+    b: list[str] = []
+    c: list[str] = []
+
+    async def emit_a(text):
+        a.append(text)
+
+    async def emit_b(text):
+        b.append(text)
+
+    async def emit_c(text):
+        c.append(text)
+
+    rep = ProgressReporter("任务", emit_a, key="conv:1")
+    rep.add_subscriber(emit_b, key="conv:1")  # same conversation -> replace
+    rep.add_subscriber(emit_c, key="conv:2")  # different -> keep both
+    await rep.report_start("x")
+    assert len(rep._subs) == 2
+    assert not a and b and c  # conv:1 now goes to the newer emit only
+
+
 async def test_backfiller_subscribe_false_when_idle(repo):
     bf = Backfiller(FakeAdapter({}), repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
     assert bf.subscribe(lambda text: None) is False
@@ -215,8 +237,8 @@ async def test_sync_while_backfill_running_forwards_progress(repo):
         def __init__(self):
             self.subs: list = []
 
-        def subscribe(self, emit):
-            self.subs.append(emit)
+        def subscribe(self, emit, key=None):
+            self.subs.append((key, emit))
             return True
 
         def status(self):
@@ -228,8 +250,12 @@ async def test_sync_while_backfill_running_forwards_progress(repo):
     svc = ControlService(MuzeConfig(), FakeAdapter({}), repo, ChatLog(), runtime)
     ctx = ControlContext(source="qq", chat_key="qq:friend:1", scene="friend", peer_id=1)
     out = await svc.run_command("/sync force", ctx)
-    assert not out.is_error and "转发" in out.text
-    assert len(bf.subs) == 1
+    out2 = await svc.run_command("/sync force", ctx)  # repeated trigger
+    assert not out.is_error and not out2.is_error and "转发" in out.text
+    assert len(bf.subs) == 2
+    # every subscription carries the conversation key, so the reporter can
+    # dedupe instead of delivering twice to the same chat
+    assert {k for k, _ in bf.subs} == {"qq:friend:1"}
 
 
 async def test_sync_when_running_without_reporter_reports_error(repo):
@@ -238,7 +264,7 @@ async def test_sync_when_running_without_reporter_reports_error(repo):
     class RunningBF:
         running = True
 
-        def subscribe(self, emit):
+        def subscribe(self, emit, key=None):
             return False
 
         def status(self):

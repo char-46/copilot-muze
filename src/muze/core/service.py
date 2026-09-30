@@ -876,7 +876,7 @@ class ControlService:
                 self.chatlog.log.info("PROGRESS   | %s", text)
 
         if self.runtime.backfiller.running:
-            if self.runtime.backfiller.subscribe(emit):
+            if self.runtime.backfiller.subscribe(emit, key=ctx.chat_key):
                 return CommandOutcome(
                     "已有补拉正在运行；已把其定时汇报转发到此处"
                     "（进行中按第 1/2/3 分钟及每 5 分钟汇报，完成时总结）"
@@ -890,7 +890,7 @@ class ControlService:
             label = await self.target_label(scene, peer)
             if len(args) > 1:
                 pages = min(int(args[1]), 500)
-                reporter = ProgressReporter(f"深拉 {label}", emit)
+                reporter = ProgressReporter(f"深拉 {label}", emit, key=ctx.chat_key)
 
                 async def job_deep() -> None:
                     try:
@@ -905,7 +905,7 @@ class ControlService:
                     f"深拉 {label} 已开始（最多 {pages} 页）。"
                     "进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
                 )
-            reporter = ProgressReporter(f"sync {label}" + ("（强制全量）" if force else ""), emit)
+            reporter = ProgressReporter(f"sync {label}" + ("（强制全量）" if force else ""), emit, key=ctx.chat_key)
 
             async def job_one() -> None:
                 try:
@@ -928,7 +928,7 @@ class ControlService:
                 f"sync {label} 已开始。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
             )
 
-        reporter = ProgressReporter("全量补拉" + ("（强制全量）" if force else ""), emit)
+        reporter = ProgressReporter("全量补拉" + ("（强制全量）" if force else ""), emit, key=ctx.chat_key)
 
         async def job_all() -> None:
             try:

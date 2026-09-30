@@ -183,12 +183,67 @@ class Agent:
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ converse
-    async def _chat(self, messages: list[dict]) -> dict:
-        """One LLM round with a couple of transient-failure retries."""
+    @property
+    def _progress(self) -> bool:
+        cfg = getattr(self.llm, "cfg", None)
+        return bool(cfg is not None and getattr(cfg, "progress", False))
+
+    def _turn_timeout(self) -> float:
+        cfg = getattr(self.llm, "cfg", None)
+        return float(getattr(cfg, "turn_timeout_sec", 0) or 0)
+
+    async def _notify(self, ctx: ControlContext, text: str) -> None:
+        """Deliver an in-turn progress line (never enters agent history)."""
+        try:
+            if ctx.qq_reachable:
+                await self.service.deliver(ctx, CommandOutcome(text))
+            else:
+                self.chatlog.log.info("PROGRESS   | %s", text)
+        except Exception:
+            log.exception("agent progress notify failed")
+
+    async def _heartbeat(self, ctx: ControlContext, stop: asyncio.Event) -> None:
+        """Tell the user we are still waiting on the model.
+
+        Stays quiet for `progress_wait_sec` first so quick answers produce
+        zero extra messages; then pings every `progress_interval_sec`.
+        """
+        cfg = getattr(self.llm, "cfg", None)
+        wait = float(getattr(cfg, "progress_wait_sec", 20) or 20)
+        interval = float(getattr(cfg, "progress_interval_sec", 60) or 60)
+        first = True
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), wait if first else interval)
+            except TimeoutError:
+                pass
+            if stop.is_set():
+                return
+            await self._notify(ctx, "⏳ 思考中…" if first else "⏳ 仍在等待模型响应…")
+            first = False
+
+    async def _chat(self, messages: list[dict], ctx: ControlContext | None = None) -> dict:
+        """One LLM round with a couple of transient-failure retries.
+
+        When ctx carries a reachable front and progress is on, each attempt is
+        wrapped in a heartbeat so a slow model never looks dead.
+        """
         last: Exception | None = None
         for attempt in range(3):
             try:
-                return await self.llm.chat(messages, tools=SPEC)
+                if ctx is None or not self._progress or not ctx.qq_reachable:
+                    return await self.llm.chat(messages, tools=SPEC)
+                stop = asyncio.Event()
+                hb = asyncio.create_task(self._heartbeat(ctx, stop))
+                try:
+                    return await self.llm.chat(messages, tools=SPEC)
+                finally:
+                    stop.set()
+                    hb.cancel()
+                    try:
+                        await hb
+                    except BaseException:
+                        pass
             except Exception as e:  # network / rate limit / 5xx
                 last = e
                 if attempt < 2:
@@ -219,13 +274,13 @@ class Agent:
         ]
 
         final_text = ""
-        try:
+
+        async def tool_loop() -> str:
             for _ in range(self.max_steps):
-                msg = await self._chat(messages)
+                msg = await self._chat(messages, ctx)
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
-                    final_text = (msg.get("content") or "").strip()
-                    break
+                    return (msg.get("content") or "").strip()
                 messages.append(msg)
                 calls = []
                 for call in tool_calls:
@@ -240,6 +295,9 @@ class Agent:
                     ctx.source, ctx.user_label or ctx.chat_key, "tool",
                     "; ".join(f"{n}({_brief(a)})" for _, n, a in calls),
                 )
+                if self._progress and ctx.qq_reachable:
+                    names = "、".join(dict.fromkeys(n for _, n, _ in calls if n))
+                    await self._notify(ctx, f"🔧 {names}")
                 # run the step's tools concurrently (independent by design)
                 results = await asyncio.gather(
                     *(runner.run(n, a) for _, n, a in calls),
@@ -254,11 +312,26 @@ class Agent:
                     messages.append(
                         {"role": "tool", "tool_call_id": cid, "content": content}
                     )
+            return ""  # step limit exhausted
+
+        timeout = self._turn_timeout()
+        try:
+            if timeout > 0:
+                final_text = await asyncio.wait_for(tool_loop(), timeout)
             else:
+                final_text = await tool_loop()
+            if not final_text:
                 final_text = (
                     "（已达工具调用步数上限，已用现有结果作答；"
                     "如仍需更多步骤，请缩小范围或回复 ::继续）"
                 )
+        except TimeoutError:
+            log.warning("agent turn aborted: exceeded %.0fs wall clock", timeout)
+            history.pop()  # drop the unfinished turn
+            return CommandOutcome(
+                f"AI 响应超时（>{int(timeout)}秒），本轮已中止；请稍后重试。",
+                is_error=True,
+            )
         except Exception as e:
             log.exception("agent loop failed")
             history.pop()  # drop failed turn

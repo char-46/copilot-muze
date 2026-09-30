@@ -206,17 +206,19 @@ class Backfiller:
             self._reporter = None
             self.running = False
 
-    def subscribe(self, emit) -> bool:
+    def subscribe(self, emit, key: str | None = None) -> bool:
         """Attach a late delivery target to the currently-running pull.
 
         Used when /sync is issued while a backfill is already active: its
-        periodic progress is forwarded to the new trigger. Returns True if
-        there was a running pull to subscribe to.
+        periodic progress is forwarded to the new trigger. Subscribers are
+        keyed by destination, so a repeated /sync from the same conversation
+        replaces (not duplicates) its subscription. Returns True if there was
+        a running pull to subscribe to.
         """
         r = self._reporter
         if not self.running or r is None:
             return False
-        r.add_subscriber(emit)
+        r.add_subscriber(emit, key=key)
         return True
 
     # ---------------------------------------------------------- coverage
