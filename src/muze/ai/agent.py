@@ -81,26 +81,37 @@ class Agent:
         return self._histories.setdefault(chat_key, [])
 
     def _lock(self, chat_key: str) -> asyncio.Lock:
-        """Serialize turns within ONE conversation; different conversations
-        run concurrently (async dispatch)."""
+        """Short-lived guard for ONE conversation's history list. It is held
+        only around the read/write of that list, NOT the LLM turn, so several
+        LLM sessions in the same conversation run concurrently (async dispatch)
+        while their context edits stay ordered/atomic."""
         return self._locks.setdefault(chat_key, asyncio.Lock())
+
+    @staticmethod
+    def _drop(history: list[dict], entry: dict) -> None:
+        """Remove one exact entry (by identity) — used to retract an
+        unanswered user turn on failure without touching concurrent turns."""
+        for i, m in enumerate(history):
+            if m is entry:
+                del history[i]
+                return
 
     # ------------------------------------------------------------- session
     def submit(self, text: str, ctx: ControlContext) -> Session:
-        """Fire-and-forget turn: register a session, run it in the background
-        (per-conversation lock), deliver the result when it lands. The caller
-        replies to the user with the session id immediately."""
+        """Fire-and-forget turn: register a session, run it in the background,
+        deliver the result when it lands. The caller replies to the user with
+        the session id immediately; several sessions in one conversation all
+        run in parallel."""
         session = self.sessions.create(ctx.chat_key, text)
         asyncio.create_task(self._run_session(session, text, ctx))
         return session
 
     async def _run_session(self, session: Session, text: str, ctx: ControlContext) -> None:
-        async with self._lock(ctx.chat_key):
-            try:
-                outcome = await self.converse(text, ctx, session=session)
-            except Exception as e:  # safety net: converse already handles its own
-                log.exception("agent session crashed")
-                outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
+        try:
+            outcome = await self.converse(text, ctx, session=session)
+        except Exception as e:  # safety net: converse already handles its own
+            log.exception("agent session crashed")
+            outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
         session.finish(ok=not outcome.is_error, preview=outcome.text)
         if ctx.qq_reachable:
             prefix = f"#{session.id} "
@@ -108,10 +119,10 @@ class Agent:
 
     async def ask(self, text: str, ctx: ControlContext) -> CommandOutcome:
         """Synchronous variant for local fronts (webui / cli): same session
-        bookkeeping and per-conversation lock, returns the final outcome."""
+        bookkeeping; converse guards the shared history itself, so parallel
+        turns never queue."""
         session = self.sessions.create(ctx.chat_key, text)
-        async with self._lock(ctx.chat_key):
-            outcome = await self.converse(text, ctx, session=session)
+        outcome = await self.converse(text, ctx, session=session)
         session.finish(ok=not outcome.is_error, preview=outcome.text)
         return outcome
 
@@ -333,14 +344,20 @@ class Agent:
             text = strip_llm_prefix(text)
         if not text:
             return CommandOutcome.err("空输入")
-        history = self._history(ctx.chat_key)
-        history.append({"role": "user", "content": text})
+        # hold the conversation lock only to append this turn and snapshot the
+        # prior context — the LLM call itself runs lock-free, so multiple
+        # sessions in the same conversation proceed in parallel.
+        user_entry = {"role": "user", "content": text}
+        async with self._lock(ctx.chat_key):
+            history = self._history(ctx.chat_key)
+            history.append(user_entry)
+            prior = list(history[:-1])
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "in", text)
 
         runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         messages: list[dict] = [
             {"role": "system", "content": await self._system_prompt(ctx)},
-            *history[:-1][-MAX_HISTORY:],
+            *prior[-MAX_HISTORY:],
             {"role": "user", "content": text},
         ]
 
@@ -414,7 +431,8 @@ class Agent:
                 )
         except TimeoutError:
             log.warning("agent turn aborted: tool round stalled for %.0fs", stall)
-            history.pop()  # drop the unfinished turn
+            async with self._lock(ctx.chat_key):
+                self._drop(history, user_entry)  # retract the unfinished turn
             if session is not None:
                 session.event("error", f"工具执行卡死（>{int(stall)}秒）")
             return CommandOutcome(
@@ -423,14 +441,16 @@ class Agent:
             )
         except Exception as e:
             log.exception("agent loop failed")
-            history.pop()  # drop failed turn
+            async with self._lock(ctx.chat_key):
+                self._drop(history, user_entry)  # retract the failed turn
             return CommandOutcome(f"AI 调用失败: {e}", is_error=True)
 
         if not final_text:
             final_text = "(AI 未返回内容)"
-        history.append({"role": "assistant", "content": final_text})
-        if len(history) > MAX_HISTORY:
-            del history[: len(history) - MAX_HISTORY]
+        async with self._lock(ctx.chat_key):
+            history.append({"role": "assistant", "content": final_text})
+            if len(history) > MAX_HISTORY:
+                del history[: len(history) - MAX_HISTORY]
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "out", final_text)
         return CommandOutcome(final_text)
 

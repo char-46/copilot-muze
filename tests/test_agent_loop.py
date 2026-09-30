@@ -335,3 +335,58 @@ async def test_submit_is_async_and_queryable_by_sess(env, monkeypatch):
     # listing without an id
     listing = await service.run_command("sess", _qq_ctx())
     assert session.id in listing.text
+
+
+async def test_same_conversation_sessions_run_in_parallel(env):
+    """Two LLM sessions in ONE conversation must not queue behind each other;
+    they share the conversation history but each commits atomically."""
+    service, repo = env
+
+    class GateLLM:
+        configured = True
+
+        def __init__(self):
+            self.entered = 0
+            self.release = asyncio.Event()
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            self.entered += 1
+            if self.entered >= 2:
+                self.release.set()
+            # if turns were serialized, the 2nd would never enter and this
+            # would time out, failing the assertions below
+            await asyncio.wait_for(self.release.wait(), 2.0)
+            return {"role": "assistant", "content": f"答:{messages[-1]['content']}"}
+
+    agent = Agent(service, repo, GateLLM(), ChatLog(), 3)
+    c = ctx()
+    o1, o2 = await asyncio.gather(agent.ask("甲", c), agent.ask("乙", c))
+
+    assert agent.llm.entered == 2  # both reached the model before either finished
+    assert {o1.text, o2.text} == {"答:甲", "答:乙"}
+    pairs = [(m["role"], m["content"]) for m in agent._histories["cli"]]
+    assert ("user", "甲") in pairs and ("user", "乙") in pairs
+    assert ("assistant", "答:甲") in pairs and ("assistant", "答:乙") in pairs
+
+
+async def test_failed_turn_retracts_only_its_own_entry(env):
+    """A failing turn drops its own user message and never removes a
+    concurrent turn's entries."""
+    service, repo = env
+
+    class BoomLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            raise RuntimeError("boom")
+
+    agent = Agent(service, repo, BoomLLM(), ChatLog(), 3)
+    c = ctx()
+    agent._history("cli").append({"role": "assistant", "content": "旧答复"})
+
+    out = await agent.ask("会失败", c)
+
+    assert out.is_error
+    hist = agent._histories["cli"]
+    assert {"role": "assistant", "content": "旧答复"} in hist
+    assert not any(m.get("content") == "会失败" for m in hist)

@@ -133,8 +133,10 @@ Agent turns are asynchronous and session-tracked:
 
 - A `::` message is acknowledged **immediately** with a short session id
   (`#a1b2c3 已受理`). The turn then runs in the background — one busy
-  conversation never blocks others, and turns within one conversation are
-  serialized so context stays coherent.
+  conversation never blocks others, and a single conversation can hold
+  **several sessions at once** (no queue): they share that conversation's
+  short-term history but each edit is committed atomically, so contexts stay
+  coherent under concurrency.
 - `/sess <id>` (or `/sess` to list) shows the full trace of a session:
   prompt, every model round with received output size, every tool call and
   its compact result, and the final status.
