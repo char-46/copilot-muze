@@ -260,6 +260,9 @@ class App:
                 n = await self.repo.expire_actions(self.cfg.control.confirm_timeout_min)
                 if n:
                     log.info("expired %s pending confirmation(s)", n)
+                gone = await self.repo.retire_gone_media()
+                if gone:
+                    log.info("retired %s permanently-gone media row(s) (404/410)", gone)
                 fixed = await self.media.retry_failed(limit=20)
                 if fixed:
                     log.info("media retry recovered %s file(s)", fixed)

@@ -135,6 +135,11 @@ CLI bypasses since it is local).
     blobs, so account B reuses account A's downloads.
   Kinds: image / video / record / file / face (market-face stickers are
   archived and rendered in the webui like images).
+- Media lifecycle: `pending -> downloading -> done` (blob stored) or
+  `failed` (transient — retried by the maintenance loop). When the protocol
+  side reports **HTTP 404/410** (QQ purges old roaming files) the row is
+  parked as **`gone`** and never retried; historical failed-404 rows are
+  swept to `gone` by the maintenance loop.
 - `data/logs/muze.log` — every chat message (recv/backfill/sent/recall) rendered
   one-per-line, plus control, agent, confirm and media events. Never rotated.
 - 小程序/卡片链接: light_app 卡片的标题/简介/跳转链接被提取进

@@ -15,10 +15,9 @@ PAYLOAD = b"sticker-bytes-123"
 
 
 class FakeResp:
-    status = 200
-
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, status: int = 200) -> None:
         self._data = data
+        self.status = status
 
     class _Content:
         def __init__(self, data: bytes) -> None:
@@ -33,8 +32,8 @@ class FakeResp:
 
 
 class FakeCtx:
-    def __init__(self, data: bytes) -> None:
-        self._resp = FakeResp(data)
+    def __init__(self, data: bytes, status: int = 200) -> None:
+        self._resp = FakeResp(data, status)
 
     async def __aenter__(self):
         return self._resp
@@ -44,8 +43,9 @@ class FakeCtx:
 
 
 class FakeHttp:
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, status: int = 200) -> None:
         self.data = data
+        self.status = status
         self.count = 0
 
     async def session(self):
@@ -53,23 +53,23 @@ class FakeHttp:
 
     def get(self, url: str):
         self.count += 1
-        return FakeCtx(self.data)
+        return FakeCtx(self.data, self.status)
 
 
 class FakeAdapter:
-    def __init__(self, data: bytes = PAYLOAD) -> None:
+    def __init__(self, data: bytes = PAYLOAD, status: int = 200) -> None:
         self.caps = type("C", (), {"incoming_file_segment": True})()
-        self.http = FakeHttp(data)
+        self.http = FakeHttp(data, status)
 
     async def get_resource_url(self, resource_id: str) -> str:
         return f"http://fake/{resource_id}"
 
 
-async def make_store(root: Path, data: bytes = PAYLOAD):
+async def make_store(root: Path, data: bytes = PAYLOAD, status: int = 200):
     blobs = BlobStore(root / "blobs")
     conn = await open_db(":memory:")
     repo = Repository(conn)
-    store = MediaStore(blobs, FakeAdapter(data), repo)
+    store = MediaStore(blobs, FakeAdapter(data, status), repo)
     return store, repo, store.adapter
 
 
@@ -169,3 +169,35 @@ async def test_blob_lookup_invalidated_by_deleted_file(tmp_path):
     hit = await blobs.lookup("face:HERE")
     assert hit and hit["content_hash"] == "cd" * 32
     await blobs.close()
+
+
+async def test_media_404_marks_gone(tmp_path):
+    """Expired roaming media (HTTP 404) is parked as 'gone', not retried."""
+    store, repo, adapter = await make_store(tmp_path, status=404)
+    img = ImageSeg(resource_id="r404", summary="old")
+    mid = await store.register("group", 7, 1, 0, img, msg_time=1700000000)
+    row = await repo.media_by_id(mid)
+    upd = await store.download_row(row)
+    assert upd["status"] == "gone"
+    # not offered for retry, but counted in stats
+    assert await repo.media_pending(10) == []
+    stats = await repo.media_stats()
+    assert stats["gone"] == 1 and stats["failed"] == 0
+    await close(store)
+
+
+async def test_retire_gone_media_retires_historical_failures(tmp_path):
+    """Rows already failed with a 404 error are swept to 'gone' once."""
+    store, repo, adapter = await make_store(tmp_path)
+    img = ImageSeg(resource_id="r1", summary="x")
+    mid = await store.register("friend", 3, 1, 0, img)
+    await repo.update_media(mid, status="failed", error="HTTP 404")
+    assert len(await repo.media_pending(10)) == 1  # would be retried before
+    retired = await repo.retire_gone_media()
+    assert retired == 1
+    assert await repo.media_pending(10) == []  # gone rows are never retried
+    row = await repo.media_by_id(mid)
+    assert row["status"] == "gone"
+    # idempotent: nothing left to retire
+    assert await repo.retire_gone_media() == 0
+    await close(store)

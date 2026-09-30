@@ -275,9 +275,24 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def retire_gone_media(self) -> int:
+        """One-shot: historical failed rows whose error says the resource is
+        gone (HTTP 404/410) become status='gone' so nothing retries them."""
+        cur = await self.conn.execute(
+            """
+            UPDATE media SET status='gone', updated_at=?
+            WHERE status='failed'
+              AND (error LIKE '%HTTP 404%' OR error LIKE '%HTTP 410%'
+                   OR (error LIKE '%url:%' AND error LIKE '%expired%'))
+            """,
+            (_now(),),
+        )
+        await self.conn.commit()
+        return cur.rowcount
+
     async def media_stats(self) -> dict:
         out: dict[str, int] = {}
-        for status in ("done", "failed", "pending", "skipped"):
+        for status in ("done", "failed", "pending", "skipped", "gone"):
             async with self.conn.execute(
                 "SELECT COUNT(*) FROM media WHERE status=?", (status,)
             ) as cur:

@@ -30,6 +30,14 @@ from muze.store.repo import Repository
 
 log = logging.getLogger("muze.media")
 
+
+class MediaGone(Exception):
+    """The resource no longer exists server-side (HTTP 404/410).
+
+    Typical for old roaming media: QQ's multimedia servers purge expired
+    files, so retrying is pointless — the row is parked as status='gone'."""
+
+
 _EXT_BY_KIND = {
     "image": ".jpg",
     "record": ".amr",
@@ -205,6 +213,10 @@ class MediaStore:
 
         try:
             content_hash, size, dest = await self._fetch_into_blob(url, row)
+        except MediaGone as e:
+            await self.repo.update_media(mid, status="gone", error=str(e)[:300])
+            log.warning("MEDIA gone  #%s kind=%s: %s (server no longer has it)", mid, row["kind"], e)
+            return {**row, "status": "gone", "error": str(e)[:300]}
         except Exception as e:
             await self.repo.update_media(mid, status="failed", error=str(e)[:300])
             log.warning("MEDIA dl-fail #%s %s: %s", mid, url[:120], e)
@@ -238,6 +250,8 @@ class MediaStore:
         hasher = hashlib.sha256()
         total = 0
         async with sess.get(url) as resp:
+            if resp.status in (404, 410):
+                raise MediaGone(f"HTTP {resp.status}")
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}")
             with open(tmp, "wb") as fh:
