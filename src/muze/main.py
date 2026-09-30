@@ -73,6 +73,15 @@ class App:
         self.runtime.self_id = login.user_id
         log.info("logged in as %s (%s)", login.user_name or "?", login.user_id)
 
+        # multi-account isolation: one data dir belongs to exactly one account
+        conflict = await self.repo.bind_owner(login.user_id)
+        if conflict is not None:
+            raise RuntimeError(
+                f"数据目录 {cfg.storage.data_dir} 已绑定账号 {conflict}，"
+                f"当前登录的是 {login.user_id}。请为该账号配置独立的 storage.data_dir "
+                f"（以及独立的 web.port），不要让多个账号共用同一个数据目录。"
+            )
+
         self.media = MediaStore(cfg.storage.media_dir, self.adapter, self.repo)
         self.pipeline = IngestPipeline(
             self.adapter, self.repo, self.media, cfg, self.chatlog, login.user_id
@@ -289,6 +298,9 @@ def run_main(argv: list[str]) -> int:
         log.error("protocol side unreachable or misconfigured: %s", e)
         log.error("check: LLBot/Lagrange.Milky is running, milky.base_url & access_token are correct")
         return 3
+    except RuntimeError as e:
+        log.error("%s", e)
+        return 4
     if app.restart_requested:
         log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
         return RESTART_EXIT

@@ -51,6 +51,16 @@ def run_cli(argv: list[str]) -> int:
             print(f"协议端不可用: {e}\n请先启动 LLBot/Lagrange.Milky 并检查配置。", file=sys.stderr)
             await adapter.close()
             return
+        conflict = await repo.bind_owner(login.user_id)
+        if conflict is not None:
+            print(
+                f"数据目录已绑定账号 {conflict}（当前登录 {login.user_id}），拒绝启动。"
+                f"请为该账号使用独立的 storage.data_dir。",
+                file=sys.stderr,
+            )
+            await adapter.close()
+            await conn.close()
+            return
         runtime = Runtime()
         runtime.self_id = login.user_id
         chatlog = ChatLog()

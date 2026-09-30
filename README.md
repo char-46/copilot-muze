@@ -110,6 +110,24 @@ Semver with pre-release + build metadata (`0.1.0-alpha.13+build.g<sha>.<ts>`);
 every feature commit bumps the pre-release and is tagged. `muze version`,
 `/status`, and the WebUI show the full string.
 
+## Multiple accounts
+
+Each QQ account runs as its own isolated stack — one LLBot login, one
+config, one data dir, one daemon:
+
+```bash
+# account A
+muze daemon -c muze-a.yaml    # storage.data_dir: ./data-a, web.port: 8300
+# account B
+muze daemon -c muze-b.yaml    # storage.data_dir: ./data-b, web.port: 8301
+```
+
+Everything (messages, media, logs, dreams, memories, scheduled tasks,
+console history) lives under the account's `storage.data_dir`. The
+database binds itself to the first account that opens it and **refuses to
+start (exit code 4) if a different account points at the same data dir**,
+so accounts can never silently mix.
+
 ## Tests
 
 ```bash

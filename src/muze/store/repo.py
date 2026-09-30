@@ -19,6 +19,36 @@ class Repository:
     def __init__(self, conn: aiosqlite.Connection) -> None:
         self.conn = conn
 
+    # ------------------------------------------------------------ owner binding
+    async def bind_owner(self, uin: int) -> int | None:
+        """Bind this database to one QQ account (multi-account isolation).
+
+        First call records the owner and returns None. Later calls return
+        the conflicting owner uin when a different account tries to use the
+        same data dir — the caller must refuse to start in that case.
+        """
+        async with self.conn.execute(
+            "SELECT value FROM meta WHERE key='owner_uin'"
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            await self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('owner_uin', ?)", (str(int(uin)),)
+            )
+            await self.conn.commit()
+            return None
+        stored = int(row[0])
+        if stored == int(uin):
+            return None
+        return stored
+
+    async def owner_uin(self) -> int | None:
+        async with self.conn.execute(
+            "SELECT value FROM meta WHERE key='owner_uin'"
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
     # ------------------------------------------------------------ messages
     async def upsert_message(
         self,
