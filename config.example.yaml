@@ -83,6 +83,14 @@ web:                          # app-level: one webui serves every account
   port: 8300
   token: ""                   # empty -> random token generated and logged at startup
 
+research:                     # web search for the agent's research closure
+  provider: ""                # tavily | brave | serper | searxng | duckduckgo | "" (off)
+  api_key: ""                 # for tavily/brave/serper
+  base_url: ""                # searxng instance URL (e.g. http://localhost:8888); optional override
+  max_results: 5
+  fetch_chars: 4000           # per-page extract kept by research()
+  timeout: 20
+
 digest:
   # Nightly "dream": summarize each passed day (fixed 01:00), catch up
   # missing days automatically, roll completed weeks/months into compressed

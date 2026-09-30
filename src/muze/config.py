@@ -130,6 +130,17 @@ class LogConfig(BaseModel):
     file: str = ""  # empty -> data_dir/logs/muze.log, appended forever
 
 
+class ResearchConfig(BaseModel):
+    """Web search backend for the agent's research closure."""
+
+    provider: str = ""  # tavily | brave | serper | searxng | duckduckgo | ""
+    api_key: str = ""
+    base_url: str = ""  # searxng instance / override
+    max_results: int = 5
+    fetch_chars: int = 4000  # per-page extract kept in research()
+    timeout: float = 20.0
+
+
 class DigestConfig(BaseModel):
     """Daily digest a.k.a. "dreaming": once per night, reflect on the passed
     day's archive, store the report, and grow long-term memories. Missing
@@ -161,6 +172,7 @@ class MuzeConfig(BaseModel):
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     control: ControlConfig = Field(default_factory=ControlConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    research: ResearchConfig = Field(default_factory=ResearchConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)

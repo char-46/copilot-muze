@@ -134,6 +134,13 @@ images (vision model), expand forwarded messages, and draft sends.
   pending request sent to the controller (`/confirm <id>` approves,
   `/cancel <id>` rejects). `/help` marks write commands with `[写]`.
 
+### Research (agent)
+
+`web_search` finds links and `research(query, pages)` searches then fetches
+the top pages' text for synthesis — a closed research loop. Pick a backend in
+`research.provider`: `tavily` / `brave` / `serper` / `searxng` / `duckduckgo`
+(plus `api_key` / `base_url`). Unconfigured, the agent says it can't go online.
+
 ## Storage & logs
 
 - `data/<uin>/muze.db` — per-account SQLite WAL: messages (dedup by

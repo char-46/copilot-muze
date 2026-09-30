@@ -216,6 +216,37 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "web_search",
+            "description": "联网搜索，返回 [{title,url,snippet}]（需在 config 配置 research.provider）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "n": {"type": "integer", "description": "结果数，默认 5"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "research",
+            "description": "联网研究闭环：搜索并抓取前几页正文，返回带摘录的结果供你综合",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "n": {"type": "integer", "description": "候选结果数，默认 5"},
+                    "pages": {"type": "integer", "description": "抓取正文的页数，默认 3"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "recall_dream",
             "description": (
                 "回顾「做梦报告」（层级总结：日报/周报/月报）。查历史聊天内容时优先用这个而非翻原始消息："
@@ -613,6 +644,46 @@ class ToolRunner:
         except Exception as e:
             return {"error": str(e)}
         return {"url": url, "content": text}
+
+    def _search_client(self):
+        client = getattr(self, "_search", None)
+        if client is None:
+            from muze.research import SearchClient
+
+            client = SearchClient(self.service.cfg.research)
+            self._search = client
+        return client
+
+    async def t_web_search(self, args: dict) -> dict:
+        from muze.research import SearchError, search_hint
+
+        client = self._search_client()
+        if not client.configured:
+            return {"error": search_hint(self.service.cfg.research)}
+        try:
+            hits = await client.search(str(args.get("query", "")))
+        except SearchError as e:
+            return {"error": str(e)}
+        finally:
+            await client.close()
+        return {"count": len(hits), "results": hits}
+
+    async def t_research(self, args: dict) -> dict:
+        from muze.research import SearchError, search_hint
+
+        client = self._search_client()
+        if not client.configured:
+            return {"error": search_hint(self.service.cfg.research)}
+        try:
+            return await client.research(
+                str(args.get("query", "")),
+                args.get("n"),
+                int(args.get("pages", 3)),
+            )
+        except SearchError as e:
+            return {"error": str(e)}
+        finally:
+            await client.close()
 
     async def t_recall_dream(self, args: dict) -> dict:
         date = str(args.get("date", "")).strip()
