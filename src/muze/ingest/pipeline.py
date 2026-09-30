@@ -110,7 +110,8 @@ class IngestPipeline:
             if kind is None:
                 continue
             if source == "event":
-                prefer = getattr(seg, "temp_url", "") or None
+                # images/records/videos carry temp_url; market faces carry url
+                prefer = getattr(seg, "temp_url", "") or getattr(seg, "url", "") or None
             else:
                 prefer = None  # roaming temp urls are stale; resolve fresh
             mid = await self.media.register(

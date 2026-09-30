@@ -59,11 +59,13 @@ CREATE TABLE IF NOT EXISTS media (
     summary     TEXT,
     status      TEXT NOT NULL DEFAULT 'pending',  -- pending/downloading/done/failed/skipped
     error       TEXT,
+    content_hash TEXT,                             -- sha256 of the blob (dedup)
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
     UNIQUE (scene, peer_id, message_seq, seg_index)
 );
 CREATE INDEX IF NOT EXISTS idx_media_status ON media (status);
+CREATE INDEX IF NOT EXISTS idx_media_hash ON media (content_hash);
 
 CREATE TABLE IF NOT EXISTS pending_actions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,21 +144,32 @@ async def _migrate_v5_add_period(conn: aiosqlite.Connection) -> None:
         await conn.commit()
 
 
+async def _migrate_v6_media_hash(conn: aiosqlite.Connection) -> None:
+    """media gained a content_hash column in v6 (cross-account blob dedup)."""
+    async with conn.execute("PRAGMA table_info(media)") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    if "content_hash" not in cols:
+        await conn.execute("ALTER TABLE media ADD COLUMN content_hash TEXT")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_media_hash ON media (content_hash)")
+    await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
     if not has_meta:
         await conn.executescript(SCHEMA_V1)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '6')")
         await conn.commit()
-        log.info("database created (schema v5)")
+        log.info("database created (schema v6)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
     version = int(row[0]) if row else 0
-    if version < 5:
+    if version < 6:
         await conn.executescript(SCHEMA_V1)  # CREATE IF NOT EXISTS: applies missing tables
         await _migrate_v5_add_period(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
+        await _migrate_v6_media_hash(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '6')")
         await conn.commit()
-        log.info("database migrated to schema v5")
+        log.info("database migrated to schema v6")

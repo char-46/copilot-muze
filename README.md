@@ -98,11 +98,25 @@ CLI bypasses since it is local).
 
 ## Storage & logs
 
-- `data/muze.db` — SQLite WAL: messages (dedup by scene/peer/seq), media index,
-  pending actions. Safe for concurrent `serve` + `cli`.
-- `data/media/YYYY-MM/` — downloaded images / voices / videos / files.
+- `data/<uin>/muze.db` — per-account SQLite WAL: messages (dedup by
+  scene/peer/seq), media index, pending actions. Safe for concurrent
+  `serve` + `cli`.
+- `data/blobs/<kind>/<sha[:2]>/<sha256><ext>` — content-addressed media
+  store **shared by all accounts**, deduped three ways:
+  - **pre-download** (zero network): market-face stickers by `emoji_id`,
+    files by the protocol-provided `file_hash` — the same sticker spammed
+    in ten groups is fetched exactly once;
+  - **content-addressed** (zero duplicate disk): anything downloading to
+    identical bytes lands on the same sha256 path;
+  - **cross-account**: a shared `data/blobs/index.db` maps dedup keys to
+    blobs, so account B reuses account A's downloads.
+  Kinds: image / video / record / file / face (market-face stickers are
+  archived and rendered in the webui like images).
 - `data/logs/muze.log` — every chat message (recv/backfill/sent/recall) rendered
   one-per-line, plus control, agent, confirm and media events. Never rotated.
+- 小程序/卡片链接: light_app 卡片的标题/简介/跳转链接被提取进
+  `text_content`（可全文搜索）；外部网页由 agent 工具 `fetch_url` /
+  `read_document` 按需抓取解析。
 
 ## Versioning
 

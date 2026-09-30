@@ -205,7 +205,7 @@ function renderMessage(m) {
     const t = div.querySelector(".thumbs");
     for (const md of medias) {
       if (md.status !== "done" || !md.file_path) continue;
-      if (md.kind === "image") {
+      if (md.kind === "image" || md.kind === "face") {
         const img = document.createElement("img");
         img.src = withAccount(`/api/mediafile/${md.id}?token=${encodeURIComponent(TOKEN)}`);
         img.loading = "lazy";

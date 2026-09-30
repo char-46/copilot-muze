@@ -112,7 +112,7 @@ def test_account_dir_per_uin(tmp_path):
     storage.data_dir = tmp_path / "root"
     acct = storage.account_dir(12345)
     assert acct == storage.data_dir / "12345"
-    assert (acct / "media").is_dir()
+    assert acct.is_dir()
     # second account gets its own dir automatically
     other = storage.account_dir(67890)
     assert other != acct

@@ -62,9 +62,10 @@ class StorageConfig(BaseModel):
         return self.data_dir / "logs"
 
     def account_dir(self, uin: int) -> Path:
-        """Per-account data dir (created): db + media live here."""
+        """Per-account data dir (created): the db lives here; media bytes go
+        to the shared app-level blob store instead."""
         acct = self.data_dir / str(uin)
-        (acct / "media").mkdir(parents=True, exist_ok=True)
+        acct.mkdir(parents=True, exist_ok=True)
         return acct
 
 

@@ -123,7 +123,9 @@ def render_segment(seg: Segment) -> str:
     if t == "market_face":
         return f"[表情包:{getattr(seg, 'summary', '')}]"
     if t == "light_app":
-        return f"[小程序:{getattr(seg, 'app_name', '')}]"
+        extra = _light_app_text(getattr(seg, "json_payload", ""))
+        inner = " ".join(x for x in (getattr(seg, "app_name", ""), extra) if x)
+        return f"[小程序:{inner}]" if inner else "[小程序]"
     if t == "xml":
         return f"[XML:{_one_line(getattr(seg, 'xml_payload', ''))[:60]}]"
     if t == "markdown":
@@ -140,6 +142,42 @@ def render_message(msg: IncomingMessage, sender_display: str = "") -> str:
         f"{conv_id(msg.message_scene, msg.peer_id)} seq={msg.message_seq} "
         f"{who} {ts} | {_one_line(body)}"
     )
+
+
+def _light_app_text(payload: str) -> str:
+    """Best-effort title/desc/url extraction from a light_app json payload."""
+    import json as _json
+
+    try:
+        data = _json.loads(payload) if payload else {}
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    found: list[str] = []
+
+    def walk(node, depth: int) -> None:
+        if depth > 3 or not isinstance(node, dict):
+            return
+        for k, v in node.items():
+            lk = str(k).lower()
+            if isinstance(v, str) and v:
+                if lk in ("title", "titletext") and v not in found:
+                    found.append(v)
+                elif lk in ("desc", "desctext", "summary") and len(v) < 120 and v not in found:
+                    found.append(v)
+                elif lk in ("jump_url", "jumpurl", "url") and v.startswith("http"):
+                    found.append(v)
+            elif isinstance(v, dict):
+                walk(v, depth + 1)
+
+    # meta_data / metaData usually holds the card fields
+    for key in ("meta_data", "metaData", "extra"):
+        if key in data and isinstance(data[key], dict):
+            walk(data[key], 0)
+    if not found:
+        walk(data, 0)
+    return " ".join(found[:3])[:200]
 
 
 def plain_text(segments: list[Segment]) -> str:
@@ -174,7 +212,9 @@ def plain_text(segments: list[Segment]) -> str:
         elif t == "market_face":
             out.append(f"[表情包:{getattr(seg, 'summary', '')}]")
         elif t == "light_app":
-            out.append(f"[小程序:{getattr(seg, 'app_name', '')}]")
+            extra = _light_app_text(getattr(seg, "json_payload", ""))
+            inner = " ".join(x for x in (getattr(seg, "app_name", ""), extra) if x)
+            out.append(f"[小程序:{inner}]" if inner else "[小程序]")
         elif t == "xml":
             out.append(f"[XML:{_one_line(getattr(seg, 'xml_payload', ''))[:50]}]")
     return " ".join(x for x in out if x).strip()

@@ -34,6 +34,7 @@ from muze.provider.milky.models import (
     MessageRecallData,
     TextSeg,
 )
+from muze.store.blobs import BlobStore
 from muze.store.db import open_db
 from muze.store.media import MediaStore
 from muze.store.repo import Repository
@@ -79,7 +80,8 @@ class App:
         self.runtime.self_id = login.user_id
         log.info("[%s] logged in as %s (%s)", self.spec.name, login.user_name or "?", login.user_id)
 
-        # per-account data dir is derived from the logged-in QQ number
+        # per-account data dir is derived from the logged-in QQ number;
+        # media bytes go to the shared app-level blob store (cross-account dedup)
         acct = cfg.storage.account_dir(login.user_id)
         self.account_dir = acct
         self.conn = await open_db(str(acct / "muze.db"))
@@ -93,7 +95,8 @@ class App:
                 f"当前登录的是 {login.user_id}。请勿手工挪用账号数据目录。"
             )
 
-        self.media = MediaStore(acct / "media", self.adapter, self.repo)
+        self.blobstore = BlobStore(cfg.storage.data_dir / "blobs")
+        self.media = MediaStore(self.blobstore, self.adapter, self.repo)
         self.pipeline = IngestPipeline(
             self.adapter, self.repo, self.media, cfg, self.chatlog, login.user_id
         )
