@@ -70,6 +70,62 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "search_archive",
+            "description": "全文搜索归档消息，返回结构化 JSON（推荐优先于 cli search）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "scene": {"type": "string", "enum": ["friend", "group"]},
+                    "peer_id": {"type": "integer"},
+                    "limit": {"type": "integer", "description": "默认 20，最大 100"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "activity",
+            "description": "活动统计（结构化）：某天 day / 区间 range / 会话排行 top / 发言人 senders",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["day", "range", "top", "senders"]},
+                    "date": {"type": "string", "description": "day 模式：YYYY-MM-DD/today/yesterday"},
+                    "start": {"type": "string", "description": "range 起始日"},
+                    "end": {"type": "string", "description": "range 结束日"},
+                    "days": {"type": "integer", "description": "top 模式近 N 天，0=全史"},
+                    "scene": {"type": "string", "enum": ["friend", "group"]},
+                    "peer_id": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "directory",
+            "description": "目录查询：conversations 会话列表 / friends 好友 / groups 群 / whois 查名字",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["conversations", "friends", "groups", "whois"]},
+                    "uin": {"type": "integer"},
+                    "group_id": {"type": "integer"},
+                    "active_h": {"type": "number", "description": "conversations: 仅最近 N 小时活跃"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["kind"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "describe_image",
             "description": "用视觉模型识别某条消息中的图片内容",
             "parameters": {
@@ -330,6 +386,146 @@ class ToolRunner:
                 ]
             out.append(item)
         return {"messages": out}
+
+    async def t_search_archive(self, args: dict) -> dict:
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return {"error": "query 不能为空"}
+        rows = await self.repo.search_messages(
+            q,
+            scene=args.get("scene") or None,
+            peer_id=args.get("peer_id"),
+            limit=min(int(args.get("limit", 20)), 100),
+        )
+        return {"count": len(rows), "matches": [self._row_brief(r) for r in rows]}
+
+    async def t_activity(self, args: dict) -> dict:
+        import time as _t
+
+        from muze.core.service import ControlService
+
+        mode = str(args.get("mode", "")).strip()
+        scene = args.get("scene") or None
+        peer = args.get("peer_id")
+        limit = int(args.get("limit", 40))
+        if mode == "day":
+            start, end = ControlService.parse_day(str(args.get("date", "today")))
+            convs = await self.repo.day_counts(start, end, limit=limit)
+            out = {
+                "date": args.get("date", "today"),
+                "total": sum(c["n"] for c in convs),
+                "conversations": [
+                    {"conv": f"{c['scene']}/{c['peer_id']}", "name": c.get("name", ""), "n": c["n"]}
+                    for c in convs
+                ],
+            }
+            if scene and peer is not None:
+                msgs = await self.repo.messages_between(scene, peer, start, end, limit=300)
+                out["messages"] = [self._row_brief(r) for r in msgs]
+                out["senders"] = [
+                    {"sender": r["sender_id"], "n": r["n"]}
+                    for r in await self.repo.sender_counts(start, end, scene, peer, limit=20)
+                ]
+            return out
+        if mode == "range":
+            start, _ = ControlService.parse_day(str(args.get("start", "")))
+            _, end = ControlService.parse_day(str(args.get("end", "")))
+            convs = await self.repo.day_counts(start, end, limit=limit)
+            return {
+                "range": [args.get("start"), args.get("end")],
+                "total": sum(c["n"] for c in convs),
+                "conversations": [
+                    {"conv": f"{c['scene']}/{c['peer_id']}", "n": c["n"]} for c in convs
+                ],
+            }
+        if mode == "top":
+            days = int(args.get("days", 0) or 0)
+            since = int(_t.time() - days * 86400) if days else 0
+            rows = await self.repo.top_conversations(since, limit=int(args.get("limit", 15)))
+            return {
+                "days": days,
+                "conversations": [
+                    {"conv": f"{c['scene']}/{c['peer_id']}", "name": c.get("name", ""), "n": c["n"]}
+                    for c in rows
+                ],
+            }
+        if mode == "senders":
+            if not (scene and peer is not None):
+                return {"error": "senders 需要 scene 和 peer_id"}
+            days = int(args.get("days", 7) or 7)
+            end = int(_t.time()) + 1
+            rows = await self.repo.sender_counts(
+                end - days * 86400, end, scene, peer, limit=int(args.get("limit", 20))
+            )
+            return {"senders": [{"sender": r["sender_id"], "n": r["n"]} for r in rows]}
+        return {"error": f"未知 mode: {mode}"}
+
+    async def t_directory(self, args: dict) -> dict:
+        from muze.chatlog import epoch_iso as _iso
+
+        kind = str(args.get("kind", "")).strip()
+        limit = int(args.get("limit", 50))
+        try:
+            if kind == "conversations":
+                active_h = args.get("active_h")
+                rows = await self.repo.list_conversations(
+                    active_within_h=float(active_h) if active_h else None, limit=limit
+                )
+                return {
+                    "conversations": [
+                        {
+                            "conv": f"{r['scene']}/{r['peer_id']}",
+                            "name": r.get("name", ""),
+                            "messages": r.get("messages") or r.get("message_count"),
+                            "last_active": _iso(r.get("last_active_at")),
+                        }
+                        for r in rows
+                    ]
+                }
+            if kind == "friends":
+                fl = await self.adapter.get_friend_list()
+                return {
+                    "friends": [
+                        {
+                            "uin": getattr(f, "user_id", 0),
+                            "name": getattr(f, "user_name", "") or getattr(f, "nickname", ""),
+                        }
+                        for f in fl
+                    ][:limit]
+                }
+            if kind == "groups":
+                gl = await self.adapter.get_group_list()
+                return {
+                    "groups": [
+                        {"group_id": getattr(g, "group_id", 0), "name": getattr(g, "group_name", "")}
+                        for g in gl
+                    ][:limit]
+                }
+            if kind == "whois":
+                out: dict = {}
+                uin = args.get("uin")
+                gid = args.get("group_id")
+                if uin:
+                    try:
+                        out["friend_name"] = await self.adapter.ensure_friend_name(int(uin))
+                    except Exception:
+                        out["friend_name"] = ""
+                    if gid:
+                        try:
+                            out["member_name"] = await self.adapter.get_group_member_name(
+                                int(gid), int(uin)
+                            )
+                        except Exception:
+                            out["member_name"] = ""
+                if gid:
+                    try:
+                        out["group_name"] = await self.adapter.ensure_group_name(int(gid))
+                    except Exception:
+                        out["group_name"] = ""
+                return out
+        except ProtocolError as e:
+            return {"error": f"协议端错误: {e}"}
+        return {"error": f"未知 kind: {kind}"}
 
     async def t_describe_image(self, args: dict) -> dict:
         medias = await self.repo.media_for_message(

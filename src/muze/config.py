@@ -107,7 +107,7 @@ class LLMEndpoint(BaseModel):
 class LLMConfig(BaseModel):
     chat: LLMEndpoint = Field(default_factory=LLMEndpoint)
     vision: LLMEndpoint = Field(default_factory=LLMEndpoint)
-    agent_max_steps: int = 8
+    agent_max_steps: int = 12
     asr_provider: str = ""  # reserved for a future ASR integration
 
     @property

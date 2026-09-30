@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -14,13 +15,29 @@ from muze.store.repo import Repository
 log = logging.getLogger("muze.ai")
 
 MAX_HISTORY = 30  # per control conversation
+TOOL_RESULT_LIMIT = 6000  # chars kept per tool result fed back to the model
+
+
+def _compact(text: str, limit: int = TOOL_RESULT_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…(结果已截断，原 {len(text)} 字符)"
+
+
+def _brief(args: dict) -> str:
+    try:
+        s = json.dumps(args, ensure_ascii=False)
+    except Exception:
+        s = str(args)
+    return s[:160]
 
 SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）上的个人 copilot 助手。
 控制者通过控制会话/界面与你对话，你可以借助工具查询和管理被控号的消息档案。
 
 要点：
 - 消息档案包含好友私聊与群聊的历史（含离线期间漫游补拉的和用户自己发出的消息）。
-- 查询优先用 cli 工具（和 /help 的命令完全一致），如 cli({"command":"search 关键词"})、
+- 结构化查询优先用 search_archive / activity / directory（返回 JSON，字段稳定，优于解析排版文本）。
+- 查询也可用 cli 工具（和 /help 的命令完全一致），如 cli({"command":"search 关键词"})、
   cli({"command":"summary group/123 60"})；不确定命令就 cli({"command":"help"})。
 - 需要逐条看消息内容时才用 get_recent_messages。
 - 图片内容用 describe_image 识别；本地文档用 read_document；网页/在线文档用 fetch_url。
@@ -66,6 +83,18 @@ class Agent:
         open TODOs and the distilled facts about the people involved.
         """
         parts = [SYSTEM_PROMPT]
+
+        # current time context — relative dates ("today", "this week") are the
+        # agent's own job to resolve, so it must know "now"
+        from datetime import datetime, timedelta
+
+        now = datetime.now().astimezone()
+        y = now - timedelta(days=1)
+        parts.append(
+            f"当前时间: {now:%Y-%m-%d %H:%M:%S} ({now.tzname() or 'local'}); "
+            f"今天 {now:%Y-%m-%d}，昨天 {y:%Y-%m-%d}。"
+            "相对日期（今天/昨天/本周/上个月）按此时区换算。"
+        )
 
         skills = getattr(self.service.runtime, "skills", None)
         if skills is not None:
@@ -145,6 +174,19 @@ class Agent:
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ converse
+    async def _chat(self, messages: list[dict]) -> dict:
+        """One LLM round with a couple of transient-failure retries."""
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                return await self.llm.chat(messages, tools=SPEC)
+            except Exception as e:  # network / rate limit / 5xx
+                last = e
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    log.warning("llm.chat retry %s/2 after: %s", attempt + 1, e)
+        raise last  # type: ignore[misc]
+
     async def converse(self, text: str, ctx: ControlContext) -> CommandOutcome:
         if not self.llm.configured:
             return CommandOutcome("LLM 未配置（llm.chat.*）", is_error=True)
@@ -162,33 +204,44 @@ class Agent:
         final_text = ""
         try:
             for _ in range(self.max_steps):
-                msg = await self.llm.chat(messages, tools=SPEC)
+                msg = await self._chat(messages)
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
                     final_text = (msg.get("content") or "").strip()
                     break
                 messages.append(msg)
+                calls = []
                 for call in tool_calls:
-                    fn = call.get("function", {})
+                    fn = call.get("function", {}) or {}
                     name = fn.get("name", "")
                     try:
                         args = json.loads(fn.get("arguments") or "{}")
                     except ValueError:
                         args = {}
-                    self.chatlog.agent(
-                        ctx.source, ctx.user_label or ctx.chat_key, "tool",
-                        f"{name}({args})",
-                    )
-                    result = await runner.run(name, args)
+                    calls.append((call.get("id", ""), name, args))
+                self.chatlog.agent(
+                    ctx.source, ctx.user_label or ctx.chat_key, "tool",
+                    "; ".join(f"{n}({_brief(a)})" for _, n, a in calls),
+                )
+                # run the step's tools concurrently (independent by design)
+                results = await asyncio.gather(
+                    *(runner.run(n, a) for _, n, a in calls),
+                    return_exceptions=True,
+                )
+                for (cid, name, _a), res in zip(calls, results):
+                    if isinstance(res, BaseException):
+                        log.warning("tool %s raised: %s", name, res)
+                        content = json.dumps({"error": str(res)}, ensure_ascii=False)
+                    else:
+                        content = _compact(str(res))
                     messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id", ""),
-                            "content": result,
-                        }
+                        {"role": "tool", "tool_call_id": cid, "content": content}
                     )
             else:
-                final_text = "（达到工具调用步数上限，已中止；请缩小问题范围重试）"
+                final_text = (
+                    "（已达工具调用步数上限，已用现有结果作答；"
+                    "如仍需更多步骤，请缩小范围或回复 ::继续）"
+                )
         except Exception as e:
             log.exception("agent loop failed")
             history.pop()  # drop failed turn

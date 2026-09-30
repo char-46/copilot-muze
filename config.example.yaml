@@ -74,7 +74,7 @@ llm:
     base_url: ""              # empty -> reuse chat.base_url / chat.api_key
     api_key: ""
     model: ""                 # e.g. glm-4v-plus
-  agent_max_steps: 8
+  agent_max_steps: 12        # tool-calling rounds per request (raised from 8); tools run in parallel within a round
   asr_provider: ""            # reserved (voice transcription lands later)
 
 web:                          # app-level: one webui serves every account
