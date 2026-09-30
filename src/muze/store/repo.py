@@ -121,39 +121,51 @@ class Repository:
     # ---------------------------------------------- backfill resume state
     async def get_bf_state(self, scene: str, peer_id: int) -> dict:
         """Multi-watermark pull state: cursor (where an unfinished deep pull
-        stopped) + target (its lower bound). Empty dict when none pending."""
+        stopped), target (its seq lower bound) and since (its time lower
+        bound, for `/sync 2d`-style pulls). Empty dict when none pending."""
         async with self.conn.execute(
-            "SELECT bf_cursor_seq, bf_target_seq FROM conversations "
+            "SELECT bf_cursor_seq, bf_target_seq, bf_since_ts FROM conversations "
             "WHERE scene = ? AND peer_id = ?",
             (scene, peer_id),
         ) as cur:
             row = await cur.fetchone()
-        if not row or row["bf_target_seq"] is None:
+        if not row or (row["bf_target_seq"] is None and row["bf_since_ts"] is None):
             return {}
-        return {"cursor": row["bf_cursor_seq"], "target": row["bf_target_seq"]}
+        return {
+            "cursor": row["bf_cursor_seq"],
+            "target": row["bf_target_seq"],
+            "since": row["bf_since_ts"],
+        }
 
     async def set_bf_state(
-        self, scene: str, peer_id: int, cursor: int, target: int
+        self,
+        scene: str,
+        peer_id: int,
+        cursor: int | None,
+        target: int | None,
+        since: float | None = None,
     ) -> None:
         """Persist resume progress (called after every completed page so a
         crash never loses more than one page of work)."""
         await self.conn.execute(
             """
-            INSERT INTO conversations (scene, peer_id, bf_cursor_seq, bf_target_seq, bf_last_run_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO conversations
+                (scene, peer_id, bf_cursor_seq, bf_target_seq, bf_since_ts, bf_last_run_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (scene, peer_id) DO UPDATE SET
                 bf_cursor_seq = excluded.bf_cursor_seq,
                 bf_target_seq = excluded.bf_target_seq,
+                bf_since_ts = excluded.bf_since_ts,
                 bf_last_run_at = excluded.bf_last_run_at
             """,
-            (scene, peer_id, cursor, target, _now()),
+            (scene, peer_id, cursor, target, since, _now()),
         )
         await self.conn.commit()
 
     async def clear_bf_state(self, scene: str, peer_id: int) -> None:
         await self.conn.execute(
             "UPDATE conversations SET bf_cursor_seq = NULL, bf_target_seq = NULL, "
-            "bf_last_run_at = ? WHERE scene = ? AND peer_id = ?",
+            "bf_since_ts = NULL, bf_last_run_at = ? WHERE scene = ? AND peer_id = ?",
             (_now(), scene, peer_id),
         )
         await self.conn.commit()
@@ -161,7 +173,8 @@ class Repository:
     async def pending_bf_conversations(self) -> list[tuple[str, int]]:
         """Conversations with an unfinished (hole-filling) pull pending."""
         async with self.conn.execute(
-            "SELECT scene, peer_id FROM conversations WHERE bf_target_seq IS NOT NULL"
+            "SELECT scene, peer_id FROM conversations "
+            "WHERE bf_target_seq IS NOT NULL OR bf_since_ts IS NOT NULL"
         ) as cur:
             return [(r[0], r[1]) for r in await cur.fetchall()]
 

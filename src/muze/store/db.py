@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS conversations (
                                     -- last page of an UNFINISHED deep pull
     bf_target_seq INTEGER,          -- resume lower bound: pull until oldest
                                     -- seq <= this (NULL = no pending pull)
+    bf_since_ts   REAL,             -- time-bounded pull: stop at messages older
+                                    -- than this (NULL = seq-bounded pull)
     bf_last_run_at REAL,            -- wall clock of the last backfill run
     last_op_at    REAL,             -- wall clock of the last stored message
     PRIMARY KEY (scene, peer_id)
@@ -197,15 +199,25 @@ async def _migrate_v8_bf_watermarks(conn: aiosqlite.Connection) -> None:
         await conn.commit()
 
 
+async def _migrate_v9_bf_since(conn: aiosqlite.Connection) -> None:
+    """v9: conversations gained bf_since_ts for time-bounded pulls (/sync 2d)."""
+    async with conn.execute("PRAGMA table_info(conversations)") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    if "bf_since_ts" not in cols:
+        await conn.execute("ALTER TABLE conversations ADD COLUMN bf_since_ts REAL")
+        await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
     if not has_meta:
         await conn.executescript(SCHEMA_V1)
         await _migrate_v8_bf_watermarks(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '8')")
+        await _migrate_v9_bf_since(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '9')")
         await conn.commit()
-        log.info("database created (schema v8)")
+        log.info("database created (schema v9)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -224,3 +236,9 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '8')")
         await conn.commit()
         log.info("database migrated to schema v8 (backfill resume watermarks)")
+        version = 8
+    if version < 9:
+        await _migrate_v9_bf_since(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '9')")
+        await conn.commit()
+        log.info("database migrated to schema v9 (time-bounded backfill)")

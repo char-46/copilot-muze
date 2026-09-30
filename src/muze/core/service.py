@@ -857,17 +857,36 @@ class ControlService:
         ]
         return CommandOutcome("\n".join(lines))
 
-    @slash("sync", "/sync [force] [scene/peer] [页数]", "漫游补拉；force=忽略水位强拉全部(重复自动去重)；带页数=深拉")
+    @slash(
+        "sync",
+        "/sync [force|时长] [scene/peer] [页数]",
+        "漫游补拉；force=忽略水位强拉全部；时长如 2d=重拉最近两天(忽略水位)；带页数=深拉",
+    )
     async def cmd_sync(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not self.runtime.backfiller:
             return CommandOutcome.err("backfiller 不可用")
         from muze.progress import ProgressReporter
+        from muze.timeparse import human_duration, parse_duration
 
         force = False
+        duration: int | None = None
         args = list(args)
         if args and args[0].lower() in ("force", "强制", "all"):
             force = True
             args = args[1:]
+        if args:
+            dur = parse_duration(args[0])
+            if dur is not None:
+                duration = dur
+                args = args[1:]
+        since_ts = (time.time() - duration) if duration else None
+        tag = (
+            f"（最近 {human_duration(duration)}）" if duration
+            else ("（强制全量）" if force else "")
+        )
+        since_note = (
+            f"自 {epoch_iso(int(since_ts))} 起，忽略水位线" if since_ts else ""
+        )
 
         async def emit(text: str) -> None:
             if ctx.qq_reachable:
@@ -888,7 +907,7 @@ class ControlService:
         if args:
             scene, peer = self.parse_target(args[0])
             label = await self.target_label(scene, peer)
-            if len(args) > 1:
+            if len(args) > 1 and duration is None:
                 pages = min(int(args[1]), 500)
                 reporter = ProgressReporter(f"深拉 {label}", emit, key=ctx.chat_key)
 
@@ -905,11 +924,13 @@ class ControlService:
                     f"深拉 {label} 已开始（最多 {pages} 页）。"
                     "进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
                 )
-            reporter = ProgressReporter(f"sync {label}" + ("（强制全量）" if force else ""), emit, key=ctx.chat_key)
+            reporter = ProgressReporter(f"sync {label}{tag}", emit, key=ctx.chat_key)
 
             async def job_one() -> None:
                 try:
-                    n = await self.runtime.backfiller.run_once([(scene, peer)], reporter=reporter, force=force)
+                    n = await self.runtime.backfiller.run_once(
+                        [(scene, peer)], reporter=reporter, force=force, since_ts=since_ts
+                    )
                 except Exception as e:
                     await reporter.finish(f"失败: {e}")
                     return
@@ -919,6 +940,11 @@ class ControlService:
                 await reporter.finish(f"完成，新增 {n} 条")
 
             asyncio.create_task(job_one())
+            if duration:
+                return CommandOutcome(
+                    f"重新拉取 {label} 最近 {human_duration(duration)}"
+                    f"（{since_note}，已存自动去重）。完成时总结"
+                )
             if force:
                 return CommandOutcome(
                     f"强制全量补拉 {label} 已开始：忽略水位翻到漫游尽头"
@@ -928,11 +954,13 @@ class ControlService:
                 f"sync {label} 已开始。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
             )
 
-        reporter = ProgressReporter("全量补拉" + ("（强制全量）" if force else ""), emit, key=ctx.chat_key)
+        reporter = ProgressReporter("全量补拉" + tag, emit, key=ctx.chat_key)
 
         async def job_all() -> None:
             try:
-                n = await self.runtime.backfiller.run_once(reporter=reporter, force=force)
+                n = await self.runtime.backfiller.run_once(
+                    reporter=reporter, force=force, since_ts=since_ts
+                )
             except Exception as e:
                 await reporter.finish(f"失败: {e}")
                 return
@@ -942,6 +970,11 @@ class ControlService:
             await reporter.finish(f"完成，新增 {n} 条")
 
         asyncio.create_task(job_all())
+        if duration:
+            return CommandOutcome(
+                f"重新拉取最近 {human_duration(duration)}的消息"
+                f"（{since_note}，已存自动去重）。完成时总结"
+            )
         if force:
             return CommandOutcome(
                 "强制全量补拉已启动（后台执行）：所有会话忽略水位翻到漫游尽头"

@@ -86,7 +86,14 @@ class Backfiller:
         return out
 
     # ------------------------------------------------------------- worker
-    async def _backfill_conversation(self, scene: str, peer_id: int, reporter=None, force: bool = False) -> int:
+    async def _backfill_conversation(
+        self,
+        scene: str,
+        peer_id: int,
+        reporter=None,
+        force: bool = False,
+        since_ts: float | None = None,
+    ) -> int:
         bf = self.cfg.ingest.backfill
         caps = self.adapter.caps
         if scene == "friend" and not caps.friend_history:
@@ -95,31 +102,40 @@ class Backfiller:
             return 0
 
         watermark = await self.repo.get_watermark(scene, peer_id)
-        # Multi-watermark pull: `target` is the lower bound to page down to and
-        # `cursor` is where an unfinished pull left off (both persisted, so a
-        # crash / page-cap / restart resumes instead of leaving a silent hole).
-        if force:
+        # Multi-watermark pull, three modes:
+        #   since_ts set -> /sync 2d: IGNORE the watermark, recover the window
+        #   force        -> ignore the watermark, page to the roaming end
+        #   otherwise    -> resume a saved pull, or incremental from last_seq
+        since: float | None
+        if since_ts is not None:
             target: int = 0
             cursor: int | None = None
+            since = float(since_ts)
+        elif force:
+            target, cursor, since = 0, None, None
         else:
             resume = await self.repo.get_bf_state(scene, peer_id)
             if resume:
-                target = int(resume["target"])
-                cursor = resume["cursor"]
+                target = int(resume.get("target") or 0)
+                cursor = resume.get("cursor")
+                since = resume.get("since")
                 log.info(
-                    "backfill %s resuming interrupted pull (cursor=%s target=%s)",
-                    conv_id(scene, peer_id), cursor, target,
+                    "backfill %s resuming interrupted pull (cursor=%s target=%s since=%s)",
+                    conv_id(scene, peer_id), cursor, target, since,
                 )
             else:
-                target, cursor = watermark, None
+                target, cursor, since = watermark, None, None
         stop_watermark = target
+        time_bounded = since is not None
         total_new = 0
         pages = 0
-        done = False  # reached the target / the roaming end / the pager's end
+        done = False  # reached the target / window start / roaming/pager end
 
         # record intent up front so even a crash during the first page can be
         # resumed (otherwise the partial upserts raise last_seq and hide the hole)
-        await self.repo.set_bf_state(scene, peer_id, cursor=cursor, target=stop_watermark)
+        await self.repo.set_bf_state(
+            scene, peer_id, cursor=cursor, target=stop_watermark, since=since
+        )
 
         while pages < bf.max_pages_per_conv and not self._stop.is_set():
             try:
@@ -136,13 +152,20 @@ class Backfiller:
             pages += 1
             page_new = 0
             oldest = None
+            oldest_time = None
             for m in res.messages:  # ascending by message_seq
                 oldest = m.message_seq if oldest is None else min(oldest, m.message_seq)
-                # upsert everything above the target (dedup keeps it cheap);
-                # holes below last_seq — but above target — get recovered here
-                if m.message_seq > stop_watermark:
-                    if await self.pipeline.handle_message(m, source="backfill"):
-                        page_new += 1
+                mt = m.time or 0
+                if mt > 0 and (oldest_time is None or mt < oldest_time):
+                    oldest_time = mt
+                if time_bounded:
+                    # window pull: keep everything in range (dedup handles the
+                    # rest); an unknown timestamp (0) is kept rather than lost
+                    keep = mt == 0 or mt >= since
+                else:
+                    keep = force or m.message_seq > stop_watermark
+                if keep and await self.pipeline.handle_message(m, source="backfill"):
+                    page_new += 1
             total_new += page_new
             if reporter is not None:
                 reporter.bump(new=page_new, pages=1)
@@ -150,12 +173,17 @@ class Backfiller:
 
             # Stop conditions:
             #  - server says no more pages (roaming end)
-            #  - we paged down to the target (everything older is covered)
+            #  - time pull: page went past the window start
+            #  - seq pull: paged down to the target
             #  - cursor stopped moving (safety against pager quirks)
             if res.next_message_seq is None:
                 done = True
                 break
-            if oldest is not None and oldest <= stop_watermark:
+            if time_bounded:
+                if oldest_time is not None and oldest_time < since:
+                    done = True
+                    break
+            elif oldest is not None and oldest <= stop_watermark:
                 done = True
                 break
             if cursor is not None and res.next_message_seq >= cursor:
@@ -165,7 +193,7 @@ class Backfiller:
             cursor = res.next_message_seq
             # persist progress so an interruption never loses more than a page
             await self.repo.set_bf_state(
-                scene, peer_id, cursor=cursor, target=stop_watermark
+                scene, peer_id, cursor=cursor, target=stop_watermark, since=since
             )
             await asyncio.sleep(bf.page_delay)
 
@@ -174,14 +202,16 @@ class Backfiller:
         else:
             log.info(
                 "backfill %s paused (page cap/interrupt) at %s pages; "
-                "will resume (cursor=%s target=%s)",
-                conv_id(scene, peer_id), pages, cursor, stop_watermark,
+                "will resume (cursor=%s target=%s since=%s)",
+                conv_id(scene, peer_id), pages, cursor, stop_watermark, since,
             )
 
-        if total_new or force:
+        if total_new or force or time_bounded:
             log.info(
-                "backfill %s +%s new (pages=%s, watermark was %s, target=%s, force=%s)",
-                conv_id(scene, peer_id), total_new, pages, watermark, stop_watermark, force,
+                "backfill %s +%s new (pages=%s, watermark was %s, target=%s, "
+                "since=%s, force=%s)",
+                conv_id(scene, peer_id), total_new, pages, watermark,
+                stop_watermark, since, force,
             )
         return total_new
 
@@ -190,6 +220,7 @@ class Backfiller:
         targets: list[tuple[str, int]] | None = None,
         reporter: ProgressReporter | None = None,
         force: bool = False,
+        since_ts: float | None = None,
     ) -> int | None:
         if self.running:
             log.info("backfill already running; skipping")
@@ -199,16 +230,19 @@ class Backfiller:
         if reporter is None:
             # Owned reporter: a background pull has no front to report to until
             # someone /syncs, at which point they subscribe (see subscribe()).
-            reporter = ProgressReporter("全量补拉" + ("（强制全量）" if force else ""))
+            tag = "（强制全量）" if force else ("（重拉近期）" if since_ts else "")
+            reporter = ProgressReporter("全量补拉" + tag)
         self._reporter = reporter
         started = time.time()
         new_total = 0
         try:
             targets = targets if targets is not None else await self.target_conversations()
-            log.info("backfill start: %s conversations (force=%s)", len(targets), force)
-            await reporter.report_start(
-                f"{len(targets)} 个会话" + ("（强制全量）" if force else "")
+            log.info(
+                "backfill start: %s conversations (force=%s since=%s)",
+                len(targets), force, since_ts,
             )
+            note = "（强制全量）" if force else ("（重拉近期）" if since_ts else "")
+            await reporter.report_start(f"{len(targets)} 个会话{note}")
 
             concurrency = max(1, self.cfg.ingest.backfill.concurrency)
             queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
@@ -224,7 +258,7 @@ class Backfiller:
                         return
                     try:
                         n = await self._backfill_conversation(
-                            scene, peer, reporter=reporter, force=force
+                            scene, peer, reporter=reporter, force=force, since_ts=since_ts
                         )
                         counts["new"] += n
                         reporter.bump(new=0, pages=0, convs=1)

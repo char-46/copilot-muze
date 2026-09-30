@@ -331,7 +331,7 @@ async def test_bf_only_row_hidden_from_lists(repo):
     assert await repo.pending_bf_conversations() == []
 
 
-async def test_migration_v7_to_v8_adds_columns(tmp_path):
+async def test_migration_v7_to_v9_adds_columns(tmp_path):
     import aiosqlite
 
     path = str(tmp_path / "old.db")
@@ -354,7 +354,58 @@ async def test_migration_v7_to_v8_adds_columns(tmp_path):
     conn = await open_db(path)
     async with conn.execute("PRAGMA table_info(conversations)") as cur:
         cols = {r[1] for r in await cur.fetchall()}
-    assert {"bf_cursor_seq", "bf_target_seq", "bf_last_run_at", "last_op_at"} <= cols
+    assert {
+        "bf_cursor_seq", "bf_target_seq", "bf_since_ts", "bf_last_run_at", "last_op_at",
+    } <= cols
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
-        assert (await cur.fetchone())[0] == "8"
+        assert (await cur.fetchone())[0] == "9"
     await conn.close()
+
+
+# ------------------------------------------- time-window pull (/sync 2d)
+async def test_time_window_pull_ignores_watermark(repo):
+    """`/sync 2d`-style: re-pull the window regardless of last_seq (dedup)."""
+    for seq in range(61, 91):  # already archived -> watermark 90
+        await repo.upsert_message(make_msg("friend", 100, seq), f"m{seq}", "event")
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    # make_msg time = 1759000000 + seq, so cutoff at +41 keeps seqs 41..90
+    since = 1759000000 + 41
+    await bf.run_once([("friend", 100)], since_ts=since)
+
+    stats = await repo.coverage_stats("friend", 100)
+    assert stats["n"] == 50           # window 41..90; 61..90 pre-existing
+    assert stats["min_seq"] == 41     # nothing older than the window stored
+    assert await repo.get_bf_state("friend", 100) == {}
+
+
+async def test_time_window_pull_resumes_after_cap(repo):
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    bf.cfg.ingest.backfill.max_pages_per_conv = 1
+    since = 1759000000 + 41
+    await bf.run_once([("friend", 100)], since_ts=since)
+
+    state = await repo.get_bf_state("friend", 100)
+    assert state.get("since") == since and state.get("cursor") == 31
+
+    bf.cfg.ingest.backfill.max_pages_per_conv = 10
+    bf.adapter = FakeAdapter({("friend", 100): [
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]})
+    await bf.run_once([("friend", 100)])  # resumes the window pull
+    assert (await repo.coverage_stats("friend", 100))["min_seq"] == 41
+    assert await repo.get_bf_state("friend", 100) == {}

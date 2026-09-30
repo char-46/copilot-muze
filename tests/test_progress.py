@@ -216,7 +216,7 @@ async def test_run_once_owns_reporter_and_reports_finish(repo):
     async def collect(text):
         seen.append(text)
 
-    async def spy(scene, peer, reporter=None, force=False):
+    async def spy(scene, peer, reporter=None, force=False, since_ts=None):
         captured["subscribed"] = bf.subscribe(collect)
         return await orig(scene, peer, reporter=reporter, force=force)
 
@@ -276,3 +276,65 @@ async def test_sync_when_running_without_reporter_reports_error(repo):
     ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
     out = await svc.run_command("/sync force", ctx)
     assert out.is_error and "已有补拉" in out.text
+
+
+async def test_sync_duration_pull_ignores_watermark(repo):
+    import asyncio
+
+    from muze.core.service import ControlContext, ControlService, Runtime
+
+    class FakeBF:
+        running = False
+
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def run_once(self, targets=None, reporter=None, force=False, since_ts=None):
+            self.calls.append({"targets": targets, "force": force, "since_ts": since_ts})
+            return 3
+
+        def status(self):
+            return {}
+
+    bf = FakeBF()
+    runtime = Runtime()
+    runtime.backfiller = bf
+    svc = ControlService(MuzeConfig(), FakeAdapter({}), repo, ChatLog(), runtime)
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+
+    out = await svc.run_command("sync 2d", ctx)
+    assert not out.is_error and "最近 2 天" in out.text and "忽略水位线" in out.text
+    await asyncio.sleep(0.05)  # let the background job run
+    assert bf.calls and bf.calls[0]["since_ts"] is not None
+    assert bf.calls[0]["force"] is False and bf.calls[0]["targets"] is None
+
+
+async def test_sync_duration_targeted(repo):
+    import asyncio
+
+    from muze.core.service import ControlContext, ControlService, Runtime
+
+    class FakeBF:
+        running = False
+
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def run_once(self, targets=None, reporter=None, force=False, since_ts=None):
+            self.calls.append({"targets": targets, "since_ts": since_ts})
+            return 1
+
+        def status(self):
+            return {}
+
+    bf = FakeBF()
+    runtime = Runtime()
+    runtime.backfiller = bf
+    svc = ControlService(MuzeConfig(), FakeAdapter({}), repo, ChatLog(), runtime)
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+
+    out = await svc.run_command("sync 12h group/9", ctx)
+    assert not out.is_error and "最近 12 小时" in out.text
+    await asyncio.sleep(0.05)
+    assert bf.calls[0]["targets"] == [("group", 9)]
+    assert bf.calls[0]["since_ts"] is not None
