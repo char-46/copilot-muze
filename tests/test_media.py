@@ -82,19 +82,21 @@ async def test_face_dedup_same_account(tmp_path):
     store, repo, adapter = await make_store(tmp_path)
     face = MarketFaceSeg(emoji_id="EMO1", summary="开心", url="http://fake/face1")
 
-    mid1 = await store.register("group", 1, 100, 0, face)
+    mid1 = await store.register("group", 1, 100, 0, face, msg_time=1700000100)
     assert mid1 is not None  # first sighting needs a download
     row = await repo.media_by_id(mid1)
+    assert row["time"] == 1700000100  # message timestamp stored on the media row
     updated = await store.download_row(row, prefer_url=face.url)
     assert updated["status"] == "done"
     assert adapter.http.count == 1
 
     # same sticker again in another message: zero downloads, row arrives done
-    mid2 = await store.register("group", 2, 200, 0, face)
+    mid2 = await store.register("group", 2, 200, 0, face, msg_time=1700000200)
     assert mid2 is None
     rows = await repo.media_for_message("group", 2, 200)
     assert len(rows) == 1 and rows[0]["status"] == "done"
     assert rows[0]["file_path"] == updated["file_path"]
+    assert rows[0]["time"] == 1700000200  # per-message timestamp kept
     assert adapter.http.count == 1  # no extra fetch
     await close(store)
 

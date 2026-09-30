@@ -115,7 +115,8 @@ class IngestPipeline:
             else:
                 prefer = None  # roaming temp urls are stale; resolve fresh
             mid = await self.media.register(
-                msg.message_scene, msg.peer_id, msg.message_seq, i, seg
+                msg.message_scene, msg.peer_id, msg.message_seq, i, seg,
+                msg_time=msg.time,
             )
             self._queue_media(mid, prefer)
         return True

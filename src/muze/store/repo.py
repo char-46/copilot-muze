@@ -75,7 +75,7 @@ class Repository:
                 msg.peer_id,
                 msg.message_seq,
                 msg.sender_id,
-                msg.time,
+                msg.time or _now(),  # timestamp; fallback if the protocol sent 0
                 json.dumps(raw, ensure_ascii=False),
                 text_content,
                 source,
@@ -210,6 +210,7 @@ class Repository:
             "file_path": None,
             "file_size": None,
             "content_hash": None,
+            "time": None,
             **row,
         }
         cur = await self.conn.execute(
@@ -217,10 +218,10 @@ class Repository:
             INSERT INTO media
                 (scene, peer_id, message_seq, seg_index, kind, resource_id, file_id,
                  file_name, file_hash, width, height, duration, summary,
-                 status, file_path, file_size, content_hash, created_at, updated_at)
+                 status, file_path, file_size, content_hash, time, created_at, updated_at)
             VALUES (:scene, :peer_id, :message_seq, :seg_index, :kind, :resource_id,
                     :file_id, :file_name, :file_hash, :width, :height, :duration,
-                    :summary, :status, :file_path, :file_size, :content_hash,
+                    :summary, :status, :file_path, :file_size, :content_hash, :time,
                     :created_at, :updated_at)
             ON CONFLICT (scene, peer_id, message_seq, seg_index) DO NOTHING
             """,

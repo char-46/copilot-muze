@@ -102,7 +102,9 @@ class MediaStore:
             )
         return meta
 
-    def plan_row(self, scene: str, peer_id: int, seq: int, seg_index: int, seg: Segment) -> dict | None:
+    def plan_row(
+        self, scene: str, peer_id: int, seq: int, seg_index: int, seg: Segment, msg_time: int = 0
+    ) -> dict | None:
         kind = self.segment_kind(seg)
         if kind is None:
             return None
@@ -127,13 +129,16 @@ class MediaStore:
             "duration": meta.get("duration"),
             "summary": meta.get("summary", "") or "",
             "status": "pending",
+            "time": msg_time or None,  # message timestamp, unix sec
         }
 
-    async def register(self, scene: str, peer_id: int, seq: int, seg_index: int, seg: Segment) -> int | None:
+    async def register(
+        self, scene: str, peer_id: int, seq: int, seg_index: int, seg: Segment, msg_time: int = 0
+    ) -> int | None:
         """Plan + insert a media row. Returns the id when a DOWNLOAD is still
         needed, or None when nothing to do (not media / duplicate message /
         dedup hit: the blob already exists and the row is inserted done)."""
-        row = self.plan_row(scene, peer_id, seq, seg_index, seg)
+        row = self.plan_row(scene, peer_id, seq, seg_index, seg, msg_time=msg_time)
         if row is None:
             return None
         if row["kind"] == "file" and not self.adapter.caps.incoming_file_segment:

@@ -31,6 +31,19 @@ async def test_upsert_dedupes(repo):
     assert (await repo.stats())["messages"] == 1
 
 
+async def test_message_timestamp_stored_and_fallback(repo):
+    # timestamp is stored verbatim
+    assert await repo.upsert_message(make_msg(seq=5), "x", "event") is True
+    row = await repo.get_message_row("friend", 100, 5)
+    assert row["time"] == 1759000005
+    # time=0 from the protocol falls back to ingestion time, never stored 0
+    m0 = make_msg(seq=7)
+    m0.time = 0
+    assert await repo.upsert_message(m0, "x", "event") is True
+    row0 = await repo.get_message_row("friend", 100, 7)
+    assert row0["time"] > 0
+
+
 async def test_watermark_tracks_max_seq(repo):
     for seq in (1, 5, 3):
         await repo.upsert_message(make_msg(seq=seq), "x", "event")

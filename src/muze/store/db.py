@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS media (
     status      TEXT NOT NULL DEFAULT 'pending',  -- pending/downloading/done/failed/skipped
     error       TEXT,
     content_hash TEXT,                             -- sha256 of the blob (dedup)
+    time        INTEGER,                           -- message timestamp (unix sec)
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
     UNIQUE (scene, peer_id, message_seq, seg_index)
@@ -154,22 +155,32 @@ async def _migrate_v6_media_hash(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _migrate_v7_media_time(conn: aiosqlite.Connection) -> None:
+    """media gained the message timestamp in v7 (time column)."""
+    async with conn.execute("PRAGMA table_info(media)") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    if "time" not in cols:
+        await conn.execute("ALTER TABLE media ADD COLUMN time INTEGER")
+        await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
     if not has_meta:
         await conn.executescript(SCHEMA_V1)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '6')")
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '7')")
         await conn.commit()
-        log.info("database created (schema v6)")
+        log.info("database created (schema v7)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
     version = int(row[0]) if row else 0
-    if version < 6:
+    if version < 7:
         await conn.executescript(SCHEMA_V1)  # CREATE IF NOT EXISTS: applies missing tables
         await _migrate_v5_add_period(conn)
         await _migrate_v6_media_hash(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '6')")
+        await _migrate_v7_media_time(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '7')")
         await conn.commit()
-        log.info("database migrated to schema v6")
+        log.info("database migrated to schema v7")
