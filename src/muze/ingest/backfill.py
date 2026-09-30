@@ -160,6 +160,90 @@ class Backfiller:
         finally:
             self.running = False
 
+    # ---------------------------------------------------------- coverage
+    async def probe_coverage(self, scene: str, peer_id: int, pages: int = 10) -> dict:
+        """Read-only probe of how deep server-side roaming goes.
+
+        Walks `pages` pages newest->older without storing anything; reports
+        the oldest seq seen, whether the roaming end was reached, and how
+        many messages the server returned (seqs are per-conversation and
+        roughly 1:1 with messages, so gaps can be estimated from seq diff).
+        """
+        bf = self.cfg.ingest.backfill
+        caps = self.adapter.caps
+        if scene == "friend" and not caps.friend_history:
+            return {"error": "protocol side has no friend roaming"}
+        if scene == "group" and not caps.group_history:
+            return {"error": "protocol side has no group roaming"}
+
+        cursor: int | None = None
+        oldest: int | None = None
+        newest: int | None = None
+        seen = 0
+        fetched = 0
+        reached_end = False
+        while fetched < pages and not self._stop.is_set():
+            try:
+                if caps.history_start_seq and cursor is not None:
+                    res = await self.adapter.get_history_messages(
+                        scene, peer_id, start_message_seq=cursor, limit=bf.page_limit
+                    )
+                else:
+                    res = await self.adapter.get_history_messages(scene, peer_id, limit=bf.page_limit)
+            except ProtocolError as e:
+                return {"error": str(e)}
+            fetched += 1
+            for m in res.messages:
+                oldest = m.message_seq if oldest is None else min(oldest, m.message_seq)
+                newest = m.message_seq if newest is None else max(newest, m.message_seq)
+                seen += 1
+            if res.next_message_seq is None:
+                reached_end = True
+                break
+            if cursor is not None and res.next_message_seq >= cursor:
+                break  # pager cannot go further on this protocol side
+            cursor = res.next_message_seq
+            await asyncio.sleep(bf.page_delay)
+        return {
+            "pages": fetched,
+            "seen": seen,
+            "oldest_seq": oldest,
+            "newest_seq": newest,
+            "reached_end": reached_end,
+            "paged": caps.history_start_seq,
+        }
+
+    async def deep_pull(self, scene: str, peer_id: int, pages: int) -> int:
+        """Ignore the watermark and pull up to `pages` pages into the store."""
+        bf = self.cfg.ingest.backfill
+        caps = self.adapter.caps
+        cursor: int | None = None
+        new = 0
+        fetched = 0
+        while fetched < pages and not self._stop.is_set():
+            try:
+                if caps.history_start_seq and cursor is not None:
+                    res = await self.adapter.get_history_messages(
+                        scene, peer_id, start_message_seq=cursor, limit=bf.page_limit
+                    )
+                else:
+                    res = await self.adapter.get_history_messages(scene, peer_id, limit=bf.page_limit)
+            except ProtocolError as e:
+                log.warning("deep pull %s failed: %s", conv_id(scene, peer_id), e)
+                break
+            fetched += 1
+            for m in res.messages:
+                if await self.pipeline.handle_message(m, source="backfill"):
+                    new += 1
+            if res.next_message_seq is None:
+                break
+            if cursor is not None and res.next_message_seq >= cursor:
+                break
+            cursor = res.next_message_seq
+            await asyncio.sleep(bf.page_delay)
+        log.info("deep pull %s: %s new in %s pages", conv_id(scene, peer_id), new, fetched)
+        return new
+
     # -------------------------------------------------------- background
     async def start_background(self) -> None:
         bf = self.cfg.ingest.backfill

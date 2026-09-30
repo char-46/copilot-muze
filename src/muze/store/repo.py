@@ -474,6 +474,19 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    async def coverage_stats(self, scene: str, peer_id: int) -> dict:
+        """Local archive coverage for one conversation."""
+        async with self.conn.execute(
+            """
+            SELECT COUNT(*) AS n, MIN(message_seq) AS min_seq, MAX(message_seq) AS max_seq,
+                   MIN(time) AS min_time, MAX(time) AS max_time
+            FROM messages WHERE scene=? AND peer_id=?
+            """,
+            (scene, peer_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else {}
+
     # ---------------------------------------------------------------- memories
     async def add_memory(
         self, kind: str, subject: str, content: str, source: str = "",

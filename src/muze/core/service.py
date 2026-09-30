@@ -518,6 +518,43 @@ class ControlService:
             return CommandOutcome.err(f"#{args[0]} 不存在或已停用")
         return CommandOutcome(f"已停用记忆 #{args[0]}")
 
+    @slash("coverage", "/coverage <scene/peer> [页数]", "已拉历史条数 + 服务器漫游未拉缺口（只读探测，默认10页）")
+    async def cmd_coverage(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            return CommandOutcome.err("用法: /coverage <scene/peer> [页数]")
+        if self.runtime.backfiller is None:
+            return CommandOutcome.err("backfiller 不可用")
+        scene, peer = self.parse_target(args[0])
+        pages = min(int(args[1]) if len(args) > 1 else 10, 200)
+
+        local = await self.repo.coverage_stats(scene, peer)
+        label = await self.target_label(scene, peer)
+        if not local.get("n"):
+            return CommandOutcome(
+                f"{label}: 本地 0 条（尚未拉取；/sync {scene}/{peer} 先拉取）"
+            )
+        probe = await self.runtime.backfiller.probe_coverage(scene, peer, pages=pages)
+        if "error" in probe:
+            return CommandOutcome.err(probe["error"])
+
+        lines = [
+            f"{label}",
+            f"本地: {local['n']} 条, seq {local['min_seq']}..{local['max_seq']}, "
+            f"时间 {epoch_iso(local['min_time'])[:10]}..{epoch_iso(local['max_time'])[:10]}",
+            f"服务器探测: {probe['pages']} 页/{probe['seen']} 条, 最老 seq={probe['oldest_seq']}"
+            + ("（已到漫游尽头）" if probe["reached_end"] else "（未到尽头，缺口可能更大）"),
+        ]
+        if not probe.get("paged"):
+            lines.append("注意: 协议端不支持 start_seq 定位，探测深度有限")
+        oldest = probe["oldest_seq"]
+        if oldest is not None and oldest < local["min_seq"]:
+            gap = local["min_seq"] - oldest
+            lines.append(f"未拉缺口: ≈{gap} 条（本地最老 seq={local['min_seq']}，服务器探测到 seq={oldest}）")
+            lines.append(f"补拉: /sync {scene}/{peer} <页数>（深拉，忽略水位）")
+        else:
+            lines.append("探测范围内无缺口（本地已覆盖）")
+        return CommandOutcome("\n".join(lines))
+
     @slash("help", "/help", "命令列表（自动扫描生成）")
     async def cmd_help(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(COMMANDS.help_text())
@@ -546,12 +583,19 @@ class ControlService:
         ]
         return CommandOutcome("\n".join(lines))
 
-    @slash("sync", "/sync [scene/peer]", "立即漫游补拉（缺省全部会话，后台执行）")
+    @slash("sync", "/sync [scene/peer] [页数]", "漫游补拉；带页数=深拉（忽略水位翻 N 页，用于补 /coverage 发现的缺口）")
     async def cmd_sync(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not self.runtime.backfiller:
-            return CommandOutcome("backfiller 不可用", is_error=True)
+            return CommandOutcome.err("backfiller 不可用")
         if args:
             scene, peer = self.parse_target(args[0])
+            if len(args) > 1:
+                pages = min(int(args[1]), 500)
+                n = await self.runtime.backfiller.deep_pull(scene, peer, pages)
+                return CommandOutcome(
+                    f"深拉 {conv_id(scene, peer)} 完成（最多 {pages} 页），新增 {n} 条；"
+                    f"/coverage {scene}/{peer} 复查缺口"
+                )
             n = await self.runtime.backfiller.run_once([(scene, peer)])
             return CommandOutcome(f"sync {conv_id(scene, peer)} 完成，新增 {n} 条")
         asyncio.create_task(self.runtime.backfiller.run_once())

@@ -109,8 +109,7 @@ class CountingPipeline:
         if self.repo is not None:
             from muze.chatlog import plain_text
 
-            await self.repo.upsert_message(msg, plain_text(msg.segments), source)
-            return True
+            return await self.repo.upsert_message(msg, plain_text(msg.segments), source)
         return True
 
 
@@ -177,3 +176,40 @@ async def test_backfill_respects_max_pages(repo):
     new = await bf.run_once([("friend", 100)])
     assert new == 60  # two pages of 30
     assert len(adapter.calls) == 2
+
+
+async def test_probe_coverage(repo):
+    # full roaming: pages down to seq 1, end reached
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    probe = await bf.probe_coverage("friend", 100, pages=10)
+    assert probe["oldest_seq"] == 1 and probe["reached_end"] is True
+    assert probe["seen"] == 90 and probe["paged"] is True
+    # nothing stored by a probe
+    assert (await repo.coverage_stats("friend", 100)).get("n") in (None, 0)
+
+
+async def test_deep_pull_ignores_watermark(repo):
+    # watermark already at 90; deep pull still fetches the older pages
+    for seq in range(61, 91):
+        await repo.upsert_message(make_msg("friend", 100, seq), f"m{seq}", "event")
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    pipe = CountingPipeline(repo)
+    bf = Backfiller(adapter, repo, MuzeConfig(), pipe, ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+
+    new = await bf.deep_pull("friend", 100, pages=10)
+    assert new == 60  # 31..90 pulled despite watermark at 90
+    stats = await repo.coverage_stats("friend", 100)
+    assert stats["n"] == 90 and stats["min_seq"] == 1
