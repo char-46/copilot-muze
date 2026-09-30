@@ -72,12 +72,15 @@ llm:
     api_key: ""
     model: glm-4.7
     temperature: 0.4
+    # timeout is a STREAM-STALL limit: max silence between chunks. A slow
+    # model keeps producing chunks and is never cut; a stuck one is dropped.
+    timeout: 120
   vision:                     # multimodal model for images; empty model disables vision
     base_url: ""              # empty -> reuse chat.base_url / chat.api_key
     api_key: ""
     model: ""                 # e.g. glm-4v-plus
   agent_max_steps: 12        # tool-calling rounds per request (raised from 8); tools run in parallel within a round
-  turn_timeout_sec: 300      # hard wall-clock cap per agent turn; 0 = uncapped
+  turn_timeout_sec: 300      # STALL cap: a tool round stuck this long is aborted (slow-but-progressing turns are never cut)
   progress: true             # in-turn feedback: "still waiting" heartbeats + tool-call lines
   progress_wait_sec: 20      # silence before the first heartbeat (fast answers send nothing)
   progress_interval_sec: 60  # between subsequent heartbeats

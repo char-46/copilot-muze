@@ -951,6 +951,26 @@ class ControlService:
             "全量补拉已启动（后台执行）。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
         )
 
+    @slash("sess", "/sess [id]", "查询 AI 会话进度（完整思考/工具调用）；省略 id 列出最近")
+    async def cmd_sess(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if self.agent is None:
+            return CommandOutcome.err("未配置 LLM")
+        store = self.agent.sessions
+        if not args:
+            rows = store.recent(8)
+            if not rows:
+                return CommandOutcome("暂无 AI 会话")
+            lines = [
+                f"#{s.id} [{'运行中' if s.status == 'running' else '完成' if s.status == 'done' else '出错'}] "
+                f"{s.elapsed():.0f}s {s.prompt[:30]}"
+                for s in reversed(rows)
+            ]
+            return CommandOutcome("\n".join(lines) + "\n/sess <id> 查看详情")
+        session = store.get(args[0])
+        if session is None:
+            return CommandOutcome.err(f"会话 {args[0]} 不存在（/sess 列出最近）")
+        return CommandOutcome(session.render())
+
     @slash("pending", "/pending", "待确认的代发列表")
     async def cmd_pending(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         rows = await self.repo.list_pending_actions(

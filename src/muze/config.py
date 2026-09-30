@@ -104,14 +104,16 @@ class LLMEndpoint(BaseModel):
     api_key: str = ""
     model: str = ""
     temperature: float | None = None
-    timeout: float = 120.0  # per-request total timeout (SDK default is 600s)
+    timeout: float = 120.0  # stream stall timeout: max silence between chunks
+    # (slow-but-producing output never times out; a stuck connection does)
 
 
 class LLMConfig(BaseModel):
     chat: LLMEndpoint = Field(default_factory=LLMEndpoint)
     vision: LLMEndpoint = Field(default_factory=LLMEndpoint)
     agent_max_steps: int = 12
-    turn_timeout_sec: float = 300.0  # hard wall-clock cap per agent turn
+    turn_timeout_sec: float = 300.0  # STALL cap: a tool round stuck this long
+    # is aborted; there is no wall-clock cap on slow-but-progressing turns
     # in-turn progress feedback: "still waiting" heartbeats + tool call lines
     progress: bool = True
     progress_wait_sec: float = 20.0  # silence before the first heartbeat

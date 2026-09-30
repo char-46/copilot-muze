@@ -210,13 +210,54 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
             return web.json_response({"error": "missing text"}, status=400)
         if service.agent is None:
             return web.json_response({"error": "LLM 未配置"}, status=503)
-        outcome = await service.agent.converse(text, ctx())
+        outcome = await service.agent.ask(text, ctx())
         return web.json_response(
             {"text": outcome.text, "media_paths": outcome.media_paths, "is_error": outcome.is_error}
         )
 
-    async def api_agent_reset(request: web.Request) -> web.Response:
+    async def api_sess(request: web.Request) -> web.Response:
+        """Live agent-turn progress: /api/sess lists, /api/sess/<id> details."""
         service, _, _ = pick(request)
+        if service.agent is None:
+            return web.json_response({"error": "LLM 未配置"}, status=503)
+        store = service.agent.sessions
+        sid = request.match_info.get("sid", "")
+        if not sid:
+            return web.json_response(
+                {
+                    "sessions": [
+                        {
+                            "id": s.id,
+                            "status": s.status,
+                            "chat_key": s.chat_key,
+                            "elapsed": round(s.elapsed(), 1),
+                            "prompt": s.prompt[:80],
+                        }
+                        for s in reversed(store.recent(20))
+                    ]
+                }
+            )
+        s = store.get(sid)
+        if s is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        return web.json_response(
+            {
+                "id": s.id,
+                "status": s.status,
+                "chat_key": s.chat_key,
+                "prompt": s.prompt,
+                "elapsed": round(s.elapsed(), 1),
+                "idle": round(s.idle(), 1),
+                "round_chars": s.round_chars,
+                "total_chars": s.total_chars,
+                "result": s.result_preview,
+                "events": [
+                    {"t": round(t, 1), "kind": k, "detail": d} for t, k, d in s.events
+                ],
+            }
+        )
+
+    async def api_agent_reset(request: web.Request) -> web.Response:        service, _, _ = pick(request)
         if service.agent is not None:
             service.agent.reset("web:default")
         return web.json_response({"ok": True})
@@ -356,6 +397,8 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
     app.router.add_get("/api/mediafile/{media_id}", api_mediafile)
     app.router.add_post("/api/command", api_command)
     app.router.add_post("/api/agent", api_agent)
+    app.router.add_get("/api/sess", api_sess)
+    app.router.add_get("/api/sess/{sid}", api_sess)
     app.router.add_post("/api/agent/reset", api_agent_reset)
     app.router.add_get("/api/pending", api_pending)
     app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)

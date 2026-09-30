@@ -21,27 +21,35 @@ class ScriptLLM:
         self.script = list(script)
         self.calls = 0
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, on_chunk=None):
         self.calls += 1
         self.last_messages = messages
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
+        if on_chunk and item.get("content"):
+            on_chunk(len(item["content"]))
         return item
 
 
 class SlowLLM(ScriptLLM):
-    """Never answers in time — used for heartbeat / timeout tests."""
+    """Streams slowly but steadily — used for live-progress / heartbeat tests."""
 
     def __init__(self, cfg, delay: float = 10.0):
         super().__init__([])
         self.cfg = cfg
         self.delay = delay
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, on_chunk=None):
+        import time as _t
+
         self.calls += 1
         self.last_messages = messages
-        await asyncio.sleep(self.delay)
+        end = _t.monotonic() + self.delay
+        while _t.monotonic() < end:
+            await asyncio.sleep(0.02)
+            if on_chunk:
+                on_chunk(3)  # chunks keep flowing: slow, NOT stuck
         return {"role": "assistant", "content": "late"}
 
 
@@ -250,23 +258,80 @@ async def test_converse_sends_tool_call_lines(env, monkeypatch):
                    for m in llm.last_messages)
 
 
-async def test_converse_heartbeats_while_llm_hangs(env):
+async def test_converse_heartbeats_show_live_output(env):
     service, repo = env
     llm = SlowLLM(_llm_cfg(progress_wait_sec=0.05, progress_interval_sec=0.05), delay=0.3)
     agent = Agent(service, repo, llm, ChatLog(), 3)
-    out = await agent.converse("慢点答", _qq_ctx())
+    session = agent.sessions.create("qq:friend:1", "慢点答")
+    out = await agent.converse("慢点答", _qq_ctx(), session=session)
     assert out.text == "late"
-    lines = _sent_texts(service)
-    beats = [l for l in lines if l.startswith("⏳")]
-    assert any("思考中" in l for l in beats)
-    assert any("仍在等待" in l for l in beats)
+    beats = [l for l in _sent_texts(service) if "⏳" in l]
+    assert beats  # user was told we are alive
+    # chunks were flowing -> the heartbeat reports live output size
+    assert any("模型输出中" in l for l in beats)
 
 
-async def test_converse_turn_timeout_frees_conversation(env):
+async def test_converse_tool_stall_aborts_turn(env, monkeypatch):
+    """A HUNG tool aborts the turn; a slow-but-alive model never would."""
     service, repo = env
-    llm = SlowLLM(_llm_cfg(turn_timeout_sec=0.15), delay=30.0)
+
+    class HungRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", HungRunner)
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "cli", "arguments": "{}"}}]},
+        ]
+    )
+    llm.cfg = _llm_cfg(turn_timeout_sec=0.05)
     agent = Agent(service, repo, llm, ChatLog(), 3)
-    out = await agent.converse("卡住", _qq_ctx())
-    assert out.is_error and "超时" in out.text
-    # the aborted turn must not poison the history
-    assert agent._histories["qq:friend:1"] == []
+    out = await agent.converse("会卡住", _qq_ctx())
+    assert out.is_error and "卡死" in out.text
+    assert agent._histories["qq:friend:1"] == []  # aborted turn dropped
+
+
+async def test_submit_is_async_and_queryable_by_sess(env, monkeypatch):
+    service, repo = env
+
+    class FakeRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            return '{"ok": true}'
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", FakeRunner)
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "search_archive", "arguments": '{"query":"x"}'}}]},
+            {"role": "assistant", "content": "答案在此"},
+        ]
+    )
+    llm.cfg = _llm_cfg()
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    service.agent = agent
+
+    session = agent.submit("查一下", _qq_ctx())
+    assert session.status == "running"
+    # the session is visible immediately, even before the turn finishes
+    assert agent.sessions.get(session.id) is session
+    await asyncio.sleep(0.1)  # let the background turn complete
+
+    assert session.status == "done"
+    sent = _sent_texts(service)
+    assert any(t.startswith(f"#{session.id}") and "答案在此" in t for t in sent)
+    # /sess shows the full trace: prompt, tool call, tool result, outcome
+    out = await service.run_command(f"sess {session.id}", _qq_ctx())
+    assert not out.is_error
+    assert session.id in out.text and "查一下" in out.text
+    assert "search_archive" in out.text and '{"ok": true}' in out.text
+    # listing without an id
+    listing = await service.run_command("sess", _qq_ctx())
+    assert session.id in listing.text

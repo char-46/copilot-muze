@@ -21,7 +21,14 @@ from muze.ai.agent import Agent
 from muze.ai.llm import LLMClient
 from muze.chatlog import ChatLog, setup_logging
 from muze.config import AccountSpec, load_accounts
-from muze.core.service import ControlContext, ControlService, Runtime
+from muze.core.service import (
+    ControlContext,
+    ControlService,
+    Runtime,
+    CommandOutcome,
+    is_llm_invocation,
+    strip_llm_prefix,
+)
 from muze.ingest.backfill import Backfiller
 from muze.ingest.pipeline import IngestPipeline
 from muze.provider.base import ProtocolError
@@ -287,6 +294,16 @@ class App:
             user_label=await self.pipeline.sender_display(msg),
             auto_confirm=False,
         )
+        # `::` turns run ASYNC: acknowledge with a session id right away and
+        # let the background task deliver the answer, so one slow LLM reply
+        # never blocks other conversations (per-chat serialization inside).
+        if is_llm_invocation(text) and self.service.agent is not None:
+            session = self.service.agent.submit(strip_llm_prefix(text), ctx)
+            await svc.deliver(
+                ctx,
+                CommandOutcome(f"#{session.id} 已受理；/sess {session.id} 查看进度"),
+            )
+            return
         outcome = await svc.execute(text, ctx)
         await svc.deliver(ctx, outcome)
 

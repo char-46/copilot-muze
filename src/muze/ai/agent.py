@@ -7,6 +7,7 @@ import json
 import logging
 
 from muze.ai.llm import LLMClient
+from muze.ai.sessions import Session, SessionStore
 from muze.ai.tools import SPEC, ToolRunner
 from muze.chatlog import ChatLog, epoch_iso
 from muze.core.service import (
@@ -72,10 +73,47 @@ class Agent:
         self.chatlog = chatlog
         self.max_steps = max_steps
         self._histories: dict[str, list[dict]] = {}
+        self.sessions = SessionStore()
+        self._locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------- history
     def _history(self, chat_key: str) -> list[dict]:
         return self._histories.setdefault(chat_key, [])
+
+    def _lock(self, chat_key: str) -> asyncio.Lock:
+        """Serialize turns within ONE conversation; different conversations
+        run concurrently (async dispatch)."""
+        return self._locks.setdefault(chat_key, asyncio.Lock())
+
+    # ------------------------------------------------------------- session
+    def submit(self, text: str, ctx: ControlContext) -> Session:
+        """Fire-and-forget turn: register a session, run it in the background
+        (per-conversation lock), deliver the result when it lands. The caller
+        replies to the user with the session id immediately."""
+        session = self.sessions.create(ctx.chat_key, text)
+        asyncio.create_task(self._run_session(session, text, ctx))
+        return session
+
+    async def _run_session(self, session: Session, text: str, ctx: ControlContext) -> None:
+        async with self._lock(ctx.chat_key):
+            try:
+                outcome = await self.converse(text, ctx, session=session)
+            except Exception as e:  # safety net: converse already handles its own
+                log.exception("agent session crashed")
+                outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
+        session.finish(ok=not outcome.is_error, preview=outcome.text)
+        if ctx.qq_reachable:
+            prefix = f"#{session.id} "
+            await self._notify(ctx, prefix + outcome.text, error=outcome.is_error)
+
+    async def ask(self, text: str, ctx: ControlContext) -> CommandOutcome:
+        """Synchronous variant for local fronts (webui / cli): same session
+        bookkeeping and per-conversation lock, returns the final outcome."""
+        session = self.sessions.create(ctx.chat_key, text)
+        async with self._lock(ctx.chat_key):
+            outcome = await self.converse(text, ctx, session=session)
+        session.finish(ok=not outcome.is_error, preview=outcome.text)
+        return outcome
 
     def reset(self, chat_key: str) -> None:
         self._histories.pop(chat_key, None)
@@ -192,21 +230,30 @@ class Agent:
         cfg = getattr(self.llm, "cfg", None)
         return float(getattr(cfg, "turn_timeout_sec", 0) or 0)
 
-    async def _notify(self, ctx: ControlContext, text: str) -> None:
+    async def _notify(
+        self, ctx: ControlContext, text: str, error: bool = False
+    ) -> None:
         """Deliver an in-turn progress line (never enters agent history)."""
         try:
             if ctx.qq_reachable:
-                await self.service.deliver(ctx, CommandOutcome(text))
+                await self.service.deliver(ctx, CommandOutcome(text, is_error=error))
             else:
                 self.chatlog.log.info("PROGRESS   | %s", text)
         except Exception:
             log.exception("agent progress notify failed")
 
-    async def _heartbeat(self, ctx: ControlContext, stop: asyncio.Event) -> None:
+    def _tag(self, session: Session | None) -> str:
+        return f"#{session.id} " if session is not None else ""
+
+    async def _heartbeat(
+        self, ctx: ControlContext, stop: asyncio.Event, session: Session | None = None
+    ) -> None:
         """Tell the user we are still waiting on the model.
 
         Stays quiet for `progress_wait_sec` first so quick answers produce
-        zero extra messages; then pings every `progress_interval_sec`.
+        zero extra messages; then pings every `progress_interval_sec`. While
+        the model is streaming, the ping carries live output size instead of
+        a bare "waiting" so slow-but-alive turns are visibly progressing.
         """
         cfg = getattr(self.llm, "cfg", None)
         wait = float(getattr(cfg, "progress_wait_sec", 20) or 20)
@@ -219,24 +266,46 @@ class Agent:
                 pass
             if stop.is_set():
                 return
-            await self._notify(ctx, "⏳ 思考中…" if first else "⏳ 仍在等待模型响应…")
+            if session is not None and session.round_chars > 0:
+                text = f"{self._tag(session)}⏳ 模型输出中（已收 {session.round_chars} 字）…"
+            elif first:
+                text = f"{self._tag(session)}⏳ 思考中…"
+            else:
+                text = f"{self._tag(session)}⏳ 仍在等待模型响应…"
+            await self._notify(ctx, text)
             first = False
 
-    async def _chat(self, messages: list[dict], ctx: ControlContext | None = None) -> dict:
+    async def _chat(
+        self,
+        messages: list[dict],
+        ctx: ControlContext | None = None,
+        session: Session | None = None,
+    ) -> dict:
         """One LLM round with a couple of transient-failure retries.
 
-        When ctx carries a reachable front and progress is on, each attempt is
-        wrapped in a heartbeat so a slow model never looks dead.
+        Slow answers are never cut: the request's read timeout is a *stall*
+        detector (silence between stream chunks), and every streamed chunk
+        feeds the session's progress counters. When ctx carries a reachable
+        front and progress is on, each attempt also runs a heartbeat.
         """
         last: Exception | None = None
         for attempt in range(3):
             try:
-                if ctx is None or not self._progress or not ctx.qq_reachable:
+                heartbeat = (
+                    ctx is not None
+                    and self._progress
+                    and ctx.qq_reachable
+                )
+                if not heartbeat:
                     return await self.llm.chat(messages, tools=SPEC)
                 stop = asyncio.Event()
-                hb = asyncio.create_task(self._heartbeat(ctx, stop))
+                hb = asyncio.create_task(self._heartbeat(ctx, stop, session))
                 try:
-                    return await self.llm.chat(messages, tools=SPEC)
+                    if session is None:
+                        return await self.llm.chat(messages, tools=SPEC)
+                    return await self.llm.chat(
+                        messages, tools=SPEC, on_chunk=session.bump
+                    )
                 finally:
                     stop.set()
                     hb.cancel()
@@ -251,7 +320,9 @@ class Agent:
                     log.warning("llm.chat retry %s/2 after: %s", attempt + 1, e)
         raise last  # type: ignore[misc]
 
-    async def converse(self, text: str, ctx: ControlContext) -> CommandOutcome:
+    async def converse(
+        self, text: str, ctx: ControlContext, session: Session | None = None
+    ) -> CommandOutcome:
         if not self.llm.configured:
             return CommandOutcome("LLM 未配置（llm.chat.*）", is_error=True)
         # the `::` control prefix must never reach the model: the QQ path
@@ -274,13 +345,20 @@ class Agent:
         ]
 
         final_text = ""
+        stall = self._turn_timeout()
 
         async def tool_loop() -> str:
-            for _ in range(self.max_steps):
-                msg = await self._chat(messages, ctx)
+            for step in range(1, self.max_steps + 1):
+                if session is not None:
+                    session.new_round()
+                    session.event("llm", f"第{step}轮（调用模型）")
+                msg = await self._chat(messages, ctx, session)
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
-                    return (msg.get("content") or "").strip()
+                    answer = (msg.get("content") or "").strip()
+                    if session is not None:
+                        session.event("llm", f"第{step}轮完成（{len(answer)} 字）")
+                    return answer
                 messages.append(msg)
                 calls = []
                 for call in tool_calls:
@@ -295,41 +373,52 @@ class Agent:
                     ctx.source, ctx.user_label or ctx.chat_key, "tool",
                     "; ".join(f"{n}({_brief(a)})" for _, n, a in calls),
                 )
+                if session is not None:
+                    for _cid, n, a in calls:
+                        session.event("tool", f"{n}({_brief(a)})")
                 if self._progress and ctx.qq_reachable:
                     names = "、".join(dict.fromkeys(n for _, n, _ in calls if n))
-                    await self._notify(ctx, f"🔧 {names}")
-                # run the step's tools concurrently (independent by design)
-                results = await asyncio.gather(
-                    *(runner.run(n, a) for _, n, a in calls),
-                    return_exceptions=True,
+                    await self._notify(ctx, f"{self._tag(session)}🔧 {names}")
+                # run the step's tools concurrently (independent by design);
+                # stall cap catches tools that hang — NOT slow LLM output,
+                # which is bounded only by silence between stream chunks
+                coros = [runner.run(n, a) for _, n, a in calls]
+                results = (
+                    await asyncio.wait_for(
+                        asyncio.gather(*coros, return_exceptions=True), stall
+                    )
+                    if stall > 0
+                    else await asyncio.gather(*coros, return_exceptions=True)
                 )
                 for (cid, name, _a), res in zip(calls, results):
                     if isinstance(res, BaseException):
                         log.warning("tool %s raised: %s", name, res)
                         content = json.dumps({"error": str(res)}, ensure_ascii=False)
+                        if session is not None:
+                            session.event("tool_result", f"{name} → 异常: {res}")
                     else:
                         content = _compact(str(res))
+                        if session is not None:
+                            session.event("tool_result", f"{name} → {str(res)[:120]}")
                     messages.append(
                         {"role": "tool", "tool_call_id": cid, "content": content}
                     )
             return ""  # step limit exhausted
 
-        timeout = self._turn_timeout()
         try:
-            if timeout > 0:
-                final_text = await asyncio.wait_for(tool_loop(), timeout)
-            else:
-                final_text = await tool_loop()
+            final_text = await tool_loop()
             if not final_text:
                 final_text = (
                     "（已达工具调用步数上限，已用现有结果作答；"
                     "如仍需更多步骤，请缩小范围或回复 ::继续）"
                 )
         except TimeoutError:
-            log.warning("agent turn aborted: exceeded %.0fs wall clock", timeout)
+            log.warning("agent turn aborted: tool round stalled for %.0fs", stall)
             history.pop()  # drop the unfinished turn
+            if session is not None:
+                session.event("error", f"工具执行卡死（>{int(stall)}秒）")
             return CommandOutcome(
-                f"AI 响应超时（>{int(timeout)}秒），本轮已中止；请稍后重试。",
+                f"工具执行卡死（>{int(stall)}秒无进展），本轮已中止；请稍后重试。",
                 is_error=True,
             )
         except Exception as e:

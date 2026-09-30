@@ -15,7 +15,7 @@ import json
 import logging
 from pathlib import Path
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Timeout
 
 from muze.config import LLMConfig
 
@@ -69,7 +69,11 @@ class LLMClient:
             self._chat = AsyncOpenAI(
                 base_url=self.cfg.chat.base_url,
                 api_key=self.cfg.chat.api_key,
-                timeout=self.cfg.chat.timeout,
+                # read = max silence between stream chunks: slow output never
+                # times out, a stuck connection is cut after `timeout`
+                timeout=Timeout(
+                    connect=15, read=self.cfg.chat.timeout, write=30, pool=15
+                ),
                 max_retries=1,
             )
         return self._chat
@@ -80,7 +84,8 @@ class LLMClient:
             self._vision = AsyncOpenAI(
                 base_url=v.base_url or self.cfg.chat.base_url,
                 api_key=v.api_key or self.cfg.chat.api_key,
-                timeout=v.timeout or self.cfg.chat.timeout,
+                timeout=Timeout(connect=15, read=v.timeout or self.cfg.chat.timeout,
+                                write=60, pool=15),
                 max_retries=1,
             )
         return self._vision
@@ -88,16 +93,27 @@ class LLMClient:
     def _vision_model(self) -> str:
         return self.cfg.vision.model or self.cfg.chat.model
 
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        """One chat.completions call; returns the raw choice message dict.
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        on_chunk=None,
+    ) -> dict:
+        """One chat.completions call (streamed); returns the assembled choice
+        message dict.
 
-        The full request (model, tools, messages incl. system prompt), the
-        raw response message and token usage are logged on muze.llm.
+        Streaming is not for UX — it is how we tell "slow" from "stuck":
+        `read` timeout applies per chunk gap, so a model that keeps producing
+        tokens never times out no matter how long the full answer takes,
+        while a dead connection is cut after `llm.chat.timeout` of silence.
+        `on_chunk(n_chars)` fires for every content delta so callers can show
+        live progress.
         """
         client = self._chat_client()
         kwargs: dict = {
             "model": self.cfg.chat.model,
             "messages": messages,
+            "stream": True,
         }
         if self.cfg.chat.temperature is not None:
             kwargs["temperature"] = self.cfg.chat.temperature
@@ -109,16 +125,61 @@ class LLMClient:
             kwargs["model"], len(tools or []), len(messages), _j(messages),
         )
         try:
-            resp = await client.chat.completions.create(**kwargs)
+            stream = await client.chat.completions.create(**kwargs)
         except Exception as e:
             log.warning("LLM fail | %s: %s", kwargs["model"], e)
             raise
-        msg = resp.choices[0].message.model_dump(exclude_none=True)
-        usage = getattr(resp, "usage", None)
-        usage_d = usage.model_dump() if usage else {}
+
+        content: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        finish = ""
+        usage_d: dict = {}
+        try:
+            async for chunk in stream:
+                u = getattr(chunk, "usage", None)
+                if u:
+                    usage_d = u.model_dump()
+                for choice in chunk.choices or []:
+                    if choice.finish_reason:
+                        finish = choice.finish_reason
+                    delta = choice.delta
+                    if delta is None:
+                        continue
+                    piece = delta.content or ""
+                    if piece:
+                        content.append(piece)
+                        if on_chunk is not None:
+                            try:
+                                on_chunk(len(piece))
+                            except Exception:
+                                pass
+                    for tc in delta.tool_calls or []:
+                        i = tc.index if tc.index is not None else 0
+                        acc = tool_calls.setdefault(
+                            i, {"id": "", "type": "function",
+                                "function": {"name": "", "arguments": ""}}
+                        )
+                        if tc.id:
+                            acc["id"] = tc.id
+                        fn = tc.function
+                        if fn is not None:
+                            if fn.name:
+                                acc["function"]["name"] += fn.name
+                            if fn.arguments:
+                                acc["function"]["arguments"] += fn.arguments
+        except Exception as e:
+            log.warning("LLM stream fail | %s: %s", kwargs["model"], e)
+            raise
+
+        msg: dict = {"role": "assistant", "finish_reason": finish or None}
+        text = "".join(content)
+        if text:
+            msg["content"] = text
+        if tool_calls:
+            msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
         log.info(
-            "LLM resp | usage=%s | %s",
-            _j(usage_d), _j(msg),
+            "LLM resp | usage=%s finish=%s | %s",
+            _j(usage_d), finish, _j(msg),
         )
         return msg
 

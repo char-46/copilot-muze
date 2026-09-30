@@ -123,11 +123,21 @@ Multi-bot safety (several accounts in one process):
 `::` input goes to the AI agent, which can query the archive, describe
 images (vision model), expand forwarded messages, and draft sends.
 
-Long turns never wedge a conversation: each LLM request and the whole turn
-are time-boxed (`llm.chat.timeout`, `llm.turn_timeout_sec`), and while the
-model works the agent reports progress — a `⏳ 思考中…` heartbeat after
-`llm.progress_wait_sec` (then every `progress_interval_sec`) and one compact
-`🔧 工具名` line per tool round. Fast answers send no extra messages.
+Agent turns are asynchronous and session-tracked:
+
+- A `::` message is acknowledged **immediately** with a short session id
+  (`#a1b2c3 已受理`). The turn then runs in the background — one busy
+  conversation never blocks others, and turns within one conversation are
+  serialized so context stays coherent.
+- `/sess <id>` (or `/sess` to list) shows the full trace of a session:
+  prompt, every model round with received output size, every tool call and
+  its compact result, and the final status.
+- While a turn runs the agent sends compact progress lines — `⏳ 模型输出中
+  （已收 N 字）` when the model is streaming (or `⏳ 思考中…` while silent,
+  re-pinged every `progress_interval_sec`) and `🔧 工具名` per tool round.
+- Slow ≠ stuck: chat requests stream, and the timeout (`llm.chat.timeout`)
+  is a *silence* limit between chunks — a slow but producing model is never
+  cut, while a dead connection and hung tools (`llm.turn_timeout_sec`) are.
 
 ### Permissions (agent & commands)
 
