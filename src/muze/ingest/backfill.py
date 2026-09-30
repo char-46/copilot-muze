@@ -85,6 +85,14 @@ class Backfiller:
         if scene == "group" and not caps.group_history:
             return 0
 
+    async def _backfill_conversation(self, scene: str, peer_id: int, reporter=None) -> int:
+        bf = self.cfg.ingest.backfill
+        caps = self.adapter.caps
+        if scene == "friend" and not caps.friend_history:
+            return 0
+        if scene == "group" and not caps.group_history:
+            return 0
+
         watermark = await self.repo.get_watermark(scene, peer_id)
         total_new = 0
         pages = 0
@@ -111,6 +119,9 @@ class Backfiller:
                     if await self.pipeline.handle_message(m, source="backfill"):
                         page_new += 1
             total_new += page_new
+            if reporter is not None:
+                reporter.bump(new=page_new, pages=1)
+                await reporter.maybe_tick()
 
             # Stop conditions:
             #  - server says no more pages
@@ -132,7 +143,11 @@ class Backfiller:
             )
         return total_new
 
-    async def run_once(self, targets: list[tuple[str, int]] | None = None) -> int:
+    async def run_once(
+        self,
+        targets: list[tuple[str, int]] | None = None,
+        reporter=None,
+    ) -> int:
         if self.running:
             log.info("backfill already running; skipping")
             return 0
@@ -142,11 +157,17 @@ class Backfiller:
         try:
             targets = targets if targets is not None else await self.target_conversations()
             log.info("backfill start: %s conversations", len(targets))
+            if reporter is not None:
+                await reporter.report_start(f"{len(targets)} 个会话")
             for scene, peer in targets:
                 if self._stop.is_set():
                     break
                 try:
-                    new_total += await self._backfill_conversation(scene, peer)
+                    n = await self._backfill_conversation(scene, peer, reporter=reporter)
+                    new_total += n
+                    if reporter is not None:
+                        reporter.bump(new=0, pages=0, convs=1)
+                        await reporter.maybe_tick()
                 except Exception as e:
                     log.warning("backfill conv %s crashed: %s", conv_id(scene, peer), e)
                 await asyncio.sleep(self.cfg.ingest.backfill.conv_delay)
@@ -213,7 +234,7 @@ class Backfiller:
             "paged": caps.history_start_seq,
         }
 
-    async def deep_pull(self, scene: str, peer_id: int, pages: int) -> int:
+    async def deep_pull(self, scene: str, peer_id: int, pages: int, reporter=None) -> int:
         """Ignore the watermark and pull up to `pages` pages into the store."""
         bf = self.cfg.ingest.backfill
         caps = self.adapter.caps
@@ -232,9 +253,14 @@ class Backfiller:
                 log.warning("deep pull %s failed: %s", conv_id(scene, peer_id), e)
                 break
             fetched += 1
+            page_new = 0
             for m in res.messages:
                 if await self.pipeline.handle_message(m, source="backfill"):
-                    new += 1
+                    page_new += 1
+            new += page_new
+            if reporter is not None:
+                reporter.bump(new=page_new, pages=1)
+                await reporter.maybe_tick()
             if res.next_message_seq is None:
                 break
             if cursor is not None and res.next_message_seq >= cursor:

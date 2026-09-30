@@ -596,23 +596,67 @@ class ControlService:
         ]
         return CommandOutcome("\n".join(lines))
 
-    @slash("sync", "/sync [scene/peer] [页数]", "漫游补拉；带页数=深拉（忽略水位翻 N 页，用于补 /coverage 发现的缺口）")
+    @slash("sync", "/sync [scene/peer] [页数]", "漫游补拉；带页数=深拉。进度按 1/2/3 分钟及每 5 分钟汇报")
     async def cmd_sync(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not self.runtime.backfiller:
             return CommandOutcome.err("backfiller 不可用")
+        from muze.progress import ProgressReporter
+
+        async def emit(text: str) -> None:
+            if ctx.qq_reachable:
+                await self.deliver(ctx, CommandOutcome(text))
+            else:
+                self.chatlog.log.info("PROGRESS   | %s", text)
+
         if args:
             scene, peer = self.parse_target(args[0])
+            label = await self.target_label(scene, peer)
             if len(args) > 1:
                 pages = min(int(args[1]), 500)
-                n = await self.runtime.backfiller.deep_pull(scene, peer, pages)
+                reporter = ProgressReporter(f"深拉 {label}", emit)
+
+                async def job_deep() -> None:
+                    try:
+                        n = await self.runtime.backfiller.deep_pull(scene, peer, pages, reporter=reporter)
+                    except Exception as e:
+                        await reporter.finish(f"失败: {e}")
+                        return
+                    await reporter.finish(f"完成，新增 {n} 条")
+
+                asyncio.create_task(job_deep())
                 return CommandOutcome(
-                    f"深拉 {conv_id(scene, peer)} 完成（最多 {pages} 页），新增 {n} 条；"
-                    f"/coverage {scene}/{peer} 复查缺口"
+                    f"深拉 {label} 已开始（最多 {pages} 页）。"
+                    "进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
                 )
-            n = await self.runtime.backfiller.run_once([(scene, peer)])
-            return CommandOutcome(f"sync {conv_id(scene, peer)} 完成，新增 {n} 条")
-        asyncio.create_task(self.runtime.backfiller.run_once())
-        return CommandOutcome("全量补拉已启动（后台执行），稍后用 /status 查看结果")
+            reporter = ProgressReporter(f"sync {label}", emit)
+
+            async def job_one() -> None:
+                try:
+                    n = await self.runtime.backfiller.run_once([(scene, peer)], reporter=reporter)
+                except Exception as e:
+                    await reporter.finish(f"失败: {e}")
+                    return
+                await reporter.finish(f"完成，新增 {n} 条")
+
+            asyncio.create_task(job_one())
+            return CommandOutcome(
+                f"sync {label} 已开始。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
+            )
+
+        reporter = ProgressReporter("全量补拉", emit)
+
+        async def job_all() -> None:
+            try:
+                n = await self.runtime.backfiller.run_once(reporter=reporter)
+            except Exception as e:
+                await reporter.finish(f"失败: {e}")
+                return
+            await reporter.finish(f"完成，新增 {n} 条")
+
+        asyncio.create_task(job_all())
+        return CommandOutcome(
+            "全量补拉已启动（后台执行）。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
+        )
 
     @slash("pending", "/pending", "待确认的代发列表")
     async def cmd_pending(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
