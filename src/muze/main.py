@@ -67,6 +67,7 @@ class App:
         self.restart_requested = False
         self._shutdown_done = False
         self._mt_task = None
+        self._sup_task = None
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -166,6 +167,8 @@ class App:
         self._loop = asyncio.get_running_loop()
         await self.backfiller.start_background()
         self._mt_task = asyncio.create_task(self._maintenance_loop())
+        if os.environ.get("MUZE_SUPERVISOR_PID"):
+            self._sup_task = asyncio.create_task(self._supervisor_watch())
         if spawn_console:
             self._spawn_console(console_registry)
         events_task = asyncio.create_task(self._consume_events())
@@ -184,6 +187,22 @@ class App:
     async def _consume_events(self) -> None:
         async for ev in self.adapter.events():
             await self.dispatch(ev)
+
+    async def _supervisor_watch(self) -> None:
+        """When launched by `muze daemon`, exit if the daemon dies so we never
+        linger as an orphan holding the web port / DB."""
+        try:
+            pid = int(os.environ.get("MUZE_SUPERVISOR_PID", "0") or 0)
+        except ValueError:
+            return
+        if pid <= 0:
+            return
+        while not self._stop.is_set():
+            await asyncio.sleep(5)
+            if not _parent_alive(pid):
+                log.warning("supervisor pid %s is gone; exiting orphaned serve", pid)
+                self._request_stop()
+                return
 
     # ------------------------------------------------------------- console
     def _spawn_console(self, registry=None) -> None:
@@ -347,6 +366,30 @@ def _make_sigint_handler(apps: list["App"], loop: asyncio.AbstractEventLoop):
             os._exit(130)
 
     return handler
+
+
+def _parent_alive(pid: int) -> bool:
+    """Is process `pid` still running? (portable: parent-watchdog for serve)."""
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(SYNCHRONIZE, False, pid)
+        if not h:
+            return False
+        try:
+            # WAIT_OBJECT_0 (0) => the process object is signaled => it exited
+            return k.WaitForSingleObject(h, 0) != 0
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _reexec() -> None:

@@ -379,7 +379,14 @@ async def start_web(
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, cfg.host, cfg.port)
-    await site.start()
+    try:
+        await site.start()
+    except OSError as e:
+        await runner.cleanup()
+        raise RuntimeError(
+            f"webui 端口 {cfg.host}:{cfg.port} 无法绑定（很可能已有另一个实例在运行，"
+            f"或上一个进程尚未退出并占着端口）: {e}"
+        ) from e
     url = f"http://{cfg.host}:{cfg.port}/"
     log.info("webui listening on %s (%s account(s))", url, len(norm))
     chatlog.log.info("WEBUI      | %s (token: %s)", url, token)

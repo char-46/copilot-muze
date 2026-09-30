@@ -70,6 +70,15 @@ async def test_shutdown_bounds_a_wedged_component(caplog):
     assert any("timed out" in r.getMessage() for r in caplog.records)
 
 
+def test_parent_alive_detects_missing():
+    import os as _os
+
+    from muze.main import _parent_alive
+
+    assert _parent_alive(_os.getpid()) is True
+    assert _parent_alive(999999) is False  # no such process
+
+
 def test_reexec_uses_same_serve_args(monkeypatch):
     import muze.main as m
 
