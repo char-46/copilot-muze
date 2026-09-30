@@ -131,3 +131,41 @@ async def test_run_once_reports_conversations(repo):
     await rep.finish("完成")
     assert new == 6 and rep.convs_done == 2
     assert sent[-1].startswith("✔") and "会话 2 个" in sent[-1]
+
+
+async def test_run_once_skipped_returns_none(repo):
+    """A concurrent call must signal 'skipped', not a fake 0-new success."""
+    adapter = FakeAdapter({("friend", 100): [{"start": 1, "seqs": [1], "next": None}]})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.running = True
+    assert await bf.run_once([("friend", 100)]) is None
+
+
+async def test_reporter_abort_is_not_a_completion():
+    sent: list[str] = []
+
+    async def emit(text):
+        sent.append(text)
+
+    rep = ProgressReporter("全量补拉（强制全量）", emit)
+    await rep.abort("已有补拉在运行，本次跳过")
+    line = sent[-1]
+    assert line.startswith("⚠") and "未执行" in line and "已有补拉" in line
+    assert "✔" not in line and "共" not in line
+
+
+async def test_sync_while_backfill_running_reports_not_started(repo):
+    from muze.core.service import ControlContext, ControlService, Runtime
+
+    class RunningBF:
+        running = True
+
+        def status(self):
+            return {"running": True, "last_run_at": 0.0, "last_new_messages": 0}
+
+    runtime = Runtime()
+    runtime.backfiller = RunningBF()
+    svc = ControlService(MuzeConfig(), FakeAdapter({}), repo, ChatLog(), runtime)
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+    out = await svc.run_command("/sync force", ctx)
+    assert out.is_error and "已有补拉" in out.text

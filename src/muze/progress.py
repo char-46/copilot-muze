@@ -80,6 +80,18 @@ class ProgressReporter:
         except Exception:
             log.exception("progress emit failed")
 
+    async def abort(self, note: str) -> None:
+        """Report that the job did not run (e.g. a pull was already active).
+
+        Deliberately not a '完成' line: printing zeroed stats would imply work
+        happened and confuse the command's own report.
+        """
+        text = f"⚠ {self.label} 未执行：{note}"
+        try:
+            await self.emit(text)
+        except Exception:
+            log.exception("progress emit failed")
+
     # -------------------------------------------------------------- timing
     def _pop_due(self) -> float | None:
         elapsed = self.now() - self.t0

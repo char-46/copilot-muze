@@ -146,10 +146,10 @@ class Backfiller:
         targets: list[tuple[str, int]] | None = None,
         reporter=None,
         force: bool = False,
-    ) -> int:
+    ) -> int | None:
         if self.running:
             log.info("backfill already running; skipping")
-            return 0
+            return None
         self.running = True
         started = time.time()
         new_total = 0

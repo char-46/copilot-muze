@@ -869,6 +869,11 @@ class ControlService:
             force = True
             args = args[1:]
 
+        if self.runtime.backfiller.running:
+            return CommandOutcome.err(
+                "已有补拉正在运行，本次未启动。等待其完成后再试（/status 查看）"
+            )
+
         async def emit(text: str) -> None:
             if ctx.qq_reachable:
                 await self.deliver(ctx, CommandOutcome(text))
@@ -903,6 +908,9 @@ class ControlService:
                 except Exception as e:
                     await reporter.finish(f"失败: {e}")
                     return
+                if n is None:
+                    await reporter.abort("已有补拉在运行，本次跳过")
+                    return
                 await reporter.finish(f"完成，新增 {n} 条")
 
             asyncio.create_task(job_one())
@@ -922,6 +930,9 @@ class ControlService:
                 n = await self.runtime.backfiller.run_once(reporter=reporter, force=force)
             except Exception as e:
                 await reporter.finish(f"失败: {e}")
+                return
+            if n is None:
+                await reporter.abort("已有补拉在运行，本次跳过")
                 return
             await reporter.finish(f"完成，新增 {n} 条")
 
