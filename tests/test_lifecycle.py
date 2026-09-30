@@ -50,3 +50,51 @@ async def test_shutdown_survives_component_failures(caplog):
         await app.shutdown()  # must not raise
     assert app._shutdown_done is True
     assert any("failed during shutdown" in r.getMessage() for r in caplog.records)
+
+
+async def test_shutdown_bounds_a_wedged_component(caplog):
+    """A cleanup step that never finishes is cut off by the timeout, so a
+    hung adapter/db can never wedge the whole exit."""
+    import asyncio
+
+    class Wedged:
+        async def close(self):
+            await asyncio.sleep(3600)
+            return 0
+
+    app = make_app()
+    app.conn = Wedged()
+    with caplog.at_level(logging.WARNING, logger="muze.main"):
+        await asyncio.wait_for(app.shutdown(), timeout=12)  # returns, not hangs
+    assert app._shutdown_done is True
+    assert any("timed out" in r.getMessage() for r in caplog.records)
+
+
+def test_sigint_handler_graceful_then_force(monkeypatch):
+    """1st Ctrl-C stops every account (no exception into the loop);
+    2nd Ctrl-C forces process exit."""
+    import os
+
+    from muze.main import _make_sigint_handler
+
+    class DummyLoop:
+        def call_soon_threadsafe(self, fn):
+            fn()
+
+    app = make_app()
+    app.restart_requested = True  # must survive the graceful stop
+    handler = _make_sigint_handler([app], DummyLoop())
+
+    forced = {}
+    monkeypatch.setattr(os, "_exit", lambda code: forced.setdefault("code", code))
+    monkeypatch.setattr(
+        "muze.main.threading.Thread",
+        lambda *a, **k: type("T", (), {"start": lambda self: None})(),
+    )
+
+    handler(2, None)
+    assert app._stop.is_set() and app.restart_requested is True
+    assert "code" not in forced  # first press is graceful
+
+    handler(2, None)
+    assert forced["code"] == 130  # second press forces exit

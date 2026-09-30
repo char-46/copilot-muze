@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from muze.ai.agent import Agent
@@ -63,6 +66,7 @@ class App:
         self._stop = asyncio.Event()
         self.restart_requested = False
         self._shutdown_done = False
+        self._mt_task = None
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -161,7 +165,7 @@ class App:
     async def run(self, spawn_console: bool = True, console_registry=None) -> None:
         self._loop = asyncio.get_running_loop()
         await self.backfiller.start_background()
-        asyncio.create_task(self._maintenance_loop())
+        self._mt_task = asyncio.create_task(self._maintenance_loop())
         if spawn_console:
             self._spawn_console(console_registry)
         events_task = asyncio.create_task(self._consume_events())
@@ -172,6 +176,8 @@ class App:
             )
             for t in pending:
                 t.cancel()
+            # reap cancellations so the event generator / websocket really closes
+            await asyncio.gather(events_task, stopper, return_exceptions=True)
         finally:
             await self.shutdown()
 
@@ -286,26 +292,61 @@ class App:
         log.info("[%s] shutting down...", self.spec.name)
         self._stop.set()
 
-        async def _safe(what: str, coro) -> None:
+        async def _safe(what: str, coro, timeout: float) -> None:
             try:
-                await coro
+                await asyncio.wait_for(coro, timeout=timeout)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[%s] %s timed out after %ss; continuing", self.spec.name, what, timeout
+                )
             except Exception:
                 log.exception("[%s] %s failed during shutdown", self.spec.name, what)
 
+        if self._mt_task is not None:
+            self._mt_task.cancel()
         scheduler = getattr(self, "scheduler", None)
         if scheduler is not None:
-            await _safe("scheduler.stop", scheduler.stop())
+            await _safe("scheduler.stop", scheduler.stop(), 5)
         if self.backfiller is not None:
-            await _safe("backfiller.stop", self.backfiller.stop())
+            await _safe("backfiller.stop", self.backfiller.stop(), 5)
         if self.pipeline is not None:
-            await _safe("drain_media", self.pipeline.drain_media(timeout=5))
+            await _safe("drain_media", self.pipeline.drain_media(timeout=5), 7)
         if self.adapter is not None:
-            await _safe("adapter.close", self.adapter.close())
+            await _safe("adapter.close", self.adapter.close(), 5)
         if self.conn is not None:
-            await _safe("conn.close", self.conn.close())
+            await _safe("conn.close", self.conn.close(), 5)
 
 
 RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve
+FORCE_EXIT_SECONDS = 10  # graceful shutdown deadline after Ctrl-C
+
+
+def _force_exit_after(seconds: float) -> None:
+    time.sleep(seconds)
+    sys.stderr.write(f"\nmuze: shutdown did not finish in {seconds}s; forcing exit\n")
+    os._exit(130)
+
+
+def _make_sigint_handler(apps: list["App"], loop: asyncio.AbstractEventLoop):
+    """Ctrl-C 1st press: graceful stop (no KeyboardInterrupt cancelling the
+    loop mid-cleanup, which is what made exits hang). 2nd press: hard exit.
+    A watchdog thread guarantees the process dies even if cleanup wedges."""
+
+    state = {"count": 0}
+
+    def handler(signum, frame):  # runs in the main thread
+        state["count"] += 1
+        if state["count"] == 1:
+            log.warning("Ctrl-C: shutting down gracefully (press again to force-quit)")
+            loop.call_soon_threadsafe(lambda: [a._stop_quiet() for a in apps])
+            threading.Thread(
+                target=_force_exit_after, args=(FORCE_EXIT_SECONDS,), daemon=True
+            ).start()
+        else:
+            log.warning("Ctrl-C again: forcing exit now")
+            os._exit(130)
+
+    return handler
 
 
 def run_main(argv: list[str]) -> int:
@@ -324,18 +365,39 @@ def run_main(argv: list[str]) -> int:
     log.info("log file: %s (never rotated)", log_path)
 
     apps = [App(s, args.config) for s in specs]
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    sigint_handler = _make_sigint_handler(apps, loop)
+    for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, sigint_handler)
+        except (ValueError, OSError):
+            pass  # not the main thread
+
+    rc = 0
     try:
-        asyncio.run(_bootstrap(apps))
+        loop.run_until_complete(_bootstrap(apps))
     except KeyboardInterrupt:
-        log.info("interrupted by user")
-        return 0
+        log.info("interrupted by user; shutting down")
     except ProtocolError as e:
         log.error("protocol side unreachable or misconfigured: %s", e)
         log.error("check: LLBot/Lagrange.Milky is running, accounts.milky[].base_url & access_token are correct")
-        return 3
+        rc = 3
     except RuntimeError as e:
         log.error("%s", e)
-        return 4
+        rc = 4
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
+
+    if rc:
+        return rc
     if any(a.restart_requested for a in apps):
         log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
         return RESTART_EXIT
@@ -393,7 +455,10 @@ async def _bootstrap(apps: list[App]) -> None:
                 log.error("account task crashed: %s", exc)
     finally:
         if web_runner is not None:
-            await web_runner.cleanup()
+            try:
+                await asyncio.wait_for(web_runner.cleanup(), timeout=5)
+            except Exception:
+                log.exception("web cleanup failed")
         for a in apps:
             try:
                 await a.shutdown()
