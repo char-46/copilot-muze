@@ -119,3 +119,85 @@ def test_sigint_handler_graceful_then_force(monkeypatch):
 
     handler(2, None)
     assert forced["code"] == 130  # second press forces exit
+
+
+# ------------------------------------------------ forced logout / reconnect
+class _FakeRepo:
+    def __init__(self):
+        self.meta: dict[str, str] = {}
+
+    async def set_meta(self, key, value):
+        self.meta[key] = value
+
+    async def get_meta(self, key):
+        return self.meta.get(key)
+
+
+class _FakeBackfiller:
+    def __init__(self):
+        self.running = False
+        self.calls: list = []
+
+    async def target_conversations(self):
+        return [("friend", 1), ("group", 2)]
+
+    async def run_once(self, targets=None, reporter=None, force=False, since_ts=None):
+        self.calls.append(targets)
+        return 5
+
+
+class _FakeService:
+    def __init__(self):
+        self.notes: list[str] = []
+
+    async def notify_controller(self, text):
+        self.notes.append(text)
+
+
+def _offline_app(gap: float):
+    cfg = MuzeConfig()
+    cfg.ingest.backfill.reconnect_gap_sec = gap
+    app = App(AccountSpec("main", "milky", MilkyEndpoint(), cfg), "config.yaml")
+    app.repo = _FakeRepo()
+    app.backfiller = _FakeBackfiller()
+    app.service = _FakeService()
+    return app
+
+
+async def test_offline_then_reconnect_triggers_catchup():
+    app = _offline_app(gap=0)  # any gap triggers immediately
+    await app._on_bot_offline("kicked offline")
+    assert app._offline_since is not None
+    assert "last_offline_at" in app.repo.meta
+    assert "kicked" in app.repo.meta.get("last_offline_reason", "")
+    assert any("被下线" in n for n in app.service.notes)
+
+    task = await app._on_bot_online()
+    assert task is not None
+    await task
+    assert app.backfiller.calls == [[("friend", 1), ("group", 2)]]
+    assert app._offline_since is None
+    assert any("补齐完成" in n for n in app.service.notes)
+
+
+async def test_reconnect_below_gap_threshold_does_not_catchup():
+    app = _offline_app(gap=3600)
+    await app._on_bot_offline("blip")
+    assert await app._on_bot_online() is None
+    assert app.backfiller.calls == []
+
+
+async def test_first_connect_does_not_catchup():
+    app = _offline_app(gap=0)
+    assert await app._on_bot_online() is None  # no prior offline this process
+    assert app.backfiller.calls == []
+
+
+async def test_dispatch_routes_bot_offline():
+    from muze.provider.milky.models import Event
+
+    app = _offline_app(gap=0)
+    await app.dispatch(
+        Event.from_raw({"event_type": "bot_offline", "data": {"reason": "kicked"}})
+    )
+    assert app._offline_since is not None

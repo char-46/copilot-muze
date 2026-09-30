@@ -53,6 +53,7 @@ ingest:
     concurrency: 4            # conversations pulled in parallel (1 = sequential)
     rescan_interval_min: 30   # periodic rescan (catches self-sent + missed events); 0 = off
     rescan_active_window_h: 24  # rescan only conversations active within this window
+    reconnect_gap_sec: 60     # after a drop longer than this, reconnect triggers an immediate catch-up pull
   media_download_concurrency: 3
   media_transcode_silk: true  # decode SILK voice to a playable .wav (raw .silk kept too)
 

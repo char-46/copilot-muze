@@ -84,6 +84,7 @@ class App:
         self._mt_task = None
         self._sup_task = None
         self._last_seen_write = 0.0
+        self._offline_since: float | None = None  # set on bot_offline, cleared on reconnect
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -179,11 +180,14 @@ class App:
         prev_login = await self.repo.get_meta("login_at")
         prev_seen = await self.repo.get_meta("last_seen_at")
         prev_shutdown = await self.repo.get_meta("last_shutdown_at")
+        prev_offline = await self.repo.get_meta("last_offline_at")
         if prev_login or prev_seen:
+            forced = bool(prev_offline and (not prev_shutdown or prev_offline > prev_shutdown))
             log.info(
-                "[%s] 上次在线: %s ~ %s%s",
-                self.spec.name, _ts(prev_login), _ts(prev_seen or prev_shutdown),
+                "[%s] 上次在线: %s ~ %s%s%s；本次启动会漫游补齐离线期间的消息",
+                self.spec.name, _ts(prev_login), _ts(prev_seen or prev_shutdown or prev_offline),
                 f"（正常关闭于 {_ts(prev_shutdown)}）" if prev_shutdown else "",
+                "（上次为掉线/被强制下线）" if forced else "",
             )
         now = time.time()
         self._last_seen_write = now
@@ -200,6 +204,67 @@ class App:
             await self.repo.set_meta("last_seen_at", str(now))
         except Exception:
             log.exception("last_seen update failed")
+
+    # ---------------------------------------------------- online / offline
+    async def _on_bot_offline(self, reason: str) -> None:
+        """The account was kicked / the socket dropped: record the gap start."""
+        now = time.time()
+        self._offline_since = now
+        try:
+            await self.repo.set_meta("last_offline_at", str(now))
+            await self.repo.set_meta("last_offline_reason", str(reason))
+        except Exception:
+            log.exception("record offline failed")
+        log.warning("[%s] 掉线/被下线: %s（重连后自动补齐漏掉的消息）", self.spec.name, reason)
+        await self._notify(f"⚠ 账号掉线/被下线：{reason}\n重连后会自动补拉漏掉的消息。")
+
+    async def _on_bot_online(self) -> "asyncio.Task | None":
+        """Connection (re)established. If we were offline long enough, kick off
+        a catch-up pull immediately instead of waiting for the next rescan."""
+        now = time.time()
+        started = self._offline_since
+        self._offline_since = None
+        try:
+            await self.repo.set_meta("last_online_at", str(now))
+        except Exception:
+            log.exception("record online failed")
+        if started is None:
+            return None  # first connect this process; on_start backfill covers it
+        gap = max(0.0, now - started)
+        if gap < float(self.cfg.ingest.backfill.reconnect_gap_sec):
+            log.info("[%s] reconnected after %.0fs (below gap threshold)", self.spec.name, gap)
+            return None
+        log.info(
+            "[%s] reconnected after %.0fs: catching up missed messages",
+            self.spec.name, gap,
+        )
+        return asyncio.create_task(self._catch_up(gap))
+
+    async def _catch_up(self, gap: float) -> None:
+        """Incremental roaming pull to recover messages missed while offline."""
+        if self.backfiller is None or self.backfiller.running:
+            return
+        try:
+            targets = await self.backfiller.target_conversations()
+            n = await self.backfiller.run_once(targets)
+        except Exception:
+            log.exception("catch-up backfill failed")
+            return
+        if n is None:
+            return
+        from muze.timeparse import human_duration
+
+        human = human_duration(int(gap)) if gap >= 60 else f"{int(gap)} 秒"
+        log.info("[%s] catch-up done: +%s messages (offline %s)", self.spec.name, n, human)
+        await self._notify(f"🔁 重连补齐完成：离线 {human}，新增 {n} 条消息。")
+
+    async def _notify(self, text: str) -> None:
+        if self.service is None:
+            return
+        try:
+            await self.service.notify_controller(text)
+        except Exception:
+            log.exception("offline/online notify failed")
 
     def _stop_quiet(self) -> None:
         """Stop this account WITHOUT changing its restart intent.
@@ -297,7 +362,9 @@ class App:
             elif ev.event_type == "message_recall" and isinstance(ev.data, MessageRecallData):
                 await self.pipeline.handle_recall(ev.data)
             elif ev.event_type == "bot_offline":
-                log.warning("bot offline: %s", getattr(ev.data, "reason", "?"))
+                await self._on_bot_offline(str(getattr(ev.data, "reason", "?") or "?"))
+            elif ev.event_type == "bot_online":
+                await self._on_bot_online()
             elif ev.event_type == "friend_file_upload" and isinstance(ev.data, FriendFileUploadData):
                 self.chatlog.log.info(
                     "CHAT file | friend/%s %s %sB is_self=%s",

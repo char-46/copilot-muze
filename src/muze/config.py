@@ -86,6 +86,8 @@ class BackfillConfig(BaseModel):
     concurrency: int = 4
     rescan_interval_min: float = 30.0
     rescan_active_window_h: float = 24.0
+    reconnect_gap_sec: float = 60.0  # min offline gap before a reconnect
+    # triggers an immediate catch-up pull (smaller blips wait for rescan)
 
 
 class IngestConfig(BaseModel):

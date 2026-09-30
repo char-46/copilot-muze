@@ -79,13 +79,18 @@ class MilkyClient:
 
     # ------------------------------------------------------------- events
     async def ws_events(self) -> AsyncIterator[dict[str, Any]]:
-        """Yield raw event dicts forever; reconnects with backoff on errors."""
+        """Yield raw event dicts forever; reconnects with backoff on errors.
+
+        Synthetic `bot_online` / `bot_offline` frames bracket each connection
+        so the app can detect a drop and, on reconnect, pull whatever arrived
+        while the socket was down."""
         while True:
             try:
                 sess = await self.session()
                 headers = {"Authorization": f"Bearer {self.access_token}"} if self.access_token else {}
                 async with sess.ws_connect(self._ws_url(), headers=headers, heartbeat=30) as ws:
                     log.info("event websocket connected: %s", self._ws_url())
+                    yield {"event_type": "bot_online", "data": {}}
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
@@ -102,4 +107,5 @@ class MilkyClient:
             except Exception as e:
                 log.warning("event websocket error: %s", e)
             log.warning("event websocket disconnected; retrying in %.1fs", self.reconnect_interval)
+            yield {"event_type": "bot_offline", "data": {"reason": "websocket disconnected"}}
             await asyncio.sleep(self.reconnect_interval)

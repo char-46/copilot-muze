@@ -44,8 +44,15 @@ actually supports and degrades lazily.
   persisted cursor/target for an unfinished deep pull), so an interrupted,
   page-capped or crash-killed pull continues where it stopped instead of leaving
   a hole that only `/sync force` could fill. The account DB also records
-  `login_at` / `last_seen_at` / `last_shutdown_at` so the downtime window is
-  visible on the next start.
+  `login_at` / `last_seen_at` / `last_shutdown_at` / `last_offline_at` so the
+  downtime window is visible on the next start.
+- **Forced logout is noticed and recovered**: the event socket (re)connect emits
+  synthetic `bot_online` / `bot_offline` frames. On a real `bot_offline` (QQ
+  kicked) or a dropped socket the app records the gap and tells the controller;
+  when the socket comes back after `ingest.backfill.reconnect_gap_sec` (default
+  60s) it immediately runs an incremental roaming pull (not just the periodic
+  rescan) and reports how many messages were recovered. A process restart does
+  the same via the `on_start` pull.
 - `get_resource_temp_url` + file download APIs let muze persist every image /
   voice / video / file to disk before temp URLs expire. Blobs are sniffed by
   magic bytes (correct extension), and SILK voice is decoded to a playable
