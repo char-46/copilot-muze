@@ -94,7 +94,6 @@ class IngestConfig(BaseModel):
 class ControlConfig(BaseModel):
     control_group: int = 0
     private_control: bool = True
-    group_trigger: Literal["at_or_slash", "all"] = "at_or_slash"
     confirm_all_sends: bool = True
     confirm_timeout_min: float = 30.0
 

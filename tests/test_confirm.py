@@ -115,15 +115,50 @@ async def test_parse_target(env):
 
 async def test_group_trigger_rules(env):
     service, *_ = env
-    # admin in control group, mentions bot -> triggers
-    assert service.qq_should_trigger("group", 20002, 10001, True, "你好") is True
-    # admin without mention, no slash -> no trigger (at_or_slash mode)
-    assert service.qq_should_trigger("group", 20002, 10001, False, "随便聊聊") is False
-    # slash always triggers
-    assert service.qq_should_trigger("group", 20002, 10001, False, "/status") is True
+    T = service.qq_should_trigger
+    # --- group: only /cmd or ::llm ever trigger, never plain chatter ---
+    assert T("group", 20002, 10001, True, "/status") is True      # @bot + cmd
+    assert T("group", 20002, 10001, True, "::帮我总结") is True   # @bot + llm
+    assert T("group", 20002, 10001, True, "你好") is False        # plain chat, even @bot
+    assert T("group", 20002, 10001, False, "/status") is True     # bare cmd, primary bot
+    assert T("group", 20002, 10001, False, "::继续") is True      # bare llm, primary bot
+    assert T("group", 20002, 10001, False, "随便聊聊") is False   # bare plain text
+    # non-primary bot in the same group: only answers when explicitly @-ed
+    service.runtime.is_primary = False
+    assert T("group", 20002, 10001, True, "/status") is True      # @me -> I answer
+    assert T("group", 20002, 10001, False, "/status") is False    # bare -> primary answers
+    assert T("group", 20002, 10001, False, "::hi") is False
+    service.runtime.is_primary = True
     # stranger in control group -> never
-    assert service.qq_should_trigger("group", 20002, 99999, True, "/status") is False
-    # admin via private chat -> always
-    assert service.qq_should_trigger("friend", 10001, 10001, False, "hi") is True
-    # non-admin private chat -> no
-    assert service.qq_should_trigger("friend", 88888, 88888, False, "hi") is False
+    assert T("group", 20002, 99999, True, "/status") is False
+    # --- friend: same /cmd + ::llm rule ---
+    assert T("friend", 10001, 10001, False, "/status") is True
+    assert T("friend", 10001, 10001, False, "::你好") is True
+    assert T("friend", 10001, 10001, False, "hi") is False        # plain text: archived only
+    # non-authority private chat -> never
+    assert T("friend", 88888, 88888, False, "/status") is False
+    # --- self-send isolation (controller == one of the bots) ---
+    # this account sending to ANOTHER bot: outgoing, never a command here;
+    # the receiving bot answers alone
+    assert T("friend", 77777, 10001, False, "/status", is_self=True) is False
+    assert T("group", 20002, 10001, False, "/status", is_self=True) is False
+    # true self-chat (peer == self, controller is self) still works
+    service.runtime.self_id = 10001
+    assert T("friend", 10001, 10001, False, "::记一下", is_self=True) is True
+    service.runtime.self_id = 0
+
+
+async def test_llm_prefix_routing(env):
+    service, *_ = env
+    from muze.core.service import is_llm_invocation, strip_llm_prefix
+
+    assert is_llm_invocation("::hi") and is_llm_invocation("：：你好")
+    assert is_llm_invocation(":：x")  # mixed half/full width colons
+    assert not is_llm_invocation(":hi") and not is_llm_invocation("/cmd")
+    assert strip_llm_prefix("::你好") == "你好"
+    assert strip_llm_prefix("：：  空格 ") == "空格"
+
+    # execute(): plain text is refused with a hint, not routed to the agent
+    ctx = ControlContext(source="web", chat_key="web:x", scene="", peer_id=0)
+    out = await service.execute("普通文本", ctx)
+    assert out.is_error and "::" in out.text

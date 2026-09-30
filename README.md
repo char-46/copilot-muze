@@ -91,7 +91,30 @@ actually supports and degrades lazily.
 | `/pending` `/confirm [id]` `/cancel [id]` | manage deferred sends |
 | `/markread <target> [seq]` | mark conversation read (if supported) |
 
-Non-slash input goes to the AI agent, which can query the archive, describe
+## Command / LLM isolation
+
+Input is strictly routed — plain chatter is archived but never answered:
+
+- **`/command`** — commands. `/help` lists them in two sections: 应用级
+  (process-level: help/version/read/fetch/reload/restart/shutdown — anything
+  account-independent) vs 本账号 (operates on this account's archive/data).
+  Register scope with `@slash(..., scope="app" | "bot")`.
+- **`::message`** — the ONLY way to reach the LLM (two colons; half/full
+  width both work: `::` `：：`).
+- anything else — no reply.
+
+Multi-bot safety (several accounts in one process):
+
+- **Group with several bots**: `@bot /cmd` or `@bot ::msg` → only the
+  addressed bot answers. Bare `/cmd` / `::msg` → only the **primary** bot
+  (first `accounts.milky[]` entry) answers — a controller message never
+  gets N replies.
+- **Controller who is also a bot account** (own QQ in `authority`): the
+  account's own outgoing messages (`is_self`) never trigger commands —
+  except a true self-chat (peer == self). So 1000000001→bot2 is answered
+  by bot2 alone; 1000000001 talking to itself still works.
+
+`::` input goes to the AI agent, which can query the archive, describe
 images (vision model), expand forwarded messages, and draft sends — all sends
 respect the confirmation policy (`control.confirm_all_sends`, default on;
 CLI bypasses since it is local).

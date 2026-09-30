@@ -196,6 +196,7 @@ class IncomingMessage(_M):
     message_seq: int = 0
     sender_id: int = 0
     time: int = 0
+    is_self: bool = False  # outgoing (sent by this account from another client)
     segments: SkipValidation[list[Segment]] = Field(default_factory=list)
 
     @classmethod

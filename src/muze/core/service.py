@@ -41,6 +41,8 @@ class CommandSpec:
     help: str  # one-line description for /help
     fn: Callable[..., Awaitable[object]]  # async (self, args, ctx) -> ...
     local_only: bool = False  # restricted to local fronts (cli/web/console)
+    scope: str = "bot"  # "app": process-level (run once per process)
+                         # "bot": operates on THIS account's data
 
     def help_line(self) -> str:
         u = self.usage or f"/{self.name}"
@@ -71,18 +73,33 @@ class CommandRegistry:
         return [self._cmds[n] for n in self.names()]
 
     def help_text(self) -> str:
-        lines = [s.help_line() for s in self.all()]
-        return "命令列表（scene/peer 形如 group/123 或 friend/456）:\n" + "\n".join(lines)
+        app = [s.help_line() for s in self.all() if s.scope == "app"]
+        bot = [s.help_line() for s in self.all() if s.scope != "app"]
+        head = "命令列表（scene/peer 形如 group/123 或 friend/456）:\n"
+        sections = []
+        if app:
+            sections.append("── 应用级（作用于整个进程，与账号无关）──\n" + "\n".join(app))
+        if bot:
+            sections.append("── 本账号（作用于当前账号的数据）──\n" + "\n".join(bot))
+        return head + "\n\n".join(sections)
 
 
 COMMANDS = CommandRegistry()
 
 
 def slash(
-    name: str, usage: str = "", help: str = "", local_only: bool = False
+    name: str,
+    usage: str = "",
+    help: str = "",
+    local_only: bool = False,
+    scope: str = "bot",
 ) -> Callable:
     """Declare a slash-command plugin on an async method.
 
+    scope: "app"  — process-level command (config/code/lifecycle, account-
+                    independent; with several bots in one chat only the
+                    primary bot answers so it runs exactly once);
+           "bot"  — operates on THIS account's archive/data (default).
     The handler receives (self, args, ctx) and may return:
     CommandOutcome | str | list[list[dict]] (message chains) | None.
     The framework always converts that into a CommandOutcome reply.
@@ -90,11 +107,23 @@ def slash(
 
     def deco(fn):
         COMMANDS.register(
-            CommandSpec(name=name, usage=usage, help=help, fn=fn, local_only=local_only)
+            CommandSpec(
+                name=name, usage=usage, help=help, fn=fn,
+                local_only=local_only, scope=scope,
+            )
         )
         return fn
 
     return deco
+
+
+def is_llm_invocation(text: str) -> bool:
+    """LLM messages start with two colons (half/full width): `::` or `：：`."""
+    return len(text) >= 2 and text[0] in ":：" and text[1] in ":："
+
+
+def strip_llm_prefix(text: str) -> str:
+    return text[2:].strip()
 
 
 @dataclass
@@ -247,12 +276,19 @@ class ControlService:
         if text.startswith("/"):
             return await self.run_command(text, ctx)
 
-        # natural language -> agent
-        if self.agent is None:
-            return CommandOutcome.err(
-                "未配置 LLM（llm.chat.base_url/api_key/model），无法处理自然语言；命令仍可用，/help 查看"
-            )
-        return await self.agent.converse(text, ctx)
+        # `::` (two colons, half/full width) -> the ONLY way to reach the LLM;
+        # plain chatter never triggers the agent (command/LLM isolation).
+        if is_llm_invocation(text):
+            prompt = strip_llm_prefix(text)
+            if not prompt:
+                return CommandOutcome.err(":: 后面要有内容")
+            if self.agent is None:
+                return CommandOutcome.err(
+                    "未配置 LLM（llm.chat.base_url/api_key/model）；命令仍可用，/help 查看"
+                )
+            return await self.agent.converse(prompt, ctx)
+
+        return CommandOutcome.err("未响应：命令以 / 开头；发给 AI 的内容以 :: 开头（两个冒号）")
 
     # ------------------------------------------------------------- sending
     async def deliver(self, ctx: ControlContext, outcome: CommandOutcome) -> None:
@@ -403,7 +439,7 @@ class ControlService:
         await self.repo.finish_task(task_id, "cancelled")
         return CommandOutcome(f"已取消任务 #{task_id}")
 
-    @slash("read", "/read <文件路径>", "读取本地文档内容（docx/txt/md/html…，媒体已落盘路径可用）")
+    @slash("read", "/read <文件路径>", "读取本地文档内容（docx/txt/md/html…，媒体已落盘路径可用）", scope="app")
     async def cmd_read(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
             return CommandOutcome.err("用法: /read <文件路径>")
@@ -416,7 +452,7 @@ class ControlService:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text[:3500])
 
-    @slash("fetch", "/fetch <URL>", "抓取网页/在线文档链接的文本内容")
+    @slash("fetch", "/fetch <URL>", "抓取网页/在线文档链接的文本内容", scope="app")
     async def cmd_fetch(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
             return CommandOutcome.err("用法: /fetch <URL>")
@@ -555,11 +591,11 @@ class ControlService:
             lines.append("探测范围内无缺口（本地已覆盖）")
         return CommandOutcome("\n".join(lines))
 
-    @slash("help", "/help", "命令列表（自动扫描生成）")
+    @slash("help", "/help", "命令列表（自动扫描生成）", scope="app")
     async def cmd_help(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(COMMANDS.help_text())
 
-    @slash("version", "/version", "版本与构建信息")
+    @slash("version", "/version", "版本与构建信息", scope="app")
     async def cmd_version(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(get_version())
 
@@ -924,21 +960,21 @@ class ControlService:
         self.agent.reset_all()
         return CommandOutcome("已清空所有 AI 对话上下文")
 
-    @slash("reload", "/reload", "热更新(config/skills/AI上下文)，源码变更时自动安排重启")
+    @slash("reload", "/reload", "热更新(config/skills/AI上下文)，源码变更时自动安排重启", scope="app")
     async def cmd_reload(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         reloader = self.runtime.reloader
         if reloader is None:
             return CommandOutcome("reload 仅在 serve 进程内可用", is_error=True)
         return await reloader.reload()
 
-    @slash("restart", "/restart", "重启服务（由 muze daemon 接管）", local_only=True)
+    @slash("restart", "/restart", "重启服务（由 muze daemon 接管）", local_only=True, scope="app")
     async def cmd_restart(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.runtime.request_restart is None:
             return CommandOutcome.err("重启钩子未装配（直接运行 serve 时请手动重启）")
         self.runtime.request_restart()
         return CommandOutcome("已请求重启：服务将退出并由 daemon 重新拉起")
 
-    @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True)
+    @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True, scope="app")
     async def cmd_shutdown(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.runtime.request_stop is None:
             return CommandOutcome.err("停止钩子未装配")
@@ -955,14 +991,42 @@ class ControlService:
             return bool(cfg.control_group) and peer_id == cfg.control_group and sender_id in self.cfg.authority
         return False
 
-    def qq_should_trigger(self, scene: str, peer_id: int, sender_id: int, mention_self: bool, text: str) -> bool:
+    def qq_should_trigger(
+        self,
+        scene: str,
+        peer_id: int,
+        sender_id: int,
+        mention_self: bool,
+        text: str,
+        is_self: bool = False,
+    ) -> bool:
+        """Should this QQ message be treated as control input (command / LLM)?
+
+        Isolation rules (multi-bot safe):
+        - Only `/command` or `::llm message` ever trigger; plain chatter
+          is archived but never answered.
+        - Self-sent messages (this account talking from another client)
+          never trigger — EXCEPT a true self-chat (peer == self). So when
+          the controller IS one of the bots (authority contains self_id),
+          the message it sends to another bot is answered by the receiving
+          bot alone instead of both.
+        - In groups with several bots present: @me -> only I answer;
+          bare `/cmd` or `::msg` -> only the PRIMARY bot (first account)
+          answers, so a controller message never gets N replies.
+        """
+        if is_self and peer_id != self.runtime.self_id:
+            return False
         if not self.is_controller(scene, peer_id, sender_id):
+            return False
+        is_cmd = text.startswith("/")
+        is_llm = is_llm_invocation(text)
+        if not (is_cmd or is_llm):
             return False
         if scene == "friend":
             return True
-        if self.cfg.control.group_trigger == "all":
-            return True
-        return mention_self or text.startswith("/")
+        if mention_self:
+            return True  # explicitly addressed -> this bot answers
+        return bool(getattr(self.runtime, "is_primary", True))
 
 
 class Runtime:
@@ -971,6 +1035,8 @@ class Runtime:
     def __init__(self) -> None:
         self.started_at = time.time()
         self.self_id = 0
+        self.is_primary = True  # first account in the process; only it
+        #                                answers bare commands in shared groups
         self.instance_name = "main"  # account display name, injected by main
         self.endpoint = None  # live protocol endpoint object, injected by main
         self.llm = None  # LLMClient, injected by main

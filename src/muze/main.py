@@ -235,10 +235,11 @@ class App:
         )
         texts = [s.text for s in msg.segments if isinstance(s, TextSeg)]
         text = " ".join(t for t in texts if t).strip()
+        is_self = bool(getattr(msg, "is_self", False)) or msg.sender_id == self.runtime.self_id
 
-        if not svc.qq_should_trigger(msg.message_scene, msg.peer_id, msg.sender_id, mention_self, text):
-            return
-        if not text:
+        if not svc.qq_should_trigger(
+            msg.message_scene, msg.peer_id, msg.sender_id, mention_self, text, is_self=is_self
+        ):
             return
         ctx = ControlContext(
             source="qq",
@@ -327,7 +328,9 @@ async def _bootstrap(apps: list[App]) -> None:
     web_runner = None
     registry: dict[str, ControlService] = {}
     try:
-        for app in apps:
+        for i, app in enumerate(apps):
+            app.runtime.is_primary = i == 0  # only apps[0] answers bare
+            #                                commands in shared groups
             await app.setup()
             registry[app.spec.name] = app.service
 
