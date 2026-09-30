@@ -632,11 +632,17 @@ class ControlService:
         ]
         return CommandOutcome("\n".join(lines))
 
-    @slash("sync", "/sync [scene/peer] [页数]", "漫游补拉；带页数=深拉。进度按 1/2/3 分钟及每 5 分钟汇报")
+    @slash("sync", "/sync [force] [scene/peer] [页数]", "漫游补拉；force=忽略水位强拉全部(重复自动去重)；带页数=深拉")
     async def cmd_sync(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not self.runtime.backfiller:
             return CommandOutcome.err("backfiller 不可用")
         from muze.progress import ProgressReporter
+
+        force = False
+        args = list(args)
+        if args and args[0].lower() in ("force", "强制", "all"):
+            force = True
+            args = args[1:]
 
         async def emit(text: str) -> None:
             if ctx.qq_reachable:
@@ -664,32 +670,42 @@ class ControlService:
                     f"深拉 {label} 已开始（最多 {pages} 页）。"
                     "进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
                 )
-            reporter = ProgressReporter(f"sync {label}", emit)
+            reporter = ProgressReporter(f"sync {label}" + ("（强制全量）" if force else ""), emit)
 
             async def job_one() -> None:
                 try:
-                    n = await self.runtime.backfiller.run_once([(scene, peer)], reporter=reporter)
+                    n = await self.runtime.backfiller.run_once([(scene, peer)], reporter=reporter, force=force)
                 except Exception as e:
                     await reporter.finish(f"失败: {e}")
                     return
                 await reporter.finish(f"完成，新增 {n} 条")
 
             asyncio.create_task(job_one())
+            if force:
+                return CommandOutcome(
+                    f"强制全量补拉 {label} 已开始：忽略水位翻到漫游尽头"
+                    "（已存消息自动去重，只补缺失）。完成时总结"
+                )
             return CommandOutcome(
                 f"sync {label} 已开始。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
             )
 
-        reporter = ProgressReporter("全量补拉", emit)
+        reporter = ProgressReporter("全量补拉" + ("（强制全量）" if force else ""), emit)
 
         async def job_all() -> None:
             try:
-                n = await self.runtime.backfiller.run_once(reporter=reporter)
+                n = await self.runtime.backfiller.run_once(reporter=reporter, force=force)
             except Exception as e:
                 await reporter.finish(f"失败: {e}")
                 return
             await reporter.finish(f"完成，新增 {n} 条")
 
         asyncio.create_task(job_all())
+        if force:
+            return CommandOutcome(
+                "强制全量补拉已启动（后台执行）：所有会话忽略水位翻到漫游尽头"
+                "（已存消息自动去重，只补缺失）。完成时总结"
+            )
         return CommandOutcome(
             "全量补拉已启动（后台执行）。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
         )

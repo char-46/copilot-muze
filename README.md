@@ -81,7 +81,7 @@ actually supports and degrades lazily.
 | command | effect |
 |---|---|
 | `/status` | version+build, uptime, archive stats, capabilities |
-| `/sync [target]` | roaming backfill now (one conversation or all) |
+| `/sync [force] [target]` | roaming backfill now; `force` ignores the watermark and pulls EVERYTHING to the roaming end (duplicates are upsert-deduped — recovers holes) |
 | `/unread` | recently active conversations with previews |
 | `/search <kw> [n]` | full-text search over the archive |
 | `/msg <scene/peer> <seq>` | single message detail + media status |

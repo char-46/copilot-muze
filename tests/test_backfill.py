@@ -178,6 +178,35 @@ async def test_backfill_respects_max_pages(repo):
     assert len(adapter.calls) == 2
 
 
+async def test_backfill_force_pulls_everything(repo):
+    """force: ignore the watermark, page to the roaming end; already-stored
+    messages are upsert-deduped so only genuinely missing ones count."""
+    # Pre-existing archive up to seq 50 (same as the watermark test).
+    for seq in range(1, 51):
+        await repo.upsert_message(make_msg("friend", 100, seq), f"m{seq}", "event")
+    # ...but seq 20 went missing historically; force should recover it.
+    await repo.conn.execute("DELETE FROM messages WHERE message_seq = 20")
+    await repo.conn.commit()
+
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    pipe = CountingPipeline(repo)
+    bf = Backfiller(adapter, repo, MuzeConfig(), pipe, ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+
+    new = await bf.run_once([("friend", 100)], force=True)
+    # 61..90 are new (30) + 51..60 (10) + the missing seq 20 recovered;
+    # 31..50 & 21..30 deduped by the primary key; all 3 pages walked.
+    assert new == 41, f"expected 41 new (30 + 10 + recovered 20), got {new}"
+    assert len(adapter.calls) == 3  # walked to the end, no watermark stop
+    assert await repo.get_message_row("friend", 100, 20) is not None
+    assert await repo.get_watermark("friend", 100) == 90
+
+
 async def test_probe_coverage(repo):
     # full roaming: pages down to seq 1, end reached
     pages = [

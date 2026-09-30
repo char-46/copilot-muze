@@ -77,15 +77,7 @@ class Backfiller:
         return out
 
     # ------------------------------------------------------------- worker
-    async def _backfill_conversation(self, scene: str, peer_id: int) -> int:
-        bf = self.cfg.ingest.backfill
-        caps = self.adapter.caps
-        if scene == "friend" and not caps.friend_history:
-            return 0
-        if scene == "group" and not caps.group_history:
-            return 0
-
-    async def _backfill_conversation(self, scene: str, peer_id: int, reporter=None) -> int:
+    async def _backfill_conversation(self, scene: str, peer_id: int, reporter=None, force: bool = False) -> int:
         bf = self.cfg.ingest.backfill
         caps = self.adapter.caps
         if scene == "friend" and not caps.friend_history:
@@ -94,6 +86,9 @@ class Backfiller:
             return 0
 
         watermark = await self.repo.get_watermark(scene, peer_id)
+        # force: ignore the watermark stop — keep paging to the roaming end
+        # (duplicates are upsert-deduped, this catches anything missed)
+        stop_watermark = 0 if force else watermark
         total_new = 0
         pages = 0
         cursor: int | None = None
@@ -115,7 +110,9 @@ class Backfiller:
             oldest = None
             for m in res.messages:  # ascending by message_seq
                 oldest = m.message_seq if oldest is None else min(oldest, m.message_seq)
-                if m.message_seq > watermark:
+                # force: feed EVERYTHING through upsert — the primary key
+                # dedupes what's stored, recovering holes below the watermark
+                if force or m.message_seq > watermark:
                     if await self.pipeline.handle_message(m, source="backfill"):
                         page_new += 1
             total_new += page_new
@@ -126,20 +123,21 @@ class Backfiller:
             # Stop conditions:
             #  - server says no more pages
             #  - we covered the watermark (everything older is already stored)
+            #    [skipped in force mode]
             #  - cursor stopped moving (safety against implementation quirks)
             if res.next_message_seq is None:
                 break
-            if oldest is not None and oldest <= watermark:
+            if oldest is not None and oldest <= stop_watermark:
                 break
             if cursor is not None and res.next_message_seq >= cursor:
                 break
             cursor = res.next_message_seq
             await asyncio.sleep(bf.page_delay)
 
-        if total_new:
+        if total_new or force:
             log.info(
-                "backfill %s +%s new (pages=%s, watermark was %s)",
-                conv_id(scene, peer_id), total_new, pages, watermark,
+                "backfill %s +%s new (pages=%s, watermark was %s, force=%s)",
+                conv_id(scene, peer_id), total_new, pages, watermark, force,
             )
         return total_new
 
@@ -147,6 +145,7 @@ class Backfiller:
         self,
         targets: list[tuple[str, int]] | None = None,
         reporter=None,
+        force: bool = False,
     ) -> int:
         if self.running:
             log.info("backfill already running; skipping")
@@ -156,14 +155,18 @@ class Backfiller:
         new_total = 0
         try:
             targets = targets if targets is not None else await self.target_conversations()
-            log.info("backfill start: %s conversations", len(targets))
+            log.info(
+                "backfill start: %s conversations (force=%s)", len(targets), force
+            )
             if reporter is not None:
-                await reporter.report_start(f"{len(targets)} 个会话")
+                await reporter.report_start(
+                    f"{len(targets)} 个会话" + ("（强制全量）" if force else "")
+                )
             for scene, peer in targets:
                 if self._stop.is_set():
                     break
                 try:
-                    n = await self._backfill_conversation(scene, peer, reporter=reporter)
+                    n = await self._backfill_conversation(scene, peer, reporter=reporter, force=force)
                     new_total += n
                     if reporter is not None:
                         reporter.bump(new=0, pages=0, convs=1)
