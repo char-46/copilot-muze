@@ -23,7 +23,7 @@ def test_watch_rules():
     cfg.ingest.scope = "watchlist"
     cfg.ingest.watchlist.friends = [11]
     cfg.ingest.watchlist.groups = [22]
-    cfg.control.admin_users = [33]
+    cfg.authority = [33]
     assert describe_watch(cfg, "friend", 11) is True
     assert describe_watch(cfg, "group", 22) is True
     assert describe_watch(cfg, "friend", 11 + 1) is False
@@ -33,7 +33,7 @@ def test_watch_rules():
 
 def test_control_conversation():
     cfg = MuzeConfig()
-    cfg.control.admin_users = [7]
+    cfg.authority = [7]
     cfg.control.control_group = 9
     assert is_control_conversation(cfg, "friend", 7) is True
     assert is_control_conversation(cfg, "group", 9) is True

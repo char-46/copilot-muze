@@ -17,7 +17,7 @@ import logging
 from pathlib import Path
 
 import muze
-from muze.config import MuzeConfig, load_config
+from muze.config import MilkyEndpoint, MuzeConfig, load_accounts
 from muze.core.service import CommandOutcome
 from muze.skills import SkillStore
 
@@ -60,6 +60,7 @@ class Reloader:
         *,
         config_path: str,
         cfg: MuzeConfig,
+        endpoint: MilkyEndpoint,
         skills: SkillStore,
         llm,
         agent,
@@ -67,6 +68,7 @@ class Reloader:
     ) -> None:
         self.config_path = config_path
         self.cfg = cfg
+        self.endpoint = endpoint
         self.skills = skills
         self.llm = llm
         self.agent = agent
@@ -91,12 +93,25 @@ class Reloader:
         else:
             lines.append("源码无变更，热重载继续")
 
-        # 2) config
+        # 2) config (re-resolve this account's spec by name)
         try:
-            new_cfg = load_config(self.config_path)
-            for name in MuzeConfig.model_fields:
-                setattr(self.cfg, name, getattr(new_cfg, name))
-            lines.append("config.yaml 已重载（storage.data_dir/web 监听地址变更需重启）")
+            name = getattr(self.runtime, "instance_name", "")
+            specs = load_accounts(self.config_path)
+            spec = next((s for s in specs if s.name == name), None)
+            if spec is None:
+                raise ValueError(
+                    f"账号 {name!r} 不在配置中（现有: {', '.join(s.name for s in specs)}）"
+                )
+            for field in MuzeConfig.model_fields:
+                setattr(self.cfg, field, getattr(spec.config, field))
+            endpoint_changed = False
+            for f in MilkyEndpoint.model_fields:
+                new_v = getattr(spec.endpoint, f)
+                if getattr(self.endpoint, f) != new_v:
+                    endpoint_changed = True
+                setattr(self.endpoint, f, new_v)
+            note = "（milky 端点变更重启后完全生效）" if endpoint_changed else ""
+            lines.append(f"config.yaml 已重载{note}（storage.data_dir/web 监听地址变更需重启）")
         except Exception as e:
             lines.append(f"config 重载失败（沿用旧配置）: {e}")
 

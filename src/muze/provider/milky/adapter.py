@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Any, AsyncIterator
 
-from muze.config import MilkyConfig
+from muze.config import MilkyEndpoint
 from muze.provider.base import Caps, NotSupported, ProtocolAdapter, ProtocolError
 from muze.provider.milky.client import MilkyClient
 from muze.provider.milky.models import (
@@ -49,7 +49,7 @@ def _unwrap(data: Any, *keys: str) -> Any:
 class MilkyAdapter(ProtocolAdapter):
     """Talks to LLBot / Lagrange.Milky over the Milky standard interface."""
 
-    def __init__(self, cfg: MilkyConfig) -> None:
+    def __init__(self, cfg: MilkyEndpoint) -> None:
         self.cfg = cfg
         self.client = MilkyClient(
             cfg.base_url,

@@ -7,6 +7,13 @@ const $$ = (s) => document.querySelectorAll(s);
 let TOKEN = localStorage.getItem("muze_token") || "";
 $("#token").value = TOKEN;
 let authorized = !!TOKEN;
+let ACCT = ""; // selected account name; "" -> server default (first)
+
+/* inject the account selector param into every api call */
+function withAccount(path) {
+  if (!ACCT) return path;
+  return path + (path.includes("?") ? "&" : "?") + "account=" + encodeURIComponent(ACCT);
+}
 
 async function api(path, opts = {}) {
   const o = Object.assign({}, opts);
@@ -15,7 +22,7 @@ async function api(path, opts = {}) {
     o.body = JSON.stringify(o.body);
     o.headers["Content-Type"] = "application/json";
   }
-  const r = await fetch(path, o);
+  const r = await fetch(withAccount(path), o);
   if (r.status === 401) {
     $("#statusdot").className = "dot off";
     authorized = false;
@@ -65,17 +72,43 @@ $("#saveToken").addEventListener("click", () => {
 
 /* refresh everything after (re)authorization */
 function refreshAll() {
+  loadAccounts();
   loadInfo();
   loadConversations();
   pendingBadgeReload();
 }
 
-/* ---------------- info ---------------- */
+/* ---------------- accounts + info ---------------- */
+let acctNames = null;
+$("#acctSel").addEventListener("change", () => {
+  ACCT = $("#acctSel").value;
+  curConv = null;
+  $("#msglist").innerHTML = "";
+  $("#msghead").textContent = "选择左侧会话";
+  refreshAll();
+});
+
+async function loadAccounts() {
+  try {
+    const d = await api("/api/accounts");
+    acctNames = d.accounts.map((a) => a.name);
+    const sel = $("#acctSel");
+    sel.innerHTML = d.accounts
+      .map((a) => `<option value="${esc(a.name)}">${esc(a.name)} (${a.self_id})</option>`)
+      .join("");
+    sel.classList.toggle("hidden", d.accounts.length < 2);
+    if (!ACCT) ACCT = d.default || (acctNames[0] || "");
+    sel.value = ACCT;
+  } catch { /* dot handled */ }
+}
+
 async function loadInfo() {
   try {
     const info = await api("/api/info");
     $("#version").textContent = info.version;
-    pendingBadge(info.stats.pending_actions || 0);
+    const pending = (info.accounts || []).reduce(
+      (n, a) => n + ((a.stats && a.stats.pending_actions) || 0), 0);
+    pendingBadge(pending);
   } catch { /* dot handled */ }
 }
 function pendingBadge(n) {
@@ -174,14 +207,14 @@ function renderMessage(m) {
       if (md.status !== "done" || !md.file_path) continue;
       if (md.kind === "image") {
         const img = document.createElement("img");
-        img.src = `/api/mediafile/${md.id}?token=${encodeURIComponent(TOKEN)}`;
+        img.src = withAccount(`/api/mediafile/${md.id}?token=${encodeURIComponent(TOKEN)}`);
         img.loading = "lazy";
         img.addEventListener("click", () => window.open(img.src));
         t.appendChild(img);
       } else {
         const a = document.createElement("a");
         a.className = "fl";
-        a.href = `/api/mediafile/${md.id}?token=${encodeURIComponent(TOKEN)}`;
+        a.href = withAccount(`/api/mediafile/${md.id}?token=${encodeURIComponent(TOKEN)}`);
         a.textContent = `[${md.kind}] ${md.file_name || md.file_path}`;
         a.target = "_blank";
         t.appendChild(a);
@@ -292,11 +325,13 @@ async function pendingBadgeReload() {
 /* ---------------- settings ---------------- */
 const CFG_FIELDS = [
   { group: "协议端 (milky)", items: [
-    { path: "milky.base_url", label: "base_url", type: "text" },
+    { path: "milky.base_url", label: "base_url（保存后需重启生效）", type: "text" },
     { path: "milky.access_token", label: "access_token（留空保持）", type: "password", secret: true },
   ]},
+  { group: "授权 (authority)", items: [
+    { path: "authority", label: "控制者QQ（逗号分隔）", type: "text" },
+  ]},
   { group: "控制 (control)", items: [
-    { path: "control.admin_users", label: "管理员QQ（逗号分隔）", type: "text" },
     { path: "control.control_group", label: "控制群号（0=禁用）", type: "number" },
     { path: "control.confirm_all_sends", label: "代发需确认", type: "checkbox" },
   ]},
@@ -320,6 +355,11 @@ function cfgGet(obj, path) {
   return path.split(".").reduce((o, k) => (o == null ? o : o[k]), obj);
 }
 
+function cfgLookup(d, path) {
+  if (path.startsWith("milky.")) return d.endpoint ? d.endpoint[path.slice(6)] : undefined;
+  return cfgGet(d.masked, path);
+}
+
 async function loadSettings() {
   const box = $("#settingsForm");
   try {
@@ -328,9 +368,9 @@ async function loadSettings() {
     for (const g of CFG_FIELDS) {
       const div = document.createElement("div");
       div.className = "group";
-      div.innerHTML = `<h3>${esc(g.group)} · 实例 ${esc(d.instance || "")}</h3>`;
+      div.innerHTML = `<h3>${esc(g.group)} · 账号 ${esc(d.instance || "")}</h3>`;
       for (const it of g.items) {
-        const val = cfgGet(d.masked, it.path);
+        const val = cfgLookup(d, it.path);
         const f = document.createElement("div");
         f.className = "field";
         const shown = it.type === "checkbox" ? (val ? "checked" : "")
@@ -372,16 +412,20 @@ $("#logRefresh").addEventListener("click", loadLogs);
 
 async function loadStatus() {
   const info = await api("/api/info");
-  const s = info.stats || {};
+  const parts = (info.accounts || []).map((a) => {
+    const s = a.stats || {};
+    return (
+      `== 账号 ${a.name} (self ${a.self_id}) ==\n` +
+      `agent: ${a.agent ? "on" : "off"}   confirm_all_sends: ${a.confirm_all_sends}\n` +
+      `conversations: ${s.conversations}   messages: ${s.messages}\n` +
+      `by scene: ${JSON.stringify(s.messages_by_scene || {})}\n` +
+      `media: ${JSON.stringify(s.media || {})}\n` +
+      `backfill: ${JSON.stringify(a.backfill || {})}\n` +
+      (a.capabilities || []).map((c) => "  " + c).join("\n")
+    );
+  });
   $("#statusview").textContent =
-    `muze ${info.version}\n` +
-    `self_id: ${info.self_id}   uptime: ${info.uptime}\n` +
-    `agent: ${info.agent ? "on" : "off"}   confirm_all_sends: ${info.confirm_all_sends}\n\n` +
-    `conversations: ${s.conversations}   messages: ${s.messages}\n` +
-    `by scene: ${JSON.stringify(s.messages_by_scene || {})}\n` +
-    `media: ${JSON.stringify(s.media || {})}\n` +
-    `backfill: ${JSON.stringify(info.backfill || {})}\n\n` +
-    (info.capabilities || []).map((c) => "  " + c).join("\n");
+    `muze ${info.version}   uptime: ${info.uptime}\n\n` + parts.join("\n\n");
 }
 
 /* ---------------- boot ---------------- */

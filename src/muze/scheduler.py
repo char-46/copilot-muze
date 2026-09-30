@@ -67,11 +67,11 @@ class Scheduler:
         """Pick the control conversation a task's result should go to."""
         if ctx.qq_reachable:
             return ctx.scene, ctx.peer_id
-        cfg = self.service.cfg.control
-        if cfg.control_group:
-            return "group", cfg.control_group
-        if cfg.admin_users:
-            return "friend", cfg.admin_users[0]
+        cfg = self.service.cfg
+        if cfg.control.control_group:
+            return "group", cfg.control.control_group
+        if cfg.authority:
+            return "friend", cfg.authority[0]
         return "", 0
 
     async def create(
@@ -101,7 +101,7 @@ class Scheduler:
         ctx = ctx or ControlContext(source="system", chat_key="system", scene="", peer_id=0)
         scene, peer = self.resolve_delivery(ctx)
         if not scene:
-            raise ValueError("无可用的控制会话（请配置 control.admin_users 或 control_group）")
+            raise ValueError("无可用的控制会话（请配置 authority 或 control.control_group）")
 
         task_id = await self.repo.create_task(
             kind, prompt, scene, peer, next_at, interval_sec, created_by, note

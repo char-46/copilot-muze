@@ -1,80 +1,80 @@
-# copilot-muze configuration
+# copilot-muze configuration (v2 layout, breaking change since 0.1.0-alpha.27)
 # Copy to config.yaml and adjust. `config.yaml` is gitignored.
 #
-# ── Multi-account (optional) ────────────────────────────────────────────────
-# To run several QQ accounts in ONE muze process, use an `instances:` list.
-# Top-level keys act as shared defaults; each entry deep-merges over them.
-# Every instance gets its own database (owner-bound), media, webui port and
-# schedule; the console switches accounts with `/use <name>`.
+# Layout:
+#   application-level : web / log / storage.data_dir / ingest / llm / digest
+#   authority         : global list of controller QQ ids (who may command)
+#   accounts          : protocol sources, one entry per login. Data dirs are
+#                       derived automatically per QQ number: <data_dir>/<uin>/
+#                       (muze.db + media/), so accounts never mix.
 #
-# llm:
-#   chat: {base_url: "https://open.bigmodel.cn/api/paas/v4/", api_key: "", model: glm-4.7}
-# instances:
-#   - name: main
-#     milky: {base_url: "http://127.0.0.1:3010", access_token: ""}
-#     storage: {data_dir: ./data-a}
-#     web: {port: 8300}
-#     control: {admin_users: [10001]}
-#   - name: alt
-#     milky: {base_url: "http://127.0.0.1:3011", access_token: ""}
-#     storage: {data_dir: ./data-b, db_file: ""}   # db_file: explicit sqlite path override
-#     web: {port: 8301}
-#     control: {admin_users: [10001]}
-# ────────────────────────────────────────────────────────────────────────────
+# Top-level sections act as shared defaults; each account entry deep-merges
+# its overrides over them (e.g. its own digest/control/llm), except `web`
+# which is app-level only.
 
-milky:
-  # LLBot (or Lagrange.Milky) serving the Milky protocol.
-  base_url: http://127.0.0.1:8080
-  access_token: ""
-  reconnect_interval: 5      # seconds between WS reconnect attempts
-  request_timeout: 30        # seconds for HTTP API calls
+authority:
+  - 10000                     # controller QQ uins allowed to command the copilot
+
+accounts:
+  milky:                      # LLBot / Lagrange.Milky serving the Milky protocol
+    - name: main              # optional display name (console /use, webui selector)
+      base_url: http://127.0.0.1:8080
+      access_token: ""
+      reconnect_interval: 5   # seconds between WS reconnect attempts
+      request_timeout: 30     # seconds for HTTP API calls
+      # authority: [10001]    # extra controllers for this account (unions global)
+      # digest: {enabled: false}   # example per-account override
+    # - name: alt             # second account in the same process
+    #   base_url: http://127.0.0.1:8081
+    #   access_token: ""
+  ob11: []                    # reserved: OneBot 11 sources (not implemented yet)
+  lagrange: []                # reserved: native Lagrange sources (not implemented yet)
 
 storage:
-  data_dir: ./data           # muze.db, media/, logs/ live under here
+  data_dir: ./data            # root; per account: <dir>/<QQ>/muze.db + <dir>/<QQ>/media/
 
 ingest:
   # all      -> every friend chat and every group is archived + backfilled
   # watchlist-> only conversations in watchlist (control chats always ingested)
   scope: all
   watchlist:
-    friends: []              # e.g. [10001, 10002]
-    groups: []               # e.g. [123456789]
+    friends: []               # e.g. [10001, 10002]
+    groups: []                # e.g. [123456789]
   backfill:
-    on_start: true           # roaming pull at startup
-    max_pages_per_conv: 200  # hard stop per conversation (page = up to page_limit msgs)
-    page_limit: 30           # Milky max is 30
-    page_delay: 1.0          # seconds between pages (rate-limit safety)
-    conv_delay: 0.5          # seconds between conversations
-    rescan_interval_min: 30  # periodic rescan (catches self-sent + missed events); 0 = off
+    on_start: true            # roaming pull at startup
+    max_pages_per_conv: 200   # hard stop per conversation (page = up to page_limit msgs)
+    page_limit: 30            # Milky max is 30
+    page_delay: 1.0           # seconds between pages (rate-limit safety)
+    conv_delay: 0.5           # seconds between conversations
+    rescan_interval_min: 30   # periodic rescan (catches self-sent + missed events); 0 = off
     rescan_active_window_h: 24  # rescan only conversations active within this window
   media_download_concurrency: 3
 
 control:
-  admin_users: []            # controller QQ uins allowed to command the copilot
-  control_group: 0           # group id used as control room; 0 = disabled
-  private_control: true      # admins may command via private chat
-  group_trigger: at_or_slash # in control group: @bot or /command; "all" = every message
-  confirm_all_sends: true    # every outgoing message requires confirmation in a control session
-  confirm_timeout_min: 30    # pending confirmations expire after this
+  control_group: 0            # group id used as control room; 0 = disabled
+  private_control: true       # authority may command via private chat
+  group_trigger: at_or_slash  # in control group: @bot or /command; "all" = every message
+  confirm_all_sends: true     # every outgoing message requires confirmation in a control session
+  confirm_timeout_min: 30     # pending confirmations expire after this
 
 llm:
-  chat:                      # any OpenAI-compatible endpoint (GLM / DeepSeek / MiMo ...)
+  chat:                       # any OpenAI-compatible endpoint (GLM / DeepSeek / MiMo ...)
     base_url: https://open.bigmodel.cn/api/paas/v4/
     api_key: ""
     model: glm-4.7
     temperature: 0.4
-  vision:                    # multimodal model for images; empty model disables vision
-    base_url: ""             # empty -> reuse chat.base_url / chat.api_key
+  vision:                     # multimodal model for images; empty model disables vision
+    base_url: ""              # empty -> reuse chat.base_url / chat.api_key
     api_key: ""
-    model: ""                # e.g. glm-4v-plus
+    model: ""                 # e.g. glm-4v-plus
   agent_max_steps: 8
-  asr_provider: ""           # reserved (voice transcription lands later)
+  asr_provider: ""            # reserved (voice transcription lands later)
 
-web:
+web:                          # app-level: one webui serves every account
   enabled: true
   host: 127.0.0.1
   port: 8300
-  token: ""                  # empty -> random token generated and logged at startup
+  token: ""                   # empty -> random token generated and logged at startup
 
 digest:
   # Nightly "dream": summarize each passed day (fixed 01:00), catch up
@@ -82,20 +82,20 @@ digest:
   # reports (hierarchical memory), and distill long-term memories about the
   # user and their contacts (fed back into the agent's prompts).
   enabled: true
-  at: "01:00"              # local time
-  top_conversations: 6     # busiest conversations per day
+  at: "01:00"               # local time
+  top_conversations: 6      # busiest conversations per day
   messages_per_conversation: 40
-  deliver: true            # send the report to the control conversation
-  extract_memories: true   # second LLM pass: distill identity/preferences
+  deliver: true             # send the report to the control conversation
+  extract_memories: true    # second LLM pass: distill identity/preferences
   max_memories_per_night: 8
-  weekly_enabled: true     # roll up completed weeks (2026-W40 style reports)
-  monthly_enabled: true    # roll up completed months (2026-09 style reports)
-  inject_context: true     # feed latest day/week/month reports into every agent prompt
+  weekly_enabled: true      # roll up completed weeks (2026-W40 style reports)
+  monthly_enabled: true     # roll up completed months (2026-09 style reports)
+  inject_context: true      # feed latest day/week/month reports into every agent prompt
   inject_day_chars: 900
   inject_week_chars: 450
   inject_month_chars: 450
   inject_max_memories: 25
 
 log:
-  level: INFO                # DEBUG for verbose protocol traffic
-  file: ""                   # empty -> data_dir/logs/muze.log (appended, never rotated)
+  level: INFO                 # DEBUG for verbose protocol traffic
+  file: ""                    # empty -> data_dir/logs/muze.log (appended, never rotated)

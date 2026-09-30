@@ -950,9 +950,9 @@ class ControlService:
         """Is this sender allowed in this conversation?"""
         cfg = self.cfg.control
         if scene == "friend":
-            return cfg.private_control and sender_id in cfg.admin_users
+            return cfg.private_control and sender_id in self.cfg.authority
         if scene == "group":
-            return bool(cfg.control_group) and peer_id == cfg.control_group and sender_id in cfg.admin_users
+            return bool(cfg.control_group) and peer_id == cfg.control_group and sender_id in self.cfg.authority
         return False
 
     def qq_should_trigger(self, scene: str, peer_id: int, sender_id: int, mention_self: bool, text: str) -> bool:
@@ -971,6 +971,9 @@ class Runtime:
     def __init__(self) -> None:
         self.started_at = time.time()
         self.self_id = 0
+        self.instance_name = "main"  # account display name, injected by main
+        self.endpoint = None  # live protocol endpoint object, injected by main
+        self.llm = None  # LLMClient, injected by main
         self.backfiller = None  # Backfiller, injected by main
         self.log_path = ""
         self.skills = None  # SkillStore, injected by main

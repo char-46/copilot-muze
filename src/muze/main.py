@@ -1,4 +1,9 @@
-"""Application assembly: wires provider, store, ingest, control, web together."""
+"""Application assembly: wires provider, store, ingest, control, web together.
+
+One process may serve several QQ accounts (accounts.milky[]). Every account
+gets its own data dir (<storage.data_dir>/<uin>/), database, media store and
+schedule; the webui is application-level and serves all of them.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ from pathlib import Path
 from muze.ai.agent import Agent
 from muze.ai.llm import LLMClient
 from muze.chatlog import ChatLog, setup_logging
-from muze.config import InstanceSpec, MuzeConfig, load_instances
+from muze.config import AccountSpec, load_accounts
 from muze.core.service import ControlContext, ControlService, Runtime
 from muze.ingest.backfill import Backfiller
 from muze.ingest.pipeline import IngestPipeline
@@ -44,13 +49,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 class App:
-    def __init__(self, cfg: MuzeConfig, config_path: str, name: str = "main") -> None:
-        self.cfg = cfg
+    """One account stack inside the process."""
+
+    def __init__(self, spec: AccountSpec, config_path: str) -> None:
+        self.spec = spec
+        self.cfg = spec.config
         self.config_path = config_path
-        self.name = name
         self.chatlog = ChatLog()
         self.runtime = Runtime()
-        self.runtime.instance_name = name
+        self.runtime.instance_name = spec.name
+        self.runtime.endpoint = spec.endpoint
         self._stop = asyncio.Event()
         self.restart_requested = False
         self.conn = None
@@ -60,31 +68,32 @@ class App:
         self.pipeline = None
         self.backfiller = None
         self.service = None
-        self.web_runner = None
+        self.account_dir: Path | None = None
 
     async def setup(self) -> None:
         cfg = self.cfg
         cfg.storage.data_dir.mkdir(parents=True, exist_ok=True)
-        cfg.storage.media_dir.mkdir(parents=True, exist_ok=True)
 
-        self.conn = await open_db(str(cfg.storage.db_path))
-        self.repo = Repository(self.conn)
-
-        self.adapter = MilkyAdapter(cfg.milky)
+        self.adapter = MilkyAdapter(self.spec.endpoint)
         login = await self.adapter.start()
         self.runtime.self_id = login.user_id
-        log.info("logged in as %s (%s)", login.user_name or "?", login.user_id)
+        log.info("[%s] logged in as %s (%s)", self.spec.name, login.user_name or "?", login.user_id)
+
+        # per-account data dir is derived from the logged-in QQ number
+        acct = cfg.storage.account_dir(login.user_id)
+        self.account_dir = acct
+        self.conn = await open_db(str(acct / "muze.db"))
+        self.repo = Repository(self.conn)
 
         # multi-account isolation: one data dir belongs to exactly one account
         conflict = await self.repo.bind_owner(login.user_id)
         if conflict is not None:
             raise RuntimeError(
-                f"数据目录 {cfg.storage.data_dir} 已绑定账号 {conflict}，"
-                f"当前登录的是 {login.user_id}。请为该账号配置独立的 storage.data_dir "
-                f"（以及独立的 web.port），不要让多个账号共用同一个数据目录。"
+                f"数据目录 {acct} 已绑定账号 {conflict}，"
+                f"当前登录的是 {login.user_id}。请勿手工挪用账号数据目录。"
             )
 
-        self.media = MediaStore(cfg.storage.media_dir, self.adapter, self.repo)
+        self.media = MediaStore(acct / "media", self.adapter, self.repo)
         self.pipeline = IngestPipeline(
             self.adapter, self.repo, self.media, cfg, self.chatlog, login.user_id
         )
@@ -99,8 +108,6 @@ class App:
         self.service.agent = self.agent
 
         # skills / scheduler / reloader
-        from pathlib import Path
-
         from muze.reloader import Reloader
         from muze.scheduler import Scheduler
         from muze.skills import SkillStore
@@ -118,6 +125,7 @@ class App:
         self.reloader = Reloader(
             config_path=self.config_path,
             cfg=cfg,
+            endpoint=self.spec.endpoint,
             skills=self.skills,
             llm=self.llm,
             agent=self.agent,
@@ -127,13 +135,6 @@ class App:
         self.runtime.request_restart = self._request_restart
         self.runtime.request_stop = self._request_stop
         self.runtime.llm = self.llm
-
-        if cfg.web.enabled:
-            from muze.web.server import start_web
-
-            self.web_runner, _token = await start_web(
-                cfg.web, self.service, self.repo, self.runtime, self.chatlog
-            )
 
     def _request_restart(self) -> None:
         self.restart_requested = True
@@ -262,15 +263,13 @@ class App:
                 log.exception("maintenance cycle failed")
 
     async def shutdown(self) -> None:
-        log.info("shutting down...")
+        log.info("[%s] shutting down...", self.spec.name)
         self._stop.set()
         scheduler = getattr(self, "scheduler", None)
         if scheduler is not None:
             await scheduler.stop()
         if self.backfiller is not None:
             await self.backfiller.stop()
-        if self.web_runner is not None:
-            await self.web_runner.cleanup()
         if self.pipeline is not None:
             await self.pipeline.drain_media(timeout=5)
         if self.adapter is not None:
@@ -285,30 +284,27 @@ RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve
 def run_main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
-        specs: list[InstanceSpec] = load_instances(args.config)
+        specs: list[AccountSpec] = load_accounts(args.config)
     except (FileNotFoundError, ValueError) as e:
         print(f"config error: {e}", file=sys.stderr)
         return 2
 
     log_path = setup_logging(specs[0].config.log, specs[0].config.storage)
     log.info(
-        "muze %s starting (config=%s, instances=%s)",
+        "muze %s starting (config=%s, accounts=%s)",
         get_version(), args.config, [s.name for s in specs],
     )
     log.info("log file: %s (never rotated)", log_path)
 
-    apps = [App(s.config, args.config, name=s.name) for s in specs]
+    apps = [App(s, args.config) for s in specs]
     try:
-        if len(apps) == 1:
-            asyncio.run(_bootstrap(apps[0]))
-        else:
-            asyncio.run(_multi_bootstrap(apps))
+        asyncio.run(_bootstrap(apps))
     except KeyboardInterrupt:
         log.info("interrupted by user")
         return 0
     except ProtocolError as e:
         log.error("protocol side unreachable or misconfigured: %s", e)
-        log.error("check: LLBot/Lagrange.Milky is running, milky.base_url & access_token are correct")
+        log.error("check: LLBot/Lagrange.Milky is running, accounts.milky[].base_url & access_token are correct")
         return 3
     except RuntimeError as e:
         log.error("%s", e)
@@ -319,56 +315,58 @@ def run_main(argv: list[str]) -> int:
     return 0
 
 
-async def _bootstrap(app: App) -> None:
-    try:
-        await app.setup()
-    except BaseException:
-        try:
-            await app.shutdown()
-        except Exception:
-            log.exception("cleanup after failed setup crashed")
-        raise
-    await app.run()
+async def _bootstrap(apps: list[App]) -> None:
+    """Set up every account, start the app-level webui, then run them all.
 
-
-async def _multi_bootstrap(apps: list[App]) -> None:
-    """Run several account instances in one process. Any instance exiting
-    (shutdown / restart / crash) stops the others; the exit code is
-    aggregated in run_main."""
+    Any account exiting (shutdown / restart / crash) stops the others; the
+    exit code is aggregated in run_main.
+    """
+    web_runner = None
     registry: dict[str, ControlService] = {}
     try:
         for app in apps:
             await app.setup()
-            registry[app.name] = app.service
-    except BaseException:
-        log.error("instance setup failed; shutting down already-started instances")
+            registry[app.spec.name] = app.service
+
+        if apps[0].cfg.web.enabled:
+            from muze.web.server import start_web
+
+            accounts = {
+                app.spec.name: (app.service, app.repo, app.runtime)
+                for app in apps
+            }
+            web_runner, _token = await start_web(
+                apps[0].cfg.web, accounts, apps[0].chatlog
+            )
+
+        log.info("running %s account(s): %s", len(apps), ", ".join(registry))
+        tasks = [
+            asyncio.create_task(
+                app.run(
+                    spawn_console=(i == 0),
+                    console_registry=registry if len(apps) > 1 else None,
+                ),
+                name=f"account:{app.spec.name}",
+            )
+            for i, app in enumerate(apps)
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for app in apps:
+            app._request_stop()
+        for t in pending:
+            try:
+                await t
+            except Exception:
+                pass
+        for t in done:
+            exc = t.exception()
+            if exc:
+                log.error("account task crashed: %s", exc)
+    finally:
+        if web_runner is not None:
+            await web_runner.cleanup()
         for a in apps:
             try:
                 await a.shutdown()
             except Exception:
-                log.exception("cleanup after failed setup crashed")
-        raise
-
-    log.info("running %s instances: %s", len(apps), ", ".join(registry))
-    tasks = [
-        asyncio.create_task(
-            app.run(
-                spawn_console=(i == 0),
-                console_registry=registry if len(apps) > 1 else None,
-            ),
-            name=f"instance:{app.name}",
-        )
-        for i, app in enumerate(apps)
-    ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for app in apps:
-        app._request_stop()
-    for t in pending:
-        try:
-            await t
-        except Exception:
-            pass
-    for t in done:
-        exc = t.exception()
-        if exc:
-            log.error("instance task crashed: %s", exc)
+                log.exception("cleanup after shutdown crashed")

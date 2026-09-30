@@ -188,9 +188,21 @@ def _wizard(path: Path) -> int:
             return 0
 
     print("== muze cfg init：生成最小可用配置（回车取默认值）==", flush=True)
-    base_url = _prompt("协议端(milky)地址", "http://127.0.0.1:8080")
-    token = _prompt("协议端 access_token（空=无）", "")
-    admin = _prompt("控制者QQ号（逗号分隔，必填）", "")
+    n_endpoints = 1
+    try:
+        n = int(_prompt("接入几个 milky 协议端（账号）?", "1"))
+        n_endpoints = max(1, n)
+    except ValueError:
+        pass
+    endpoints = []
+    for i in range(n_endpoints):
+        base_url = _prompt(
+            f"协议端#{i + 1} (milky) 地址", "http://127.0.0.1:8080" if i == 0 else "http://127.0.0.1:8081"
+        )
+        token = _prompt(f"协议端#{i + 1} access_token（空=无）", "")
+        endpoints.append({"base_url": base_url, "access_token": token})
+
+    admin = _prompt("控制者QQ号 authority（逗号分隔，必填）", "")
     if not admin:
         print("控制者QQ号必填", file=sys.stderr)
         return 2
@@ -199,26 +211,22 @@ def _wizard(path: Path) -> int:
     llm_key = _prompt("LLM api_key", "")
     llm_model = _prompt("LLM model", "glm-4.7")
     vision = _prompt("视觉模型（空=禁用）", "")
-    data_dir = _prompt("数据目录", "./data")
-    multi = _prompt("多账号 instances 结构? y/N", "n").lower() in ("y", "yes")
+    data_dir = _prompt("数据根目录（每账号自动 <dir>/<QQ号>/）", "./data")
 
-    admin_users = [int(x) for x in admin.replace("，", ",").split(",") if x.strip()]
-    inst = {
-        "milky": {"base_url": base_url, "access_token": token},
+    authority = [int(x) for x in admin.replace("，", ",").split(",") if x.strip()]
+    raw = {
+        "authority": authority,
+        "accounts": {"milky": endpoints, "ob11": [], "lagrange": []},
         "storage": {"data_dir": data_dir},
         "control": {
-            "admin_users": admin_users,
             "control_group": int(group) if group.isdigit() else 0,
         },
-    }
-    shared = {
         "llm": {
             "chat": {"base_url": llm_url, "api_key": llm_key, "model": llm_model},
             "vision": {"model": vision},
         },
         "digest": {"enabled": True, "at": "01:00"},
     }
-    raw = {"instances": [ {"name": "main", **inst} ]} if multi else {**inst, **shared}
     _dump(raw, path)
     print(f"written: {path}\n下一步: muze daemon -c {path}", flush=True)
     return 0

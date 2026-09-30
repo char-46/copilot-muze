@@ -2,40 +2,70 @@
 
 All settings live in a single YAML file (see config.example.yaml). Secrets
 (api keys, access tokens) should not be committed; `config.yaml` is gitignored.
+
+Layout (breaking change since v0.1.0-alpha.27):
+
+    application-level: web / log / storage.data_dir / ingest / llm / digest
+    authority: [10000]                 # authorized controller QQ ids (global)
+    accounts:
+      milky:                           # one entry per protocol-side login
+        - name: main                   # optional display name
+          base_url: "http://127.0.0.1:3010"
+          access_token: ""
+          authority: []                # extra controllers for this account
+          digest: {enabled: false}     # optional per-account overrides
+      ob11: []                         # reserved, not implemented yet
+      lagrange: []                     # reserved, not implemented yet
+
+Top-level sections act as shared defaults; each account entry deep-merges its
+overrides over them. Per account, data dirs are derived automatically from
+the logged-in QQ number: <data_dir>/<uin>/{muze.db, media/}.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 
-class MilkyConfig(BaseModel):
+class MilkyEndpoint(BaseModel):
+    """Connection to one Milky-protocol side (LLBot / Lagrange.Milky)."""
+
     base_url: str = "http://127.0.0.1:8080"
     access_token: str = ""
     reconnect_interval: float = 5.0
     request_timeout: float = 30.0
 
 
-class StorageConfig(BaseModel):
-    data_dir: Path = Path("./data")
-    db_file: str = ""  # explicit sqlite path override; empty -> data_dir/muze.db
+class AccountsConfig(BaseModel):
+    """Account sources, grouped by protocol implementation.
 
-    @property
-    def media_dir(self) -> Path:
-        return self.data_dir / "media"
+    Only `milky` is wired up today; ob11/lagrange are reserved so configs
+    can be written ahead of the adapters.
+    """
+
+    milky: list[dict] = Field(default_factory=list)
+    ob11: list[dict] = Field(default_factory=list)
+    lagrange: list[dict] = Field(default_factory=list)
+
+
+class StorageConfig(BaseModel):
+    # root dir; per-account dirs are <data_dir>/<uin>/ (auto after login)
+    data_dir: Path = Path("./data")
 
     @property
     def logs_dir(self) -> Path:
         return self.data_dir / "logs"
 
-    @property
-    def db_path(self) -> Path:
-        return Path(self.db_file) if self.db_file else self.data_dir / "muze.db"
+    def account_dir(self, uin: int) -> Path:
+        """Per-account data dir (created): db + media live here."""
+        acct = self.data_dir / str(uin)
+        (acct / "media").mkdir(parents=True, exist_ok=True)
+        return acct
 
 
 class Watchlist(BaseModel):
@@ -61,7 +91,6 @@ class IngestConfig(BaseModel):
 
 
 class ControlConfig(BaseModel):
-    admin_users: list[int] = Field(default_factory=list)
     control_group: int = 0
     private_control: bool = True
     group_trigger: Literal["at_or_slash", "all"] = "at_or_slash"
@@ -89,22 +118,12 @@ class LLMConfig(BaseModel):
 
 
 class WebConfig(BaseModel):
+    """App-level webui: one web frontend serves every account in the process."""
+
     enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 8300
     token: str = ""  # empty -> generated at startup and logged
-
-
-class DigestConfig(BaseModel):
-    """Nightly "dream": summarize the day's messages into a stored report."""
-
-    enabled: bool = True
-    at: str = "23:30"  # local time, daily
-    window_hours: float = 24.0
-    top_conversations: int = 6
-    messages_per_conversation: int = 40
-    deliver: bool = True  # send the report to the control conversation
-    model_hint: str = ""  # optional override: use llm.chat as-is when empty
 
 
 class LogConfig(BaseModel):
@@ -137,7 +156,8 @@ class DigestConfig(BaseModel):
 
 
 class MuzeConfig(BaseModel):
-    milky: MilkyConfig = Field(default_factory=MilkyConfig)
+    accounts: AccountsConfig = Field(default_factory=AccountsConfig)
+    authority: list[int] = Field(default_factory=list)  # controller QQ ids
     storage: StorageConfig = Field(default_factory=StorageConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     control: ControlConfig = Field(default_factory=ControlConfig)
@@ -147,19 +167,8 @@ class MuzeConfig(BaseModel):
     digest: DigestConfig = Field(default_factory=DigestConfig)
 
 
-def load_config(path: str | Path) -> MuzeConfig:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(
-            f"config file not found: {p} (copy config.example.yaml to config.yaml first)"
-        )
-    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    cfg = _validate_config(raw, p)
-    if cfg.ingest.scope == "watchlist" and not (
-        cfg.ingest.watchlist.friends or cfg.ingest.watchlist.groups
-    ):
-        raise ValueError("ingest.scope=watchlist but watchlist is empty")
-    return cfg
+ENDPOINT_KEYS = tuple(MilkyEndpoint.model_fields)
+ACCOUNT_ENTRY_RESERVED = ("name", "authority", "web") + ENDPOINT_KEYS
 
 
 def _validate_config(raw: dict, p) -> MuzeConfig:
@@ -180,32 +189,23 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 @dataclass
-class InstanceSpec:
-    """One account stack: a name plus its fully-resolved MuzeConfig."""
+class AccountSpec:
+    """One account stack: display name, protocol endpoint, resolved config."""
 
     name: str
+    protocol: str  # "milky"
+    endpoint: MilkyEndpoint
     config: MuzeConfig
 
 
-def load_instances(path: str | Path) -> list[InstanceSpec]:
-    """Load one or many account instances from a config file.
+def load_accounts(path: str | Path) -> list[AccountSpec]:
+    """Resolve every configured account into a fully-merged AccountSpec.
 
-    Multi-account layout — top-level keys act as shared defaults, each
-    `instances[]` entry deep-merges over them (per-account milky / storage /
-    web / control ...)::
-
-        llm: {...}                    # shared
-        instances:
-          - name: main
-            milky: {base_url: "http://127.0.0.1:3010"}
-            storage: {data_dir: ./data-a}
-            web: {port: 8300}
-          - name: alt
-            milky: {base_url: "http://127.0.0.1:3011"}
-            storage: {db_file: ./data-b/alt.db, data_dir: ./data-b}
-            web: {port: 8301}
-
-    Without `instances` the file is a classic single-account config.
+    Top-level sections are shared defaults; each `accounts.milky[]` entry
+    deep-merges over them. Entry keys: endpoint fields (base_url,
+    access_token, ...), `name`, `authority` (extra controllers, unioned
+    with the global list) and any section override except `web` (the webui
+    is app-level, one frontend for all accounts).
     """
     p = Path(path)
     if not p.exists():
@@ -216,23 +216,62 @@ def load_instances(path: str | Path) -> list[InstanceSpec]:
     if not isinstance(raw, dict):
         raise ValueError(f"invalid config {p}: not a mapping")
 
-    entries = raw.get("instances")
-    if isinstance(entries, list) and entries:
-        base = {k: v for k, v in raw.items() if k != "instances"}
-        specs: list[InstanceSpec] = []
-        seen: set[str] = set()
-        for i, inst in enumerate(entries):
-            if not isinstance(inst, dict):
-                raise ValueError(f"instances[{i}] must be a mapping")
-            name = str(inst.get("name") or f"inst{i + 1}")
-            if name in seen:
-                raise ValueError(f"duplicate instance name: {name}")
-            seen.add(name)
-            merged = _deep_merge(base, inst)
-            specs.append(InstanceSpec(name, _validate_config(merged, p)))
-        return specs
+    if "milky" in raw or "instances" in raw:
+        raise ValueError(
+            "配置格式已变更（不兼容旧版）：顶层 milky:/instances: 已移除，"
+            "请改用 accounts.milky 列表，见 config.example.yaml"
+        )
 
-    return [InstanceSpec("main", _validate_config(raw, p))]
+    accounts = raw.get("accounts") or {}
+    if not isinstance(accounts, dict):
+        raise ValueError(f"invalid config {p}: accounts must be a mapping")
+    for proto in ("ob11", "lagrange"):
+        if accounts.get(proto):
+            raise ValueError(
+                f"accounts.{proto} 尚未支持（当前仅 milky），请从配置中移除或留空"
+            )
+    entries = accounts.get("milky")
+    if not entries:
+        raise ValueError(
+            f"invalid config {p}: accounts.milky 至少需要一项（base_url 指向协议端）"
+        )
+
+    base = {k: v for k, v in raw.items() if k != "accounts"}
+    global_authority = base.get("authority") or []
+
+    specs: list[AccountSpec] = []
+    seen: set[str] = set()
+    for i, ent in enumerate(entries):
+        if not isinstance(ent, dict):
+            raise ValueError(f"accounts.milky[{i}] must be a mapping")
+        ent = dict(ent)
+        name = str(ent.pop("name", "") or f"milky-{i + 1}")
+        if name in seen:
+            raise ValueError(f"duplicate account name: {name}")
+        seen.add(name)
+        if "web" in ent:
+            raise ValueError(
+                f"accounts.milky[{i}] ({name}): web 是应用级配置，不能按账号覆盖"
+            )
+        extra_authority = ent.pop("authority", None) or []
+        endpoint_kwargs = {k: ent.pop(k) for k in list(ent) if k in ENDPOINT_KEYS}
+
+        merged = _deep_merge(base, ent)
+        merged["authority"] = sorted(
+            {int(u) for u in global_authority} | {int(u) for u in extra_authority}
+        )
+        cfg = _validate_config(merged, p)
+        if cfg.ingest.scope == "watchlist" and not (
+            cfg.ingest.watchlist.friends or cfg.ingest.watchlist.groups
+        ):
+            raise ValueError("ingest.scope=watchlist but watchlist is empty")
+
+        try:
+            endpoint = MilkyEndpoint.model_validate(endpoint_kwargs)
+        except ValidationError as e:
+            raise ValueError(f"accounts.milky[{i}] ({name}) endpoint invalid:\n{e}") from e
+        specs.append(AccountSpec(name, "milky", endpoint, cfg))
+    return specs
 
 
 def describe_watch(cfg: MuzeConfig, scene: str, peer_id: int) -> bool:
@@ -252,5 +291,5 @@ def is_control_conversation(cfg: MuzeConfig, scene: str, peer_id: int) -> bool:
     if scene == "group":
         return bool(cfg.control.control_group) and peer_id == cfg.control.control_group
     if scene == "friend":
-        return cfg.control.private_control and peer_id in cfg.control.admin_users
+        return cfg.control.private_control and peer_id in cfg.authority
     return False

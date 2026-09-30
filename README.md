@@ -110,43 +110,49 @@ Semver with pre-release + build metadata (`0.1.0-alpha.13+build.g<sha>.<ts>`);
 every feature commit bumps the pre-release and is tagged. `muze version`,
 `/status`, and the WebUI show the full string.
 
-## Multiple accounts
+## Accounts & configuration layout
 
-Two supported layouts:
-
-**Single process, many accounts** (recommended) — an `instances:` list in one
-config; top-level keys are shared defaults, each entry deep-merges over them.
-Every account keeps its own database (owner-bound), media, webui port and
-schedules; the embedded console switches accounts with `/use <name>` and the
-CLI picks one with `-i <name>`:
+Config (v2, breaking since 0.1.0-alpha.27) groups protocol logins under
+`accounts`, one entry per login; multiple protocol implementations and
+multiple instances of the same implementation can be listed side by side
+(ob11 / lagrange are reserved slots, milky is wired up today):
 
 ```yaml
-llm: {chat: {base_url: "...", api_key: "...", model: glm-4.7}}
-instances:
-  - name: main
-    milky: {base_url: "http://127.0.0.1:3010"}
-    storage: {data_dir: ./data-a}
-    web: {port: 8300}
-  - name: alt
-    milky: {base_url: "http://127.0.0.1:3011"}
-    storage: {data_dir: ./data-b, db_file: ""}   # db_file overrides the sqlite path
-    web: {port: 8301}
+authority: [10000]          # global controller QQ ids (who may command)
+accounts:
+  milky:
+    - name: main
+      base_url: "http://127.0.0.1:3010"     # LLBot #1
+    - name: alt
+      base_url: "http://127.0.0.1:3011"     # LLBot #2 (another QQ)
+      authority: [20002]                    # extra controllers for this account
+      digest: {enabled: false}              # any section may be overridden per account
+  ob11: []                  # reserved
+  lagrange: []              # reserved
+storage: {data_dir: ./data}
+web: {port: 8300}           # app-level: ONE webui serves every account
 ```
 
-**Process per account** — separate config files, separate `muze daemon`s.
-
-Either way the database binds itself to the first account that opens it and
-**refuses to start (exit code 4) if a different account points at the same
-data dir**, so accounts can never silently mix. If any instance exits (or
-crashes) in multi-instance mode, all instances stop and the daemon restarts
-the whole process.
+- **Auto per-account data dirs**: each account gets `<data_dir>/<QQ号>/`
+  (muze.db + media/) derived from its logged-in uin — accounts never mix,
+  no per-account storage config needed.
+- **Top-level sections are shared defaults**; each account entry
+  deep-merges its overrides over them. `web` is application-level and
+  cannot be overridden per account.
+- **authority** is the controller list (formerly `control.admin_users`);
+  an account entry's `authority` unions the global one.
+- One process runs all accounts; any account exiting stops the others and
+  the daemon restarts the whole process. The console switches accounts
+  with `/use <name>`; `muze cli -i <name>` picks one directly.
+- The webui has an account selector (header) — every tab (chats, search,
+  AI, pending, settings, logs, status) operates on the selected account.
 
 ## Quick configuration
 
 ```bash
 uv run muze cfg init                    # interactive wizard → minimal config
 uv run muze cfg show                    # whole config (secrets masked)
-uv run muze cfg show llm.chat.model     # one dotted path
+uv run muze cfg show accounts.milky.0.base_url   # one dotted path
 uv run muze cfg set web.port 8301       # edit file (rewrites YAML, comments lost)
 ```
 
