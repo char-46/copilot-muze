@@ -257,7 +257,8 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
             }
         )
 
-    async def api_agent_reset(request: web.Request) -> web.Response:        service, _, _ = pick(request)
+    async def api_agent_reset(request: web.Request) -> web.Response:
+        service, _, _ = pick(request)
         if service.agent is not None:
             service.agent.reset("web:default")
         return web.json_response({"ok": True})

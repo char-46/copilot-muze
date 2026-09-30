@@ -2,7 +2,26 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
+
+
+def _exit_now(rc: int) -> None:
+    """Deterministic process exit.
+
+    Cleanup (DB, adapter, webui) has already run inside run_main; exiting via
+    os._exit guarantees no lingering non-daemon thread (console reader, http
+    helper) can wedge the process after a /restart — a wedged serve holds the
+    web port and the daemon can never relaunch.
+    """
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        logging.shutdown()
+    except Exception:
+        pass
+    os._exit(rc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,12 +43,14 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "daemon":
         from muze.daemon import run_daemon
 
-        return run_daemon(rest)
+        rc = run_daemon(rest)
+        _exit_now(rc)
 
     if cmd == "serve":
         from muze.main import run_main
 
-        return run_main(rest)
+        rc = run_main(rest)
+        _exit_now(rc)
 
     if cmd == "cli":
         from muze.cli.repl import run_cli
