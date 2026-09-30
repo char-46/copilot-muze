@@ -20,7 +20,7 @@ async def env(tmp_path):
     repo = Repository(conn)
     adapter = Recorder()
     cfg = MuzeConfig()
-    cfg.authority = [10001]
+    cfg.control.controller = [10001]
     cfg.storage.data_dir = tmp_path
     service = ControlService(cfg, adapter, repo, ChatLog(), Runtime())
     yield service, repo, adapter, tmp_path

@@ -6,13 +6,16 @@ All settings live in a single YAML file (see config.example.yaml). Secrets
 Layout (breaking change since v0.1.0-alpha.27):
 
     application-level: web / log / storage.data_dir / ingest / llm / digest
-    authority: [10000]                 # authorized controller QQ ids (global)
+    control:
+      controller: [10000]              # authorized controller QQ ids (who)
+      control_group: 0                 # group used as the control console (where)
+      private_control: true
     accounts:
       milky:                           # one entry per protocol-side login
         - name: main                   # optional display name
           base_url: "http://127.0.0.1:3010"
           access_token: ""
-          authority: []                # extra controllers for this account
+          controller: []               # extra controllers for this account
           digest: {enabled: false}     # optional per-account overrides
       ob11: []                         # reserved, not implemented yet
       lagrange: []                     # reserved, not implemented yet
@@ -94,7 +97,8 @@ class IngestConfig(BaseModel):
 
 
 class ControlConfig(BaseModel):
-    control_group: int = 0
+    controller: list[int] = Field(default_factory=list)  # authorized QQ ids (who)
+    control_group: int = 0  # control-console group (where); 0 = disabled
     private_control: bool = True
     confirm_timeout_min: float = 30.0
 
@@ -111,13 +115,14 @@ class LLMEndpoint(BaseModel):
 class LLMConfig(BaseModel):
     chat: LLMEndpoint = Field(default_factory=LLMEndpoint)
     vision: LLMEndpoint = Field(default_factory=LLMEndpoint)
-    agent_max_steps: int = 12
+    agent_max_steps: int = 48
     turn_timeout_sec: float = 300.0  # STALL cap: a tool round stuck this long
     # is aborted; there is no wall-clock cap on slow-but-progressing turns
     # how many turns may talk to the model at once (per account); extra turns
     # wait for a slot, and beyond max_queued_turns they are refused with 忙
     max_concurrent_turns: int = 4
     max_queued_turns: int = 8
+    auto_title: bool = True  # LLM-summarized session titles (/sess list)
     # in-turn progress feedback: "still waiting" heartbeats + tool call lines
     progress: bool = True
     progress_wait_sec: float = 20.0  # silence before the first heartbeat
@@ -181,7 +186,6 @@ class DigestConfig(BaseModel):
 
 class MuzeConfig(BaseModel):
     accounts: AccountsConfig = Field(default_factory=AccountsConfig)
-    authority: list[int] = Field(default_factory=list)  # controller QQ ids
     storage: StorageConfig = Field(default_factory=StorageConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     control: ControlConfig = Field(default_factory=ControlConfig)
@@ -193,7 +197,7 @@ class MuzeConfig(BaseModel):
 
 
 ENDPOINT_KEYS = tuple(MilkyEndpoint.model_fields)
-ACCOUNT_ENTRY_RESERVED = ("name", "authority", "web") + ENDPOINT_KEYS
+ACCOUNT_ENTRY_RESERVED = ("name", "controller", "web") + ENDPOINT_KEYS
 
 
 def _validate_config(raw: dict, p) -> MuzeConfig:
@@ -228,9 +232,9 @@ def load_accounts(path: str | Path) -> list[AccountSpec]:
 
     Top-level sections are shared defaults; each `accounts.milky[]` entry
     deep-merges over them. Entry keys: endpoint fields (base_url,
-    access_token, ...), `name`, `authority` (extra controllers, unioned
-    with the global list) and any section override except `web` (the webui
-    is app-level, one frontend for all accounts).
+    access_token, ...), `name`, `controller` (extra controllers, unioned
+    with the global `control.controller` list) and any section override
+    except `web` (the webui is app-level, one frontend for all accounts).
     """
     p = Path(path)
     if not p.exists():
@@ -262,7 +266,15 @@ def load_accounts(path: str | Path) -> list[AccountSpec]:
         )
 
     base = {k: v for k, v in raw.items() if k != "accounts"}
-    global_authority = base.get("authority") or []
+    base_control = dict(base.get("control") or {})
+    # controller ids: new control.controller, plus the legacy top-level
+    # `authority:` (dropped from the schema) — unioned for a soft migration.
+    global_controller = {
+        int(u)
+        for u in (base_control.get("controller") or [])
+    } | {int(u) for u in (base.pop("authority", None) or [])}
+    base_control["controller"] = sorted(global_controller)
+    base["control"] = base_control
 
     specs: list[AccountSpec] = []
     seen: set[str] = set()
@@ -278,12 +290,19 @@ def load_accounts(path: str | Path) -> list[AccountSpec]:
             raise ValueError(
                 f"accounts.milky[{i}] ({name}): web 是应用级配置，不能按账号覆盖"
             )
-        extra_authority = ent.pop("authority", None) or []
+        ent_control = dict(ent.get("control") or {})
+        extra_controller = {
+            int(u) for u in (ent.pop("controller", None) or [])
+        } | {int(u) for u in (ent.pop("authority", None) or [])}
+        extra_controller |= {int(u) for u in (ent_control.pop("controller", None) or [])}
+        if ent_control:
+            ent["control"] = ent_control
         endpoint_kwargs = {k: ent.pop(k) for k in list(ent) if k in ENDPOINT_KEYS}
 
         merged = _deep_merge(base, ent)
-        merged["authority"] = sorted(
-            {int(u) for u in global_authority} | {int(u) for u in extra_authority}
+        merged.setdefault("control", {})
+        merged["control"]["controller"] = sorted(
+            global_controller | extra_controller
         )
         cfg = _validate_config(merged, p)
         if cfg.ingest.scope == "watchlist" and not (
@@ -316,5 +335,5 @@ def is_control_conversation(cfg: MuzeConfig, scene: str, peer_id: int) -> bool:
     if scene == "group":
         return bool(cfg.control.control_group) and peer_id == cfg.control.control_group
     if scene == "friend":
-        return cfg.control.private_control and peer_id in cfg.authority
+        return cfg.control.private_control and peer_id in cfg.control.controller
     return False

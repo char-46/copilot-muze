@@ -43,6 +43,15 @@ def _brief(args: dict) -> str:
         s = str(args)
     return s[:160]
 
+
+def _up_to_last_user(messages: list[dict]) -> list[dict]:
+    """Truncate loop messages back to the last user turn — a clean point to
+    re-ask after a timeout/error (drops dangling assistant tool_calls)."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            return messages[: i + 1]
+    return []
+
 SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）上的个人 copilot 助手。
 控制者通过控制会话/界面与你对话，你可以借助工具查询和管理被控号的消息档案。
 
@@ -70,7 +79,7 @@ class Agent:
         repo: Repository,
         llm: LLMClient,
         chatlog: ChatLog,
-        max_steps: int = 8,
+        max_steps: int = 48,
     ) -> None:
         self.service = service
         self.repo = repo
@@ -158,43 +167,136 @@ class Agent:
                 self._slots.notify_all()
 
     # ------------------------------------------------------------- session
+    def _track(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def load_sessions(self) -> None:
+        """Restore persisted sessions so suspended/continued turns survive a
+        restart (called once at startup)."""
+        try:
+            rows = await self.repo.list_ai_sessions(limit=self.sessions.cap)
+        except Exception:
+            log.exception("loading persisted sessions failed")
+            return
+        for row in rows:
+            try:
+                self.sessions.add(Session.from_row(row))
+            except Exception:
+                log.exception("bad persisted session row %s", row.get("id"))
+        if rows:
+            log.info("restored %d AI session(s)", len(rows))
+
+    async def _persist(self, session: Session) -> None:
+        try:
+            await self.repo.upsert_ai_session(session.to_row())
+        except Exception:
+            log.exception("persist session %s failed", session.id)
+
+    async def get_session(self, sid: str) -> Session | None:
+        """Find a session in memory, falling back to the persisted table."""
+        s = self.sessions.get(sid)
+        if s is not None:
+            return s
+        try:
+            row = await self.repo.get_ai_session((sid or "").lstrip("#").strip())
+        except Exception:
+            log.exception("load session %s failed", sid)
+            return None
+        if row is None:
+            return None
+        s = Session.from_row(row)
+        self.sessions.add(s)
+        return s
+
     def submit(self, text: str, ctx: ControlContext) -> Session:
         """Fire-and-forget turn: register a session, run it in the background,
         deliver the result when it lands. The caller replies to the user with
         the session id immediately; several sessions in one conversation all
         run in parallel (up to the account's concurrency cap)."""
         session = self.sessions.create(ctx.chat_key, text)
-        task = asyncio.create_task(self._run_session(session, text, ctx))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._track(self._run_session(session, text, ctx))
         return session
 
     async def _run_session(self, session: Session, text: str, ctx: ControlContext) -> None:
         try:
-            async with self._turn_slot():
-                outcome = await self.converse(text, ctx, session=session)
-        except AgentBusy as e:
-            outcome = CommandOutcome(str(e), is_error=True)
+            outcome = await self.converse(text, ctx, session=session)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # safety net: converse already handles its own
             log.exception("agent session crashed")
+            await self._finalize(session)
             outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
-        session.finish(ok=not outcome.is_error, preview=outcome.text)
         if ctx.qq_reachable:
             prefix = f"#{session.id} "
             await self._notify(ctx, prefix + outcome.text, error=outcome.is_error)
 
     async def ask(self, text: str, ctx: ControlContext) -> CommandOutcome:
         """Synchronous variant for local fronts (webui / cli): same session
-        bookkeeping; converse guards the shared history itself, so parallel
-        turns never queue on the history — only on the account's model slots."""
+        bookkeeping and admission control as submit, returns the outcome."""
         session = self.sessions.create(ctx.chat_key, text)
+        return await self.converse(text, ctx, session=session)
+
+    def resume(self, session: Session, ctx: ControlContext, extra_text: str | None = None) -> None:
+        """Continue an existing session in the background (fire-and-forget):
+        `extra_text` None resumes a suspended/errored turn from where it
+        stopped; a message continues a finished session as a new turn."""
+        self._track(self._run_resume(session, ctx, extra_text))
+
+    async def _run_resume(
+        self, session: Session, ctx: ControlContext, extra_text: str | None
+    ) -> None:
         try:
-            async with self._turn_slot():
-                outcome = await self.converse(text, ctx, session=session)
+            outcome = await self._resume_inner(session, ctx, extra_text)
+        except asyncio.CancelledError:
+            raise
         except AgentBusy as e:
+            await self._finalize(session)
             outcome = CommandOutcome(str(e), is_error=True)
-        session.finish(ok=not outcome.is_error, preview=outcome.text)
-        return outcome
+        except Exception as e:
+            log.exception("agent resume crashed")
+            await self._finalize(session)
+            outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
+        if ctx.qq_reachable:
+            await self._notify(ctx, f"#{session.id} " + outcome.text, error=outcome.is_error)
+
+    async def _finalize(self, session: Session) -> None:
+        """Persist the final state and (optionally) refine the title via LLM."""
+        if session.status == "running":
+            session.finish(False, session.result_preview)
+        await self._persist(session)
+        if self._auto_title_enabled() and self.llm.configured:
+            self._track(self._auto_title(session))
+
+    def _auto_title_enabled(self) -> bool:
+        cfg = getattr(self.llm, "cfg", None)
+        return bool(cfg is not None and getattr(cfg, "auto_title", False))
+
+    async def _auto_title(self, session: Session) -> None:
+        """Summarize a short title (replaces the heuristic), best-effort."""
+        try:
+            seed = f"问：{session.prompt}\n答：{session.result_preview or '(未完成)'}"
+            msg = await self.llm.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "给这段对话起一个不超过 12 个汉字的简短标题，"
+                        "只输出标题本身，不要标点和引号。",
+                    },
+                    {"role": "user", "content": seed[:1500]},
+                ]
+            )
+            title = (msg.get("content") or "").strip().splitlines()[0].strip()
+            title = title.strip("。.「」“”\"' ")[:20]
+            if title and title != session.title:
+                session.title = title
+                await self._persist(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("auto title failed for #%s: %s", session.id, e)
 
     async def aclose(self) -> None:
         """Cancel any in-flight background turns (used on shutdown)."""
@@ -412,6 +514,8 @@ class Agent:
     async def converse(
         self, text: str, ctx: ControlContext, session: Session | None = None
     ) -> CommandOutcome:
+        """Run one FRESH turn (a new prompt) with admission control and full
+        session bookkeeping. Used by every front (QQ `::`, webui, cli)."""
         if not self.llm.configured:
             return CommandOutcome("LLM 未配置（llm.chat.*）", is_error=True)
         # the `::` control prefix must never reach the model: the QQ path
@@ -422,8 +526,31 @@ class Agent:
             text = strip_llm_prefix(text)
         if not text:
             return CommandOutcome.err("空输入")
+        if session is None:
+            session = self.sessions.create(ctx.chat_key, text)
+        session.status = "running"
+        session.messages = []
+        await self._persist(session)
+        try:
+            async with self._turn_slot():
+                outcome = await self._fresh_inner(session, text, ctx)
+        except AgentBusy as e:
+            session.finish(False, str(e))
+            outcome = CommandOutcome(str(e), is_error=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("agent turn failed")
+            session.finish(False, str(e))
+            outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
+        await self._finalize(session)
+        return outcome
+
+    async def _fresh_inner(
+        self, session: Session, text: str, ctx: ControlContext
+    ) -> CommandOutcome:
         # hold the conversation lock only to append this turn and snapshot the
-        # prior context — the LLM call itself runs lock-free, so multiple
+        # prior context — the LLM call itself runs lock-free, so several
         # sessions in the same conversation proceed in parallel.
         user_entry = {"role": "user", "content": text}
         async with self._lock(ctx.chat_key):
@@ -431,29 +558,91 @@ class Agent:
             history.append(user_entry)
             prior = list(history[:-1])
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "in", text)
-
-        runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         messages: list[dict] = [
             {"role": "system", "content": await self._system_prompt(ctx)},
             *prior[-MAX_HISTORY:],
-            {"role": "user", "content": text},
+            user_entry,
         ]
 
-        final_text = ""
-        stall = self._turn_timeout()
+        async def commit(final_text: str) -> None:
+            async with self._lock(ctx.chat_key):
+                self._commit(
+                    history, user_entry, {"role": "assistant", "content": final_text}
+                )
 
-        async def tool_loop() -> str:
-            for step in range(1, self.max_steps + 1):
-                if session is not None:
-                    session.new_round()
-                    session.event("llm", f"第{step}轮（调用模型）")
+        async def rollback() -> None:
+            async with self._lock(ctx.chat_key):
+                self._drop(history, user_entry)
+
+        return await self._drive(session, ctx, messages, 1, commit, rollback)
+
+    async def _resume_inner(
+        self, session: Session, ctx: ControlContext, extra_text: str | None
+    ) -> CommandOutcome:
+        """Continue a session: a suspended/errored turn resumes from its saved
+        messages; a finished session takes a new user message as a new turn."""
+        added: dict | None = None
+        if extra_text is not None:
+            added = {"role": "user", "content": extra_text}
+            session.messages = [*session.messages, added]
+            start = 1
+            self.chatlog.agent(
+                ctx.source, ctx.user_label or ctx.chat_key, "in", extra_text
+            )
+        else:
+            # resume from where it stopped, granting a fresh round budget
+            start = 1
+        session.status = "running"
+        await self._persist(session)
+        messages: list[dict] = [
+            {"role": "system", "content": await self._system_prompt(ctx)},
+            *session.messages,
+        ]
+
+        async def commit(final_text: str) -> None:
+            async with self._lock(ctx.chat_key):
+                hist = self._history(ctx.chat_key)
+                hist.append({"role": "assistant", "content": final_text})
+                if len(hist) > MAX_HISTORY:
+                    del hist[: len(hist) - MAX_HISTORY]
+
+        async def rollback() -> None:
+            if added is not None:
+                for i, m in enumerate(session.messages):
+                    if m is added:
+                        del session.messages[i]
+                        break
+
+        return await self._drive(session, ctx, messages, start, commit, rollback)
+
+    async def _drive(
+        self,
+        session: Session,
+        ctx: ControlContext,
+        messages: list[dict],
+        start_step: int,
+        commit,
+        rollback,
+    ) -> CommandOutcome:
+        """The tool-calling loop. `messages` is mutated in place and, at the
+        end, stored on the session (system stripped) so a suspended/error turn
+        can be resumed exactly where it stopped."""
+        runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
+        stall = self._turn_timeout()
+        final_text = ""
+
+        try:
+            for step in range(start_step, self.max_steps + 1):
+                session.new_round()
+                session.event("llm", f"第{step}轮（调用模型）")
                 msg = await self._chat(messages, ctx, session)
+                session.step = step
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
                     answer = (msg.get("content") or "").strip()
-                    if session is not None:
-                        session.event("llm", f"第{step}轮完成（{len(answer)} 字）")
-                    return answer
+                    session.event("llm", f"第{step}轮完成（{len(answer)} 字）")
+                    final_text = answer
+                    break
                 messages.append(msg)
                 calls = []
                 for call in tool_calls:
@@ -468,9 +657,8 @@ class Agent:
                     ctx.source, ctx.user_label or ctx.chat_key, "tool",
                     "; ".join(f"{n}({_brief(a)})" for _, n, a in calls),
                 )
-                if session is not None:
-                    for _cid, n, a in calls:
-                        session.event("tool", f"{n}({_brief(a)})")
+                for _cid, n, a in calls:
+                    session.event("tool", f"{n}({_brief(a)})")
                 if self._progress and ctx.qq_reachable:
                     names = "、".join(dict.fromkeys(n for _, n, _ in calls if n))
                     await self._notify(ctx, f"{self._tag(session)}🔧 {names}")
@@ -489,48 +677,48 @@ class Agent:
                     if isinstance(res, BaseException):
                         log.warning("tool %s raised: %s", name, res)
                         content = json.dumps({"error": str(res)}, ensure_ascii=False)
-                        if session is not None:
-                            session.event("tool_result", f"{name} → 异常: {res}")
+                        session.event("tool_result", f"{name} → 异常: {res}")
                     else:
                         content = _compact(str(res))
-                        if session is not None:
-                            session.event("tool_result", f"{name} → {str(res)[:120]}")
+                        session.event("tool_result", f"{name} → {str(res)[:120]}")
                     messages.append(
                         {"role": "tool", "tool_call_id": cid, "content": content}
                     )
-            return ""  # step limit exhausted
-
-        try:
-            final_text = await tool_loop()
-            if not final_text:
-                final_text = (
-                    "（已达工具调用步数上限，已用现有结果作答；"
-                    "如仍需更多步骤，请缩小范围或回复 ::继续）"
+            else:
+                # step limit reached: keep the loop state (messages end on a
+                # tool result) and SUSPEND so /sess go can continue.
+                session.suspend(messages[1:], f"第 {self.max_steps} 轮达上限")
+                return CommandOutcome(
+                    f"已达工具调用步数上限（{self.max_steps} 步），本轮已暂停；"
+                    f"回复 /sess go {session.id} 继续。"
                 )
         except TimeoutError:
             log.warning("agent turn aborted: tool round stalled for %.0fs", stall)
-            async with self._lock(ctx.chat_key):
-                self._drop(history, user_entry)  # retract the unfinished turn
-            if session is not None:
-                session.event("error", f"工具执行卡死（>{int(stall)}秒）")
+            await rollback()
+            session.messages = _up_to_last_user(messages[1:])
+            session.step = 0
+            session.finish(False, f"工具执行卡死（>{int(stall)}秒）")
             return CommandOutcome(
-                f"工具执行卡死（>{int(stall)}秒无进展），本轮已中止；请稍后重试。",
+                f"工具执行卡死（>{int(stall)}秒无进展），本轮已中止；"
+                f"可用 /sess go {session.id} 重试。",
                 is_error=True,
             )
         except asyncio.CancelledError:
-            async with self._lock(ctx.chat_key):
-                self._drop(history, user_entry)  # shutdown retracts in-flight turns
+            await rollback()
             raise
         except Exception as e:
             log.exception("agent loop failed")
-            async with self._lock(ctx.chat_key):
-                self._drop(history, user_entry)  # retract the failed turn
+            await rollback()
+            session.messages = _up_to_last_user(messages[1:])
+            session.step = 0
+            session.finish(False, str(e))
             return CommandOutcome(f"AI 调用失败: {e}", is_error=True)
 
         if not final_text:
             final_text = "(AI 未返回内容)"
-        async with self._lock(ctx.chat_key):
-            self._commit(history, user_entry, {"role": "assistant", "content": final_text})
+        session.messages = messages[1:]
+        session.finish(True, final_text)
+        await commit(final_text)
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "out", final_text)
         return CommandOutcome(final_text)
 

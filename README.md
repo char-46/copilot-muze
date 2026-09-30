@@ -140,9 +140,17 @@ Agent turns are asynchronous and session-tracked:
   coherent under concurrency. Model turns are admitted per account: up to
   `llm.max_concurrent_turns` run at once, `llm.max_queued_turns` more may
   wait, and beyond that a turn is refused with 忙 rather than piling up.
-- `/sess <id>` (or `/sess` to list) shows the full trace of a session:
-  prompt, every model round with received output size, every tool call and
-  its compact result, and the final status.
+- Sessions are **persisted** (SQLite `ai_sessions`): hitting the round limit
+  (`llm.agent_max_steps`, default 48) leaves the turn `suspend` with its loop
+  state saved; `error` turns keep a clean resume point. `/sess list` shows the
+  recent sessions with an auto title (heuristic immediately, refined by a cheap
+  LLM pass when `llm.auto_title` is on).
+- `/sess <id>` shows the full trace of a session: title, prompt, every model
+  round with received output size, every tool call and its compact result, and
+  the final status. `/sess go [id]` resumes a suspended/errored turn (omit the
+  id to resume **all** of them); `/sess <id> <消息>` continues a finished
+  session with a new message, keeping its context. Both survive a restart.
+  (The old `::继续` is now an alias for `/sess go`.)
 - While a turn runs the agent sends compact progress lines — `⏳ 模型输出中
   （已收 N 字）` when the model is streaming (or `⏳ 思考中…` while silent,
   re-pinged every `progress_interval_sec`) and `🔧 工具名` per tool round.
@@ -215,14 +223,16 @@ multiple instances of the same implementation can be listed side by side
 (ob11 / lagrange are reserved slots, milky is wired up today):
 
 ```yaml
-authority: [10000]          # global controller QQ ids (who may command)
+control:
+  controller: [10000]       # controller QQ ids (who may command)
+  control_group: 0          # group id used as the control room; 0 = disabled
 accounts:
   milky:
     - name: main
       base_url: "http://127.0.0.1:3010"     # LLBot #1
     - name: alt
       base_url: "http://127.0.0.1:3011"     # LLBot #2 (another QQ)
-      authority: [20002]                    # extra controllers for this account
+      controller: [20002]                   # extra controllers for this account
       digest: {enabled: false}              # any section may be overridden per account
   ob11: []                  # reserved
   lagrange: []              # reserved
@@ -236,8 +246,11 @@ web: {port: 8300}           # app-level: ONE webui serves every account
 - **Top-level sections are shared defaults**; each account entry
   deep-merges its overrides over them. `web` is application-level and
   cannot be overridden per account.
-- **authority** is the controller list (formerly `control.admin_users`);
-  an account entry's `authority` unions the global one.
+- **`control.controller`** is the controller list (who: formerly the
+  top-level `authority`, and before that `control.admin_users`); **`control.control_group`**
+  is the control room (where). An account entry's `controller` unions the global one.
+  The legacy top-level `authority` / per-account `authority` keys are still
+  accepted and folded in (soft migration).
 - One process runs all accounts; any account exiting stops the others and
   the daemon restarts the whole process. The console switches accounts
   with `/use <name>`; `muze cli -i <name>` picks one directly.

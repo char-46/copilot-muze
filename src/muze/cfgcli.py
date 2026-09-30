@@ -202,7 +202,7 @@ def _wizard(path: Path) -> int:
         token = _prompt(f"协议端#{i + 1} access_token（空=无）", "")
         endpoints.append({"base_url": base_url, "access_token": token})
 
-    admin = _prompt("控制者QQ号 authority（逗号分隔，必填）", "")
+    admin = _prompt("控制者QQ号 controller（逗号分隔，必填）", "")
     if not admin:
         print("控制者QQ号必填", file=sys.stderr)
         return 2
@@ -213,12 +213,12 @@ def _wizard(path: Path) -> int:
     vision = _prompt("视觉模型（空=禁用）", "")
     data_dir = _prompt("数据根目录（每账号自动 <dir>/<QQ号>/）", "./data")
 
-    authority = [int(x) for x in admin.replace("，", ",").split(",") if x.strip()]
+    controller = [int(x) for x in admin.replace("，", ",").split(",") if x.strip()]
     raw = {
-        "authority": authority,
         "accounts": {"milky": endpoints, "ob11": [], "lagrange": []},
         "storage": {"data_dir": data_dir},
         "control": {
+            "controller": controller,
             "control_group": int(group) if group.isdigit() else 0,
         },
         "llm": {

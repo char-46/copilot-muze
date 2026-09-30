@@ -13,7 +13,7 @@ def write_cfg(tmp_path, text):
 
 
 SINGLE = """
-authority: [10000]
+control: {controller: [10000]}
 accounts:
   milky:
     - base_url: "http://127.0.0.1:3010"
@@ -21,7 +21,7 @@ storage: {data_dir: ./d}
 """
 
 MULTI = """
-authority: [10000]
+control: {controller: [10000]}
 llm:
   chat: {base_url: "https://x", api_key: k, model: m}
 digest:
@@ -32,8 +32,17 @@ accounts:
       base_url: "http://127.0.0.1:3010"
     - name: alt
       base_url: "http://127.0.0.1:3011"
-      authority: [20002]
+      controller: [20002]
       digest: {enabled: true}
+"""
+
+LEGACY = """
+authority: [10000]
+accounts:
+  milky:
+    - base_url: "http://127.0.0.1:3010"
+    - base_url: "http://127.0.0.1:3011"
+      authority: [20002]
 """
 
 
@@ -44,7 +53,7 @@ def test_load_accounts_single(tmp_path):
     assert s.protocol == "milky"
     assert s.name == "milky-1"  # default name
     assert s.endpoint.base_url.endswith("3010")
-    assert s.config.authority == [10000]
+    assert s.config.control.controller == [10000]
 
 
 def test_load_accounts_multi_inherit_and_union(tmp_path):
@@ -56,12 +65,20 @@ def test_load_accounts_multi_inherit_and_union(tmp_path):
     # per-account override via deep-merge
     assert main.config.digest.enabled is False
     assert alt.config.digest.enabled is True
-    # authority: global list unions the entry's extra list
-    assert main.config.authority == [10000]
-    assert alt.config.authority == [10000, 20002]
+    # controller: global list unions the entry's extra list
+    assert main.config.control.controller == [10000]
+    assert alt.config.control.controller == [10000, 20002]
     # endpoints are separate objects
     assert main.endpoint is not alt.endpoint
     assert alt.endpoint.base_url.endswith("3011")
+
+
+def test_load_accounts_legacy_authority_still_works(tmp_path):
+    """The old top-level `authority:` and per-account `authority:` are folded
+    into control.controller (soft migration)."""
+    specs = load_accounts(write_cfg(tmp_path, LEGACY))
+    assert specs[0].config.control.controller == [10000]
+    assert specs[1].config.control.controller == [10000, 20002]
 
 
 def test_load_accounts_duplicate_name(tmp_path):
@@ -119,14 +136,14 @@ def test_account_dir_per_uin(tmp_path):
     assert other == storage.data_dir / "67890"
 
 
-def test_is_control_conversation_uses_authority():
+def test_is_control_conversation_uses_controller():
     from muze.config import MuzeConfig, is_control_conversation
 
-    cfg = MuzeConfig.model_validate({"authority": [10001]})
+    cfg = MuzeConfig.model_validate({"control": {"controller": [10001]}})
     assert is_control_conversation(cfg, "friend", 10001)
     assert not is_control_conversation(cfg, "friend", 10002)
     cfg2 = MuzeConfig.model_validate(
-        {"authority": [1], "control": {"control_group": 42}}
+        {"control": {"controller": [1], "control_group": 42}}
     )
     assert is_control_conversation(cfg2, "group", 42)
 

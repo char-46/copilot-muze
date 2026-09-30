@@ -213,6 +213,8 @@ class App:
     # ------------------------------------------------------------- events
     async def run(self, spawn_console: bool = True, console_registry=None) -> None:
         self._loop = asyncio.get_running_loop()
+        if getattr(self, "agent", None) is not None:
+            await self.agent.load_sessions()  # restore suspended/continued turns
         await self.backfiller.start_background()
         self._mt_task = asyncio.create_task(self._maintenance_loop())
         if os.environ.get("MUZE_SUPERVISOR_PID"):

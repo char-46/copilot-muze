@@ -296,6 +296,9 @@ class ControlService:
                 return CommandOutcome.err(
                     "未配置 LLM（llm.chat.base_url/api_key/model）；命令仍可用，/help 查看"
                 )
+            # legacy muscle-memory: `::继续` now means `/sess go`
+            if prompt in ("继续", "go", "接着"):
+                return await self.cmd_sess(["go"], ctx)
             return await self.agent.converse(prompt, ctx)
 
         return CommandOutcome.err("未响应：命令以 / 开头；发给 AI 的内容以 :: 开头（两个冒号）")
@@ -371,7 +374,7 @@ class ControlService:
         target = self.control_conversation()
         if target is None:
             return CommandOutcome.err(
-                "无控制会话（请配置 authority 或 control.control_group），已拒绝发送"
+                "无控制会话（请配置 control.controller 或 control.control_group），已拒绝发送"
             )
         ctrl_scene, ctrl_peer = target
         action_id = await self.repo.create_action(
@@ -434,8 +437,8 @@ class ControlService:
         """Where approvals / notifications for this account are delivered."""
         if self.cfg.control.control_group:
             return "group", self.cfg.control.control_group
-        if self.cfg.authority:
-            return "friend", self.cfg.authority[0]
+        if self.cfg.control.controller:
+            return "friend", self.cfg.control.controller[0]
         return None
 
     async def notify_controller(self, text: str) -> None:
@@ -984,24 +987,65 @@ class ControlService:
             "全量补拉已启动（后台执行）。进度将按第 1/2/3 分钟及每 5 分钟汇报，完成时总结"
         )
 
-    @slash("sess", "/sess [id]", "查询 AI 会话进度（完整思考/工具调用）；省略 id 列出最近")
+    @slash(
+        "sess",
+        "/sess [list|go [id]|<id> [消息]]",
+        "AI 会话：list 列表 / go [id] 继续暂停或出错的会话（省略 id = 全部）/"
+        "<id> 看详情 / <id> 消息 在完成后继续追问",
+    )
     async def cmd_sess(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.agent is None:
             return CommandOutcome.err("未配置 LLM")
         store = self.agent.sessions
-        if not args:
-            rows = store.recent(8)
+
+        if not args or args[0] in ("list", "ls"):
+            rows = store.latest(10)
             if not rows:
                 return CommandOutcome("暂无 AI 会话")
+            icon = {"running": "⏳", "done": "✔", "error": "✖", "suspend": "⏸"}
             lines = [
-                f"#{s.id} [{'运行中' if s.status == 'running' else '完成' if s.status == 'done' else '出错'}] "
-                f"{s.elapsed():.0f}s {s.prompt[:30]}"
-                for s in reversed(rows)
+                f"{icon.get(s.status, '?')} #{s.id} {s.title} "
+                f"[{s.chat_key}] {s.elapsed():.0f}s"
+                for s in rows
             ]
-            return CommandOutcome("\n".join(lines) + "\n/sess <id> 查看详情")
-        session = store.get(args[0])
+            return CommandOutcome(
+                "\n".join(lines)
+                + "\n/sess <id> 详情 · /sess go [id] 继续 · /sess <id> <消息> 追问"
+            )
+
+        sub = args[0]
+        if sub == "go":
+            if len(args) >= 2:
+                session = await self.agent.get_session(args[1])
+                if session is None:
+                    return CommandOutcome.err(f"会话 {args[1]} 不存在（/sess list 查看）")
+                if session.status == "running":
+                    return CommandOutcome.err(f"#{session.id} 正在运行，稍后再试")
+                self.agent.resume(session, ctx)
+                return CommandOutcome(
+                    f"已继续 #{session.id}（{session.title}），完成后回复"
+                )
+            pending = store.resumable()
+            if not pending:
+                return CommandOutcome("没有可继续的会话（暂停或出错的）")
+            for s in pending:
+                self.agent.resume(s, ctx)
+            ids = "、".join(f"#{s.id}" for s in pending)
+            return CommandOutcome(f"已继续 {len(pending)} 个会话：{ids}，完成后回复")
+
+        session = await self.agent.get_session(sub)
         if session is None:
-            return CommandOutcome.err(f"会话 {args[0]} 不存在（/sess 列出最近）")
+            return CommandOutcome.err(f"会话 {sub} 不存在（/sess list 查看）")
+        if len(args) >= 2:
+            msg = " ".join(args[1:]).strip()
+            if not msg:
+                return CommandOutcome.err("要继续的内容为空")
+            if session.status == "running":
+                return CommandOutcome.err(f"#{session.id} 正在运行，稍后再试")
+            self.agent.resume(session, ctx, extra_text=msg)
+            return CommandOutcome(
+                f"已继续 #{session.id}（{session.title}），完成后回复"
+            )
         return CommandOutcome(session.render())
 
     @slash("pending", "/pending", "待确认的代发列表")
@@ -1299,9 +1343,9 @@ class ControlService:
         """Is this sender allowed in this conversation?"""
         cfg = self.cfg.control
         if scene == "friend":
-            return cfg.private_control and sender_id in self.cfg.authority
+            return cfg.private_control and sender_id in cfg.controller
         if scene == "group":
-            return bool(cfg.control_group) and peer_id == cfg.control_group and sender_id in self.cfg.authority
+            return bool(cfg.control_group) and peer_id == cfg.control_group and sender_id in cfg.controller
         return False
 
     def qq_should_trigger(
@@ -1320,7 +1364,7 @@ class ControlService:
           is archived but never answered.
         - Self-sent messages (this account talking from another client)
           never trigger — EXCEPT a true self-chat (peer == self). So when
-          the controller IS one of the bots (authority contains self_id),
+          the controller IS one of the bots (controller contains self_id),
           the message it sends to another bot is answered by the receiving
           bot alone instead of both.
         - In groups with several bots present: @me -> only I answer;

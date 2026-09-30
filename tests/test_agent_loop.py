@@ -252,7 +252,7 @@ async def test_converse_sends_tool_call_lines(env, monkeypatch):
     assert out.text == "done"
     lines = _sent_texts(service)
     # one compact line for the round, duplicate tool names collapsed
-    assert any(l.startswith("🔧") and l.count("search_archive") == 1 for l in lines)
+    assert any("🔧" in l and l.count("search_archive") == 1 for l in lines)
     # tool lines never enter the conversation history
     assert not any(m.get("role") == "assistant" and str(m.get("content", "")).startswith("🔧")
                    for m in llm.last_messages)
@@ -521,3 +521,115 @@ async def test_aclose_cancels_inflight_session(env):
     await agent.aclose()
     await asyncio.sleep(0.05)
     assert agent._histories.get("qq:friend:1", []) == []
+
+
+# ------------------------------------------------- persistent sessions
+def _tool_call(n: int) -> dict:
+    return {
+        "role": "assistant",
+        "tool_calls": [{"id": str(n), "function": {"name": "cli", "arguments": "{}"}}],
+    }
+
+
+async def test_step_limit_suspends_and_sess_go_resumes(env, monkeypatch):
+    service, repo = env
+
+    class FakeRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            return "{}"
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", FakeRunner)
+    llm = ScriptLLM([_tool_call(1), _tool_call(2), {"role": "assistant", "content": "完成"}])
+    agent = Agent(service, repo, llm, ChatLog(), 2)  # 2 rounds per run
+    service.agent = agent
+    c = _qq_ctx()
+
+    session = agent.sessions.create(c.chat_key, "多步任务")
+    out = await agent.converse("多步任务", c, session=session)
+    assert session.status == "suspend"
+    assert "/sess go" in out.text and "::继续" not in out.text
+    assert session.messages  # loop state kept for resume
+
+    res = await service.run_command(f"sess go {session.id}", c)
+    assert "已继续" in res.text
+    await asyncio.sleep(0.1)
+    assert session.status == "done" and session.result_preview == "完成"
+
+
+async def test_sessions_survive_restart_and_resume(env, monkeypatch):
+    service, repo = env
+
+    class FakeRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            return "{}"
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", FakeRunner)
+    a1 = Agent(service, repo, ScriptLLM([_tool_call(1)]), ChatLog(), 1)
+    s = a1.sessions.create("qq:friend:1", "持久任务")
+    await a1.converse("持久任务", _qq_ctx(), session=s)
+    assert s.status == "suspend"
+    sid = s.id
+
+    # "restart": a fresh agent restores sessions from the DB
+    a2 = Agent(service, repo, ScriptLLM([{"role": "assistant", "content": "续上"}]), ChatLog(), 1)
+    await a2.load_sessions()
+    restored = a2.sessions.get(sid)
+    assert restored is not None and restored.status == "suspend"
+    assert restored.messages  # saved loop state survived the restart
+
+    a2.resume(restored, _qq_ctx())
+    await asyncio.sleep(0.1)
+    assert restored.status == "done" and restored.result_preview == "续上"
+
+
+async def test_sess_id_message_continues_done_session(env):
+    service, repo = env
+    seen: list[list[str]] = []
+
+    class RecLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            seen.append([m["content"] for m in messages if m["role"] == "user"])
+            return {"role": "assistant", "content": f"答{len(seen)}"}
+
+    agent = Agent(service, repo, RecLLM(), ChatLog(), 4)
+    service.agent = agent
+    c = _qq_ctx()
+    session = agent.sessions.create(c.chat_key, "第一个问题")
+    await agent.converse("第一个问题", c, session=session)
+    assert session.status == "done"
+
+    res = await service.run_command(f"sess {session.id} 第二个问题", c)
+    assert "已继续" in res.text
+    await asyncio.sleep(0.1)
+    assert session.status == "done"
+    assert seen[-1] == ["第一个问题", "第二个问题"]  # context carried over
+
+
+async def test_sess_list_shows_title_and_detail(env):
+    service, repo = env
+    agent = Agent(service, repo, ScriptLLM([]), ChatLog(), 4)
+    service.agent = agent
+    s = agent.sessions.create("qq:friend:1", "帮我总结一下昨天的群聊记录")
+    c = _qq_ctx()
+
+    listing = await service.run_command("sess list", c)
+    assert s.id in listing.text and "帮我总结" in listing.text
+    detail = await service.run_command(f"sess {s.id}", c)
+    assert "标题:" in detail.text and "帮我总结" in detail.text
+
+
+def test_default_max_steps_and_heuristic_title():
+    from muze.ai.sessions import heuristic_title
+    from muze.config import LLMConfig
+
+    assert LLMConfig().agent_max_steps == 48
+    assert heuristic_title("第一行\n第二行") == "第一行"
+    assert heuristic_title("   ") == "(无标题)"

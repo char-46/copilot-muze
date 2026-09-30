@@ -3,7 +3,7 @@
 #
 # Layout:
 #   application-level : web / log / storage.data_dir / ingest / llm / digest
-#   authority         : global list of controller QQ ids (who may command)
+#   control           : who may command (controller) and where (control_group)
 #   accounts          : protocol sources, one entry per login. Data dirs are
 #                       derived automatically per QQ number: <data_dir>/<uin>/
 #                       (muze.db), so accounts never mix; media bytes live in
@@ -13,14 +13,11 @@
 # its overrides over them (e.g. its own digest/control/llm), except `web`
 # which is app-level only.
 #
-# Command / LLM isolation (how the authority talks to the copilot):
+# Command / LLM isolation (how the controller talks to the copilot):
 #   /command   -> command (group: @bot or bare — bare answered by the
 #                primary bot only, so N bots in one group never all reply)
 #   ::message  -> sent to the LLM (two colons, half/full width both work)
 #   other text -> archived only, never answered
-
-authority:
-  - 10000                     # controller QQ uins allowed to command the copilot
 
 accounts:
   milky:                      # LLBot / Lagrange.Milky serving the Milky protocol
@@ -29,7 +26,7 @@ accounts:
       access_token: ""
       reconnect_interval: 5   # seconds between WS reconnect attempts
       request_timeout: 30     # seconds for HTTP API calls
-      # authority: [10001]    # extra controllers for this account (unions global)
+      # controller: [10001]   # extra controllers for this account (unions global)
       # digest: {enabled: false}   # example per-account override
     # - name: alt             # second account in the same process
     #   base_url: http://127.0.0.1:8081
@@ -60,8 +57,9 @@ ingest:
   media_transcode_silk: true  # decode SILK voice to a playable .wav (raw .silk kept too)
 
 control:
-  control_group: 0            # group id used as control room; 0 = disabled
-  private_control: true       # authority may command via private chat
+  controller: [10000]         # controller QQ uins allowed to command the copilot (who)
+  control_group: 0            # group id used as control room; 0 = disabled (where)
+  private_control: true       # controller may command via private chat
   confirm_timeout_min: 30     # pending approvals expire after this
                               # (writes outside the control session are always
                               #  routed to the controller for approval)
@@ -79,10 +77,11 @@ llm:
     base_url: ""              # empty -> reuse chat.base_url / chat.api_key
     api_key: ""
     model: ""                 # e.g. glm-4v-plus
-  agent_max_steps: 12        # tool-calling rounds per request (raised from 8); tools run in parallel within a round
+  agent_max_steps: 48        # tool-calling rounds per run; hitting it SUSPENDS the turn (resume with /sess go)
   turn_timeout_sec: 300      # STALL cap: a tool round stuck this long is aborted (slow-but-progressing turns are never cut)
   max_concurrent_turns: 4    # turns talking to the model at once (per account); a chat can hold several :: sessions
   max_queued_turns: 8        # extra turns allowed to wait for a slot; beyond this the turn is refused with 忙
+  auto_title: true           # summarize a short title per session for /sess list (one cheap extra LLM call)
   progress: true             # in-turn feedback: "still waiting" heartbeats + tool-call lines
   progress_wait_sec: 20      # silence before the first heartbeat (fast answers send nothing)
   progress_interval_sec: 60  # between subsequent heartbeats

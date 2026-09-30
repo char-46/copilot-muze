@@ -130,7 +130,8 @@ async def test_dream_night_first_run(repo):
     text = await dream_night(repo, llm, MuzeConfig(), ChatLog())
     assert "补做 1 天" in text
     rows = await repo.list_digests()
-    assert len(rows) == 1
+    # one day digest; a month/week rollup may also appear around period bounds
+    assert len([r for r in rows if r["period"] == "day"]) == 1
 
 
 async def test_memory_crud_and_retire(repo):

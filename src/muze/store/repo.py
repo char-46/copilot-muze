@@ -730,6 +730,58 @@ class Repository:
         await self.conn.commit()
         return cur.rowcount > 0
 
+    # --------------------------------------------------------- ai sessions
+    async def upsert_ai_session(self, row: dict) -> None:
+        """Insert or replace one agent session (id-keyed)."""
+        await self.conn.execute(
+            """
+            INSERT INTO ai_sessions
+                (id, chat_key, prompt, title, status, step, created, updated,
+                 result_preview, messages_json, events_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                chat_key=excluded.chat_key, prompt=excluded.prompt,
+                title=excluded.title, status=excluded.status, step=excluded.step,
+                created=excluded.created, updated=excluded.updated,
+                result_preview=excluded.result_preview,
+                messages_json=excluded.messages_json,
+                events_json=excluded.events_json
+            """,
+            (
+                row["id"], row["chat_key"], row["prompt"], row.get("title", ""),
+                row.get("status", "running"), int(row.get("step", 0)),
+                float(row["created"]), float(row["updated"]),
+                row.get("result_preview", ""),
+                row.get("messages_json", "[]"), row.get("events_json", "[]"),
+            ),
+        )
+        await self.conn.commit()
+
+    async def get_ai_session(self, sid: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT * FROM ai_sessions WHERE id=?", (sid,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_ai_sessions(
+        self, limit: int = 50, chat_key: str | None = None
+    ) -> list[dict]:
+        sql = "SELECT * FROM ai_sessions"
+        args: list = []
+        if chat_key:
+            sql += " WHERE chat_key=?"
+            args.append(chat_key)
+        sql += " ORDER BY updated DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def delete_ai_session(self, sid: str) -> None:
+        await self.conn.execute("DELETE FROM ai_sessions WHERE id=?", (sid,))
+        await self.conn.commit()
+
     # ---------------------------------------------------------------- stats
     async def stats(self) -> dict:
         out: dict[str, Any] = {}

@@ -129,6 +129,22 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_memories_subject ON memories (subject, active);
+
+CREATE TABLE IF NOT EXISTS ai_sessions (
+    id            TEXT PRIMARY KEY,           -- short hex id (#a1b2c3)
+    chat_key      TEXT NOT NULL,              -- control conversation it belongs to
+    prompt        TEXT NOT NULL,
+    title         TEXT NOT NULL DEFAULT '',   -- auto/LLM title for /sess list
+    status        TEXT NOT NULL DEFAULT 'running',  -- running|done|error|suspend
+    step          INTEGER NOT NULL DEFAULT 0, -- model rounds completed (resume)
+    created       REAL NOT NULL,              -- wall clock
+    updated       REAL NOT NULL,
+    result_preview TEXT NOT NULL DEFAULT '',
+    messages_json TEXT NOT NULL DEFAULT '[]', -- tool-loop messages, system stripped
+    events_json   TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_chat ON ai_sessions (chat_key, updated);
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_status ON ai_sessions (status, updated);
 """
 
 
@@ -208,6 +224,34 @@ async def _migrate_v9_bf_since(conn: aiosqlite.Connection) -> None:
         await conn.commit()
 
 
+async def _migrate_v10_ai_sessions(conn: aiosqlite.Connection) -> None:
+    """v10: agent sessions are persisted (survive restart / resumable)."""
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_sessions (
+            id            TEXT PRIMARY KEY,
+            chat_key      TEXT NOT NULL,
+            prompt        TEXT NOT NULL,
+            title         TEXT NOT NULL DEFAULT '',
+            status        TEXT NOT NULL DEFAULT 'running',
+            step          INTEGER NOT NULL DEFAULT 0,
+            created       REAL NOT NULL,
+            updated       REAL NOT NULL,
+            result_preview TEXT NOT NULL DEFAULT '',
+            messages_json TEXT NOT NULL DEFAULT '[]',
+            events_json   TEXT NOT NULL DEFAULT '[]'
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_sessions_chat ON ai_sessions (chat_key, updated)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_sessions_status ON ai_sessions (status, updated)"
+    )
+    await conn.commit()
+
+
 async def migrate(conn: aiosqlite.Connection) -> None:
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'") as cur:
         has_meta = await cur.fetchone()
@@ -215,9 +259,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.executescript(SCHEMA_V1)
         await _migrate_v8_bf_watermarks(conn)
         await _migrate_v9_bf_since(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '9')")
+        await _migrate_v10_ai_sessions(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '10')")
         await conn.commit()
-        log.info("database created (schema v9)")
+        log.info("database created (schema v10)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -242,3 +287,9 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '9')")
         await conn.commit()
         log.info("database migrated to schema v9 (time-bounded backfill)")
+        version = 9
+    if version < 10:
+        await _migrate_v10_ai_sessions(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '10')")
+        await conn.commit()
+        log.info("database migrated to schema v10 (persistent agent sessions)")

@@ -64,7 +64,7 @@ class Backfiller:
         cfg = self.cfg
         if cfg.control.control_group:
             add("group", cfg.control.control_group)
-        for u in cfg.authority:
+        for u in cfg.control.controller:
             add("friend", u)
 
         if cfg.ingest.scope == "all":
@@ -417,7 +417,7 @@ class Backfiller:
         cfg = self.cfg
         if cfg.control.control_group:
             targets.append(("group", cfg.control.control_group))
-        for u in cfg.authority:
+        for u in cfg.control.controller:
             targets.append(("friend", u))
         return list(dict.fromkeys(targets))
 

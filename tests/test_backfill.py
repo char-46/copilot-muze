@@ -331,7 +331,7 @@ async def test_bf_only_row_hidden_from_lists(repo):
     assert await repo.pending_bf_conversations() == []
 
 
-async def test_migration_v7_to_v9_adds_columns(tmp_path):
+async def test_migration_v7_to_v10_adds_columns(tmp_path):
     import aiosqlite
 
     path = str(tmp_path / "old.db")
@@ -357,8 +357,12 @@ async def test_migration_v7_to_v9_adds_columns(tmp_path):
     assert {
         "bf_cursor_seq", "bf_target_seq", "bf_since_ts", "bf_last_run_at", "last_op_at",
     } <= cols
+    async with conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ai_sessions'"
+    ) as cur:
+        assert await cur.fetchone()  # v10 created the persistent session table
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
-        assert (await cur.fetchone())[0] == "9"
+        assert (await cur.fetchone())[0] == "10"
     await conn.close()
 
 
