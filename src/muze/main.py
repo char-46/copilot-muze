@@ -102,7 +102,10 @@ class App:
             )
 
         self.blobstore = BlobStore(cfg.storage.data_dir / "blobs")
-        self.media = MediaStore(self.blobstore, self.adapter, self.repo)
+        self.media = MediaStore(
+            self.blobstore, self.adapter, self.repo,
+            transcode_silk=cfg.ingest.media_transcode_silk,
+        )
         self.pipeline = IngestPipeline(
             self.adapter, self.repo, self.media, cfg, self.chatlog, login.user_id
         )

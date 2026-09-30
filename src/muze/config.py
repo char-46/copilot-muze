@@ -90,6 +90,7 @@ class IngestConfig(BaseModel):
     watchlist: Watchlist = Field(default_factory=Watchlist)
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
     media_download_concurrency: int = 3
+    media_transcode_silk: bool = True
 
 
 class ControlConfig(BaseModel):

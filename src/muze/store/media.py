@@ -27,6 +27,7 @@ from muze.provider.milky.models import (
 )
 from muze.store.blobs import BlobStore, dedup_key
 from muze.store.repo import Repository
+from muze.store.sniff import sniff_ext
 
 log = logging.getLogger("muze.media")
 
@@ -61,10 +62,17 @@ def to_file_uri(path: Path | str) -> str:
 
 
 class MediaStore:
-    def __init__(self, blobs: BlobStore, adapter: ProtocolAdapter, repo: Repository) -> None:
+    def __init__(
+        self,
+        blobs: BlobStore,
+        adapter: ProtocolAdapter,
+        repo: Repository,
+        transcode_silk: bool = True,
+    ) -> None:
         self.blobs = blobs
         self.adapter = adapter
         self.repo = repo
+        self.transcode_silk = transcode_silk
 
     # ------------------------------------------------------------- planning
     @staticmethod
@@ -222,6 +230,10 @@ class MediaStore:
             log.warning("MEDIA dl-fail #%s %s: %s", mid, url[:120], e)
             return {**row, "status": "failed", "error": str(e)[:300]}
 
+        # SILK voice: keep the raw clip but expose a playable WAV as the blob
+        # consumers download / feed to the agent.
+        dest, content_hash, size = await self._maybe_transcode_silk(dest, content_hash, size, row)
+
         key = dedup_key(row)
         if key:
             await self.blobs.record(key, content_hash, str(dest), size, row["kind"])
@@ -234,13 +246,68 @@ class MediaStore:
         return {**row, "status": "done", "file_path": str(dest), "file_size": size,
                 "content_hash": content_hash}
 
-    def _ext_for(self, row: dict, url: str) -> str:
-        if row.get("file_name") and _EXT_RE.search(row["file_name"]):
-            return _EXT_RE.search(row["file_name"]).group(0).lower()
+    def _ext_for(self, row: dict, url: str, head: bytes = b"") -> str:
+        name_ext = ""
+        if row.get("file_name"):
+            m = _EXT_RE.search(row["file_name"])
+            if m:
+                name_ext = m.group(0).lower()
+        sniffed = sniff_ext(head)
+        # a file's own name wins (docx/zip share magic), otherwise trust bytes
+        if row.get("kind") == "file" and name_ext:
+            return name_ext
+        if sniffed:
+            return sniffed
+        if name_ext:
+            return name_ext
         path_ext = Path(urlparse(url).path).suffix
         if path_ext and _EXT_RE.search(path_ext):
             return path_ext.lower()
         return _EXT_BY_KIND.get(row["kind"], ".bin")
+
+    async def _maybe_transcode_silk(
+        self, dest: Path, content_hash: str, size: int, row: dict
+    ) -> tuple[Path, str, int]:
+        """Decode a stored SILK clip into a playable WAV.
+
+        The raw SILK blob is kept (recorded under its content hash); the WAV
+        becomes the row's primary file so the webui/agent get something that
+        plays anywhere. Falls back to the original on any failure.
+        """
+        if (
+            row.get("kind") != "record"
+            or not self.transcode_silk
+            or dest.suffix.lower() != ".silk"
+        ):
+            return dest, content_hash, size
+        try:
+            import pilk  # pure-python silk codec (optional dependency)
+        except Exception:
+            log.info("MEDIA silk transcode skipped: pilk unavailable (%s)", dest.name)
+            return dest, content_hash, size
+
+        wav_tmp = self.blobs.tmp_path().with_suffix(".wav")
+        try:
+            await asyncio.to_thread(pilk.silk_to_wav, str(dest), str(wav_tmp), 24000)
+            data = wav_tmp.read_bytes()
+        except Exception as e:
+            log.warning("MEDIA silk transcode failed (%s); keeping %s", e, dest.name)
+            try:
+                wav_tmp.unlink()
+            except OSError:
+                pass
+            return dest, content_hash, size
+
+        wav_hash = hashlib.sha256(data).hexdigest()
+        wav_dest = self.blobs.blob_path("record", wav_hash, ".wav")
+        if wav_dest.exists():
+            wav_tmp.unlink()
+        else:
+            wav_tmp.replace(wav_dest)
+        # preserve the original silk clip in the shared blob store
+        await self.blobs.record(f"sha:{content_hash}", content_hash, str(dest), size, "record")
+        log.info("MEDIA silk->wav %s -> %s (%s bytes)", dest.name, wav_dest.name, len(data))
+        return wav_dest, wav_hash, len(data)
 
     async def _fetch_into_blob(self, url: str, row: dict) -> tuple[str, int, Path]:
         """Stream the url into a tmp file while hashing, then move it to its
@@ -259,8 +326,10 @@ class MediaStore:
                     fh.write(chunk)
                     hasher.update(chunk)
                     total += len(chunk)
+        with open(tmp, "rb") as fh:
+            head = fh.read(512)
         content_hash = hasher.hexdigest()
-        dest = self.blobs.blob_path(row["kind"], content_hash, self._ext_for(row, url))
+        dest = self.blobs.blob_path(row["kind"], content_hash, self._ext_for(row, url, head))
         if dest.exists():
             tmp.unlink()  # identical content already stored
             log.info("MEDIA blob-hit %s (disk copy kept)", dest.name)

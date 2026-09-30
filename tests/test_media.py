@@ -5,11 +5,12 @@ from pathlib import Path
 import pytest
 
 from muze.chatlog import plain_text
-from muze.provider.milky.models import ImageSeg, LightAppSeg, MarketFaceSeg, TextSeg
+from muze.provider.milky.models import ImageSeg, LightAppSeg, MarketFaceSeg, RecordSeg, TextSeg
 from muze.store.blobs import BlobStore
 from muze.store.db import open_db
 from muze.store.media import MediaStore
 from muze.store.repo import Repository
+from muze.store.sniff import sniff_container, sniff_ext
 
 PAYLOAD = b"sticker-bytes-123"
 
@@ -200,4 +201,74 @@ async def test_retire_gone_media_retires_historical_failures(tmp_path):
     assert row["status"] == "gone"
     # idempotent: nothing left to retire
     assert await repo.retire_gone_media() == 0
+    await close(store)
+
+
+# --------------------------------------------------------------- sniffing
+def test_sniff_container_and_ext():
+    assert sniff_container(b"#!SILK_V3\x0c\x00") == "silk"
+    assert sniff_container(b"\x02#!SILK_V3\x00") == "silk"  # Tencent prefix
+    assert sniff_container(b"#!AMR\n...") == "amr"
+    assert sniff_container(b"ID3\x04\x00") == "mp3"
+    assert sniff_container(b"\xff\xfb\x90\x00") == "mp3"
+    assert sniff_container(b"OggS\x00\x02") == "ogg"
+    assert sniff_container(b"RIFF\x00\x00\x00\x00WAVE") == "wav"
+    assert sniff_container(b"\x89PNG\r\n\x1a\n") == "png"
+    assert sniff_container(b"\xff\xd8\xff\xe0") == "jpg"
+    assert sniff_container(b"GIF89a") == "gif"
+    assert sniff_container(b"\x00\x00\x00\x18ftypmp42") == "m4a"
+    assert sniff_container(b"%PDF-1.7") == "pdf"
+    assert sniff_container(b"PK\x03\x04") == "zip"
+    assert sniff_container(b"not media at all") is None
+    assert sniff_ext(b"#!SILK_V3") == ".silk"
+    assert sniff_ext(b"\xff\xd8\xff") == ".jpg"
+    assert sniff_ext(b"plain text") is None
+
+
+def test_ext_priority_file_name_wins_for_files(tmp_path):
+    store = MediaStore(BlobStore(tmp_path / "blobs"), FakeAdapter(), None)
+    # a docx is really a zip: the user-facing name must win for kind=file
+    row = {"kind": "file", "file_name": "report.docx"}
+    assert store._ext_for(row, "http://x/y", b"PK\x03\x04") == ".docx"
+    # an image named .jpg but actually PNG: bytes win
+    row = {"kind": "image", "file_name": "photo.jpg"}
+    assert store._ext_for(row, "http://x/y", b"\x89PNG\r\n\x1a\n") == ".png"
+    # nothing known: fall back to the kind default
+    row = {"kind": "record", "file_name": ""}
+    assert store._ext_for(row, "http://x/y", b"random") == ".amr"
+
+
+async def test_voice_silk_stored_as_playable_wav(tmp_path):
+    pilk = pytest.importorskip("pilk")
+    # build a tiny (silent) SILK clip the way the protocol side would deliver it
+    pcm = (b"\x00\x00") * 4800  # 0.2s @ 24kHz mono s16
+    (tmp_path / "t.pcm").write_bytes(pcm)
+    pilk.encode(str(tmp_path / "t.pcm"), str(tmp_path / "t.silk"), pcm_rate=24000)
+    silk_bytes = (tmp_path / "t.silk").read_bytes()
+    assert silk_bytes[:9] == b"#!SILK_V3"
+
+    store, repo, adapter = await make_store(tmp_path, data=silk_bytes)
+    rec = RecordSeg(resource_id="v1", duration=1)
+    mid = await store.register("friend", 5, 1, 0, rec)
+    row = await repo.media_by_id(mid)
+    upd = await store.download_row(row, prefer_url="http://fake/v1")
+
+    assert upd["status"] == "done"
+    playable = Path(upd["file_path"])
+    assert playable.suffix == ".wav" and playable.exists()
+    assert playable.read_bytes()[:4] == b"RIFF"  # real WAV container
+    # the original silk is preserved alongside the playable wav
+    silk_files = list((tmp_path / "blobs" / "record").rglob("*.silk"))
+    assert len(silk_files) == 1
+    await close(store)
+
+
+async def test_voice_amr_stays_amr(tmp_path):
+    store, repo, adapter = await make_store(tmp_path, data=b"#!AMR\n\x00\x01\x02")
+    rec = RecordSeg(resource_id="a1", duration=2)
+    mid = await store.register("friend", 6, 1, 0, rec)
+    row = await repo.media_by_id(mid)
+    upd = await store.download_row(row, prefer_url="http://fake/a1")
+    assert upd["status"] == "done"
+    assert Path(upd["file_path"]).suffix == ".amr"
     await close(store)

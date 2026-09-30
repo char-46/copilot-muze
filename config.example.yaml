@@ -57,6 +57,7 @@ ingest:
     rescan_interval_min: 30   # periodic rescan (catches self-sent + missed events); 0 = off
     rescan_active_window_h: 24  # rescan only conversations active within this window
   media_download_concurrency: 3
+  media_transcode_silk: true  # decode SILK voice to a playable .wav (raw .silk kept too)
 
 control:
   control_group: 0            # group id used as control room; 0 = disabled

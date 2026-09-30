@@ -41,7 +41,9 @@ actually supports and degrades lazily.
   copilot was offline — including already-read and self-sent ones (there is no
   `message_sent` push event in the standard, so periodic rescans pick those up).
 - `get_resource_temp_url` + file download APIs let muze persist every image /
-  voice / video / file to disk before temp URLs expire.
+  voice / video / file to disk before temp URLs expire. Blobs are sniffed by
+  magic bytes (correct extension), and SILK voice is decoded to a playable
+  `.wav` (the raw `.silk` is kept too).
 - The standard is implementation-agnostic: protocol sides can be swapped
   (LLBot <-> Lagrange.Milky) with zero application changes.
 
