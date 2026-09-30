@@ -124,7 +124,6 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                     "backfill": bf,
                     "agent": service.agent is not None,
                     "capabilities": service.adapter.caps.summary_lines(),
-                    "confirm_all_sends": service.cfg.control.confirm_all_sends,
                 }
             )
         return web.json_response(

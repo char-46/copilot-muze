@@ -19,6 +19,12 @@ from muze.store.repo import Repository
 
 log = logging.getLogger("muze.ai")
 
+# Permission model: reads are unconditional anywhere; writes run freely in
+# the controller's session but are routed to the controller for approval in
+# any other conversation (see ControlService.requires_approval).
+# send_message routes itself via ControlService.request_send.
+WRITE_TOOLS = {"schedule_task", "remember"}
+
 SPEC = [
     {
         "type": "function",
@@ -223,6 +229,8 @@ class ToolRunner:
         self.ctx = ctx
 
     async def run(self, name: str, args: dict) -> str:
+        if name in WRITE_TOOLS and self.service.requires_approval(self.ctx):
+            return await self._gate(name, args)
         try:
             handler = getattr(self, f"t_{name}")
             result = await handler(args)
@@ -233,6 +241,33 @@ class ToolRunner:
             log.warning("tool %s failed: %s", name, e)
             payload = json.dumps({"error": str(e)}, ensure_ascii=False)
         log.info("LLM tool  | %s(%s) -> %s", name, _args_brief(args), payload[:4000])
+        return payload
+
+    def _describe(self, name: str, args: dict) -> str:
+        if name == "send_message":
+            return f"发送消息到 {args.get('scene')}/{args.get('peer_id')}: {str(args.get('text', ''))[:120]}"
+        if name == "schedule_task":
+            return f"创建计划任务: {str(args.get('prompt', ''))[:120]}"
+        if name == "remember":
+            return f"写入长期记忆 [{args.get('subject', 'owner')}]: {str(args.get('content', ''))[:120]}"
+        if name == "cli":
+            return f"执行命令: /{args.get('command', '')}"
+        return f"{name}({_args_brief(args)})"
+
+    async def _gate(self, name: str, args: dict) -> str:
+        """Outside the controller's session: submit the write for approval."""
+        desc = self._describe(name, args)
+        outcome = await self.service.request_operation(name, args, self.ctx, desc)
+        payload = json.dumps(
+            {
+                "needs_approval": True,
+                "is_error": outcome.is_error,
+                "message": outcome.text,
+                "note": "当前会话无写权限，已转交控制者审批；批准后自动执行",
+            },
+            ensure_ascii=False,
+        )
+        log.info("LLM tool  | %s(%s) GATED -> %s", name, _args_brief(args), payload[:400])
         return payload
 
     # ----------------------------------------------------------- helpers
@@ -250,6 +285,19 @@ class ToolRunner:
         command = str(args.get("command", "")).strip().lstrip("/")
         if not command:
             return {"error": "empty command", "hint": "cli({\"command\":\"help\"})"}
+        from muze.core.service import COMMANDS
+
+        spec = COMMANDS.get(command.split()[0])
+        if spec is not None and spec.write and self.service.requires_approval(self.ctx):
+            desc = self._describe("cli", {"command": command})
+            outcome = await self.service.request_operation(
+                "cli", {"command": command}, self.ctx, desc
+            )
+            return {
+                "needs_approval": True,
+                "output": outcome.text,
+                "note": "该命令会改动外部状态，当前会话无写权限，已提交控制者审批",
+            }
         outcome = await self.service.run_command(command, self.ctx)
         if outcome.is_error:
             return {"is_error": True, "output": outcome.text}

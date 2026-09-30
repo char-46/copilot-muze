@@ -43,6 +43,9 @@ class CommandSpec:
     local_only: bool = False  # restricted to local fronts (cli/web/console)
     scope: str = "bot"  # "app": process-level (run once per process)
                          # "bot": operates on THIS account's data
+    write: bool = False  # mutating / externally-visible (sends, schedule,
+                         # memory writes, service state). Outside the
+                         # controller's session these need approval.
 
     def help_line(self) -> str:
         u = self.usage or f"/{self.name}"
@@ -51,6 +54,8 @@ class CommandSpec:
         line = f"{u} - {self.help}" if self.help else u
         if self.local_only:
             line += " [本地]"
+        if self.write:
+            line += " [写]"
         return line
 
 
@@ -93,6 +98,7 @@ def slash(
     help: str = "",
     local_only: bool = False,
     scope: str = "bot",
+    write: bool = False,
 ) -> Callable:
     """Declare a slash-command plugin on an async method.
 
@@ -100,6 +106,10 @@ def slash(
                     independent; with several bots in one chat only the
                     primary bot answers so it runs exactly once);
            "bot"  — operates on THIS account's archive/data (default).
+    write: True for mutating / externally-visible commands (send, schedule,
+           memory writes, service state). Such commands run directly in the
+           controller's session (or local fronts) but are routed to the
+           controller for approval anywhere else.
     The handler receives (self, args, ctx) and may return:
     CommandOutcome | str | list[list[dict]] (message chains) | None.
     The framework always converts that into a CommandOutcome reply.
@@ -109,7 +119,7 @@ def slash(
         COMMANDS.register(
             CommandSpec(
                 name=name, usage=usage, help=help, fn=fn,
-                local_only=local_only, scope=scope,
+                local_only=local_only, scope=scope, write=write,
             )
         )
         return fn
@@ -349,27 +359,126 @@ class ControlService:
         ctx: ControlContext,
         created_by: str,
     ) -> CommandOutcome:
-        """Send now, or create a pending confirmation (per config/context)."""
-        if ctx.auto_confirm or not self.cfg.control.confirm_all_sends:
+        """Send now when allowed, otherwise route to the controller.
+
+        Permission model: in the controller's own session (or a local front)
+        writes are unconditional; ANYWHERE ELSE every outbound action must be
+        approved by the controller, and the confirmation is delivered to the
+        controller's control conversation — never back into the source chat.
+        """
+        if ctx.auto_confirm or self.is_control_ctx(ctx):
             return await self.send_as_bot(scene, peer_id, segments, preview)
+        target = self.control_conversation()
+        if target is None:
+            return CommandOutcome.err(
+                "无控制会话（请配置 authority 或 control.control_group），已拒绝发送"
+            )
+        ctrl_scene, ctrl_peer = target
         action_id = await self.repo.create_action(
             "send",
             scene,
             peer_id,
-            {"segments": segments, "preview": preview[:500]},
-            ctx.scene,
-            ctx.peer_id,
+            {
+                "segments": segments,
+                "preview": preview[:500],
+                "origin": f"{ctx.source}:{ctx.chat_key}",
+            },
+            ctrl_scene,
+            ctrl_peer,
             created_by,
         )
-        self.chatlog.confirm(action_id, f"pending send -> {conv_id(scene, peer_id)}: {preview}")
+        self.chatlog.confirm(
+            action_id,
+            f"pending send(from {ctx.source}:{ctx.chat_key}) -> {conv_id(scene, peer_id)}: {preview}",
+        )
+        await self.notify_controller(
+            f"【审批请求 #{action_id}】来自 {ctx.source}:{ctx.chat_key}\n"
+            f"拟以被控号向 {await self.target_label(scene, peer_id)} 发送:\n-----\n"
+            f"{preview[:500]}\n-----\n/confirm {action_id} 批准，/cancel {action_id} 拒绝"
+        )
         return CommandOutcome(
-            f"待确认 #{action_id}: 将以被控号向 {await self.target_label(scene, peer_id)} 发送:\n"
-            f"-----\n{preview[:800]}\n-----\n"
-            f"回复 /confirm {action_id} 发送，/cancel {action_id} 取消"
+            f"待控制者确认 #{action_id}（该会话无写权限，已转交控制者）"
         )
 
+    async def request_operation(
+        self, tool: str, args: dict, ctx: ControlContext, description: str
+    ) -> CommandOutcome:
+        """Route a non-send write (memory, schedule, raw command) to the
+        controller for approval when the caller is not in the control session."""
+        target = self.control_conversation()
+        if target is None:
+            return CommandOutcome.err("无控制会话，已拒绝该操作")
+        ctrl_scene, ctrl_peer = target
+        action_id = await self.repo.create_action(
+            "op",
+            ctx.scene or "",
+            ctx.peer_id or 0,
+            {
+                "tool": tool,
+                "args": args,
+                "origin": f"{ctx.source}:{ctx.chat_key}",
+                "preview": description[:500],
+            },
+            ctrl_scene,
+            ctrl_peer,
+            "agent",
+        )
+        self.chatlog.confirm(action_id, f"pending op({tool}) from {ctx.source}:{ctx.chat_key}: {description}")
+        await self.notify_controller(
+            f"【审批请求 #{action_id}】来自 {ctx.source}:{ctx.chat_key}\n"
+            f"操作: {description[:500]}\n/confirm {action_id} 批准，/cancel {action_id} 拒绝"
+        )
+        return CommandOutcome(f"待控制者确认 #{action_id}（{tool}，已转交控制者）")
+
+    def control_conversation(self) -> tuple[str, int] | None:
+        """Where approvals / notifications for this account are delivered."""
+        if self.cfg.control.control_group:
+            return "group", self.cfg.control.control_group
+        if self.cfg.authority:
+            return "friend", self.cfg.authority[0]
+        return None
+
+    async def notify_controller(self, text: str) -> None:
+        target = self.control_conversation()
+        if target is None:
+            return
+        scene, peer = target
+        try:
+            segs = [out_text(text[:1500])]
+            if scene == "group":
+                await self.adapter.send_group_message(peer, segs)
+            else:
+                await self.adapter.send_private_message(peer, segs)
+        except ProtocolError as e:
+            log.warning("notify controller failed: %s", e)
+
+    async def execute_pending(self, action: dict, ctx: ControlContext) -> CommandOutcome:
+        """Execute an approved pending action (kind: send | op)."""
+        payload = json.loads(action["payload_json"])
+        kind = action["kind"]
+        if kind == "send":
+            return await self.send_as_bot(
+                action["scene"], action["peer_id"],
+                payload.get("segments", []), payload.get("preview", ""),
+            )
+        if kind == "op":
+            from muze.ai.tools import ToolRunner
+
+            tool = payload.get("tool", "")
+            targs = payload.get("args") or {}
+            control_ctx = ControlContext(
+                source="system", chat_key="system", scene="", peer_id=0,
+                user_label="approved", auto_confirm=True,
+            )
+            runner = ToolRunner(
+                self, self.repo, self.adapter, getattr(self.runtime, "llm", None), control_ctx
+            )
+            result = await runner.run(tool, targs)
+            return CommandOutcome(f"已执行 {tool}: {str(result)[:800]}")
+        return CommandOutcome.err(f"未知待办类型 {kind}")
+
     # ------------------------------------------------------------- commands
-    @slash("schedule", "/schedule <时间> <指令>", "创建计划任务；时间: +秒数|ISO时间|every:秒数，如 /schedule +7200 总结未读")
+    @slash("schedule", "/schedule <时间> <指令>", "创建计划任务；时间: +秒数|ISO时间|every:秒数，如 /schedule +7200 总结未读", write=True)
     async def cmd_schedule(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if len(args) < 2:
             return CommandOutcome.err(
@@ -428,7 +537,7 @@ class ControlService:
             )
         return CommandOutcome("\n".join(lines))
 
-    @slash("canceltask", "/canceltask <id>", "取消计划任务")
+    @slash("canceltask", "/canceltask <id>", "取消计划任务", write=True)
     async def cmd_canceltask(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
             return CommandOutcome.err("用法: /canceltask <id>")
@@ -464,7 +573,7 @@ class ControlService:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text[:3500])
 
-    @slash("dream", "/dream [night|now|日|周|月|list]", "层级做梦：night=补链(内置) now=今天 2026-W40=周 2026-09=月")
+    @slash("dream", "/dream [night|now|日|周|月|list]", "层级做梦：night=补链(内置) now=今天 2026-W40=周 2026-09=月", write=True)
     async def cmd_dream(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
 
@@ -545,7 +654,7 @@ class ControlService:
             + "\n/forget <id> 停用某条"
         )
 
-    @slash("forget", "/forget <id>", "停用一条长期记忆")
+    @slash("forget", "/forget <id>", "停用一条长期记忆", write=True)
     async def cmd_forget(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
             return CommandOutcome.err("用法: /forget <id>（/memories 查 id）")
@@ -729,18 +838,15 @@ class ControlService:
         return CommandOutcome("\n".join(lines) + "\n/confirm id 或 /cancel id")
 
     async def confirm_action(self, action_id: int, ctx: ControlContext) -> CommandOutcome:
-        """Confirm a pending send from any privileged front (Web/CLI)."""
+        """Confirm a pending action (send / op) from any privileged front."""
         action = await self.repo.get_action(action_id)
         if not action or action["status"] != "pending":
             return CommandOutcome(f"#{action_id} 不存在或已失效", is_error=True)
-        await self.repo.set_action_status(action_id, "executed")
-        payload = json.loads(action["payload_json"])
-        outcome = await self.send_as_bot(
-            action["scene"], action["peer_id"], payload.get("segments", []),
-            payload.get("preview", ""),
-        )
+        ok = await self.repo.set_action_status(action_id, "executed")
+        if not ok:
+            return CommandOutcome(f"#{action_id} 已失效", is_error=True)
         self.chatlog.confirm(action_id, f"confirmed by {ctx.user_label or ctx.chat_key}")
-        return outcome
+        return await self.execute_pending(action, ctx)
 
     async def cancel_action(self, action_id: int, ctx: ControlContext) -> CommandOutcome:
         action = await self.repo.get_action(action_id)
@@ -750,7 +856,7 @@ class ControlService:
         self.chatlog.confirm(action_id, f"cancelled by {ctx.user_label or ctx.chat_key}")
         return CommandOutcome(f"已取消 #{action_id}")
 
-    @slash("confirm", "/confirm [id]", "确认代发（缺省确认最旧一项）")
+    @slash("confirm", "/confirm [id]", "确认代发（缺省确认最旧一项）", write=True)
     async def cmd_confirm(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         rows = await self.repo.list_pending_actions(ctx.scene or None, ctx.peer_id or None)
         if not rows:
@@ -764,15 +870,10 @@ class ControlService:
         ok = await self.repo.set_action_status(action["id"], "executed")
         if not ok:
             return CommandOutcome(f"#{action['id']} 已失效", is_error=True)
-        payload = json.loads(action["payload_json"])
-        outcome = await self.send_as_bot(
-            action["scene"], action["peer_id"], payload.get("segments", []),
-            payload.get("preview", ""),
-        )
         self.chatlog.confirm(action["id"], f"confirmed by {ctx.user_label or ctx.chat_key}")
-        return outcome
+        return await self.execute_pending(action, ctx)
 
-    @slash("cancel", "/cancel [id]", "取消代发（缺省全部）")
+    @slash("cancel", "/cancel [id]", "取消代发（缺省全部）", write=True)
     async def cmd_cancel(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         rows = await self.repo.list_pending_actions(ctx.scene or None, ctx.peer_id or None)
         if not rows:
@@ -872,7 +973,7 @@ class ControlService:
         rows = list(reversed(rows))  # oldest first for the model
         return await self.agent.summarize(scene, peer, rows, ctx)
 
-    @slash("send", "/send <scene/peer> <内容>", "以被控号发消息（需确认）")
+    @slash("send", "/send <scene/peer> <内容>", "以被控号发消息（需确认）", write=True)
     async def cmd_send(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if len(args) < 2:
             return CommandOutcome("用法: /send <scene/peer> <内容>", is_error=True)
@@ -880,7 +981,7 @@ class ControlService:
         body = " ".join(args[1:])
         return await self.request_send(scene, peer, [out_text(body)], body, ctx, "command")
 
-    @slash("reply", "/reply <scene/peer> [seq] <内容>", "以被控号回复某条消息（需确认）")
+    @slash("reply", "/reply <scene/peer> [seq] <内容>", "以被控号回复某条消息（需确认）", write=True)
     async def cmd_reply(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if len(args) < 2:
             return CommandOutcome("用法: /reply <scene/peer> [seq] <内容>", is_error=True)
@@ -896,7 +997,7 @@ class ControlService:
         segments = [out_reply(reply_seq), out_text(body)] if reply_seq else [out_text(body)]
         return await self.request_send(scene, peer, segments, body, ctx, "command")
 
-    @slash("markread", "/markread <scene/peer> [seq]", "标记会话已读")
+    @slash("markread", "/markread <scene/peer> [seq]", "标记会话已读", write=True)
     async def cmd_markread(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
             return CommandOutcome("用法: /markread <scene/peer> [seq]", is_error=True)
@@ -971,28 +1072,28 @@ class ControlService:
             return CommandOutcome(f"技能 {args[0]} 不存在，/skills 查看列表", is_error=True)
         return CommandOutcome(f"# {sk.name}\n{sk.body[:4000]}")
 
-    @slash("reset", "/reset", "清空 AI 对话上下文")
+    @slash("reset", "/reset", "清空 AI 对话上下文", write=True)
     async def cmd_reset(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.agent is None:
             return CommandOutcome("agent 未配置")
         self.agent.reset_all()
         return CommandOutcome("已清空所有 AI 对话上下文")
 
-    @slash("reload", "/reload", "热更新(config/skills/AI上下文)，源码变更时自动安排重启", scope="app")
+    @slash("reload", "/reload", "热更新(config/skills/AI上下文)，源码变更时自动安排重启", scope="app", write=True)
     async def cmd_reload(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         reloader = self.runtime.reloader
         if reloader is None:
             return CommandOutcome("reload 仅在 serve 进程内可用", is_error=True)
         return await reloader.reload()
 
-    @slash("restart", "/restart", "重启服务（由 muze daemon 接管）", local_only=True, scope="app")
+    @slash("restart", "/restart", "重启服务（由 muze daemon 接管）", local_only=True, scope="app", write=True)
     async def cmd_restart(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.runtime.request_restart is None:
             return CommandOutcome.err("重启钩子未装配（直接运行 serve 时请手动重启）")
         self.runtime.request_restart()
         return CommandOutcome("已请求重启：服务将退出并由 daemon 重新拉起")
 
-    @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True, scope="app")
+    @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True, scope="app", write=True)
     async def cmd_shutdown(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.runtime.request_stop is None:
             return CommandOutcome.err("停止钩子未装配")
@@ -1000,6 +1101,17 @@ class ControlService:
         return CommandOutcome("已请求停止服务")
 
     # ------------------------------------------------------------ qq route
+    def is_control_ctx(self, ctx: ControlContext) -> bool:
+        """Is this the controller's own session (where writes are allowed)?"""
+        if ctx.is_local:
+            return True  # cli / webui / console = the operator themself
+        return is_control_conversation(self.cfg, ctx.scene, ctx.peer_id)
+
+    def requires_approval(self, ctx: ControlContext) -> bool:
+        """Reads are unconditional; writes outside the control session must
+        be routed to the controller for approval."""
+        return not self.is_control_ctx(ctx)
+
     def is_controller(self, scene: str, peer_id: int, sender_id: int) -> bool:
         """Is this sender allowed in this conversation?"""
         cfg = self.cfg.control

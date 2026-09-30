@@ -92,16 +92,25 @@ async def test_auto_confirm_sends_immediately(env):
 
 async def test_confirm_flow_via_pending(env):
     service, repo, adapter, cfg = env
-    ctx = qq_ctx(cfg)
-    out = await service.request_send("group", 20002, [{"type": "text", "data": {"text": "代发内容"}}], "代发内容", ctx, "agent")
-    assert adapter.sent == []  # nothing sent yet
-    assert "待确认" in out.text
-    rows = await repo.list_pending_actions("friend", 10001)
+    # request comes from a NON-control conversation -> routed to the controller
+    src = ControlContext(
+        source="qq", chat_key="qq:group:999", scene="group", peer_id=999, user_label="random"
+    )
+    out = await service.request_send(
+        "group", 30003, [{"type": "text", "data": {"text": "代发内容"}}], "代发内容", src, "agent"
+    )
+    assert all(t[1] != 30003 for t in adapter.sent)  # not sent yet
+    assert "待控制者确认" in out.text
+    rows = await repo.list_pending_actions()
     assert len(rows) == 1
+    assert (rows[0]["control_scene"], rows[0]["control_peer_id"]) == ("group", 20002)
 
-    confirmed = await service.confirm_action(rows[0]["id"], ctx)
+    confirm_ctx = ControlContext(
+        source="qq", chat_key="qq:group:20002", scene="group", peer_id=20002, user_label="admin"
+    )
+    confirmed = await service.confirm_action(rows[0]["id"], confirm_ctx)
     assert "已发送" in confirmed.text
-    assert len(adapter.sent) == 1 and adapter.sent[0][0] == "group"
+    assert any(t[0] == "group" and t[1] == 30003 for t in adapter.sent)
     assert await repo.list_pending_actions() == []
 
 

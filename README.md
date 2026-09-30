@@ -115,9 +115,20 @@ Multi-bot safety (several accounts in one process):
   by bot2 alone; 1000000001 talking to itself still works.
 
 `::` input goes to the AI agent, which can query the archive, describe
-images (vision model), expand forwarded messages, and draft sends — all sends
-respect the confirmation policy (`control.confirm_all_sends`, default on;
-CLI bypasses since it is local).
+images (vision model), expand forwarded messages, and draft sends.
+
+### Permissions (agent & commands)
+
+- **Reads are unconditional anywhere**: archive search/browse, message
+  detail, media, stats, dreams, memories, skills, `fetch_url`, `read_document`,
+  `describe_image`.
+- **Writes run freely only in the controller's session**: the control
+  conversation (control group / authority DM) or a local front (CLI/WebUI/
+  console).
+- **Anywhere else, every write is routed to the controller**: sends,
+  scheduled tasks, memory writes, and write-capable `cli` commands become a
+  pending request sent to the controller (`/confirm <id>` approves,
+  `/cancel <id>` rejects). `/help` marks write commands with `[写]`.
 
 ## Storage & logs
 

@@ -60,8 +60,9 @@ ingest:
 control:
   control_group: 0            # group id used as control room; 0 = disabled
   private_control: true       # authority may command via private chat
-  confirm_all_sends: true     # every outgoing message requires confirmation in a control session
-  confirm_timeout_min: 30     # pending confirmations expire after this
+  confirm_timeout_min: 30     # pending approvals expire after this
+                              # (writes outside the control session are always
+                              #  routed to the controller for approval)
 
 llm:
   chat:                       # any OpenAI-compatible endpoint (GLM / DeepSeek / MiMo ...)

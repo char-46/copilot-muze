@@ -333,7 +333,6 @@ const CFG_FIELDS = [
   ]},
   { group: "控制 (control)", items: [
     { path: "control.control_group", label: "控制群号（0=禁用）", type: "number" },
-    { path: "control.confirm_all_sends", label: "代发需确认", type: "checkbox" },
   ]},
   { group: "LLM · chat", items: [
     { path: "llm.chat.base_url", label: "base_url", type: "text" },
@@ -416,8 +415,9 @@ async function loadStatus() {
     const s = a.stats || {};
     return (
       `== 账号 ${a.name} (self ${a.self_id}) ==\n` +
-      `agent: ${a.agent ? "on" : "off"}   confirm_all_sends: ${a.confirm_all_sends}\n` +
+      `agent: ${a.agent ? "on" : "off"}\n` +
       `conversations: ${s.conversations}   messages: ${s.messages}\n` +
+      `archive: ${(s.oldest_ts ? new Date(s.oldest_ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-")} ~ ${(s.newest_ts ? new Date(s.newest_ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-")}\n` +
       `by scene: ${JSON.stringify(s.messages_by_scene || {})}\n` +
       `media: ${JSON.stringify(s.media || {})}\n` +
       `backfill: ${JSON.stringify(a.backfill || {})}\n` +
