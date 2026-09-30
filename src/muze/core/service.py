@@ -1205,7 +1205,7 @@ class ControlService:
         if self.runtime.request_restart is None:
             return CommandOutcome.err("重启钩子未装配（直接运行 serve 时请手动重启）")
         self.runtime.request_restart()
-        return CommandOutcome("已请求重启：服务将退出并由 daemon 重新拉起")
+        return CommandOutcome("已请求重启：进程将重新启动（daemon 监督下由 daemon 拉起，否则自行重启）")
 
     @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True, scope="app", write=True)
     async def cmd_shutdown(self, args: list[str], ctx: ControlContext) -> CommandOutcome:

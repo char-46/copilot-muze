@@ -70,6 +70,18 @@ async def test_shutdown_bounds_a_wedged_component(caplog):
     assert any("timed out" in r.getMessage() for r in caplog.records)
 
 
+def test_reexec_uses_same_serve_args(monkeypatch):
+    import muze.main as m
+
+    calls = []
+    monkeypatch.setattr(m.os, "execv", lambda exe, args: calls.append((exe, args)))
+    monkeypatch.setattr(m.sys, "argv", ["muze", "serve", "-c", "x.yaml"])
+    m._reexec()
+    assert calls, "execv should be called"
+    _exe, args = calls[0]
+    assert args[1:5] == ["-m", "muze", "serve", "-c"] and args[-1] == "x.yaml"
+
+
 def test_sigint_handler_graceful_then_force(monkeypatch):
     """1st Ctrl-C stops every account (no exception into the loop);
     2nd Ctrl-C forces process exit."""

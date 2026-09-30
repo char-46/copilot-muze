@@ -87,7 +87,7 @@ class Reloader:
             )
             if self.runtime.request_restart is not None:
                 self.runtime.request_restart()
-                lines.append("已请求重启：daemon 将自动拉起新版本")
+                lines.append("已请求重启：进程将重新启动以加载新代码")
                 return CommandOutcome("\n".join(lines))
             lines.append("（未装配重启钩子，请手动重启 serve）")
         else:

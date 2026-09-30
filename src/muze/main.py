@@ -349,6 +349,17 @@ def _make_sigint_handler(apps: list["App"], loop: asyncio.AbstractEventLoop):
     return handler
 
 
+def _reexec() -> None:
+    """Re-exec this process with the same serve args (loads new code)."""
+    args = [sys.executable, "-m", "muze", *sys.argv[1:]]
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, args)
+    except OSError:
+        log.exception("re-exec failed; exiting with rc=%d", RESTART_EXIT)
+
+
 def run_main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
@@ -399,8 +410,12 @@ def run_main(argv: list[str]) -> int:
     if rc:
         return rc
     if any(a.restart_requested for a in apps):
-        log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
-        return RESTART_EXIT
+        if os.environ.get("MUZE_SUPERVISED") == "1":
+            log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
+            return RESTART_EXIT
+        log.info("restart requested; re-executing this process now")
+        _reexec()
+        return RESTART_EXIT  # only if exec failed
     return 0
 
 

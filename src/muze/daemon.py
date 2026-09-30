@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -40,12 +41,13 @@ def run_daemon(argv: list[str]) -> int:
     )
     serve_cmd = [sys.executable, "-m", "muze", "serve", "-c", args.config]
     log.info("daemon starting serve: %s", " ".join(serve_cmd))
+    child_env = {**os.environ, "MUZE_SUPERVISED": "1"}
 
     backoff = 5.0
     while True:
         started = time.monotonic()
         try:
-            proc = subprocess.run(serve_cmd)
+            proc = subprocess.run(serve_cmd, env=child_env)
         except KeyboardInterrupt:
             log.info("daemon interrupted; exiting")
             return 0
