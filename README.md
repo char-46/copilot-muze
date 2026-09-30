@@ -1,11 +1,13 @@
 # copilot-muze
 
+**English** | [简体中文](README.zh-CN.md)
+
 Personal QQ copilot: archives every message (including already-read ones pulled
 via roaming), saves media, and lets you drive your QQ account through commands
 and natural language — from a QQ control chat, a WebUI, or a CLI.
 
 ```
-muze 0.1.0-alpha.13+build.g<sha>.<utc-time>
+muze 0.1.0-alpha.56+build.g<sha>.<utc-time>
 ```
 
 ## Architecture
@@ -90,6 +92,62 @@ actually supports and degrades lazily.
      (your local console is you). `muze serve` also opens an interactive
      console on its own stdin when running in a foreground terminal
      (`/help`, `/shutdown`, Ctrl+C; set `MUZE_FORCE_CONSOLE=1` to force).
+
+## Deployment (one-click update, auto restart)
+
+Day-to-day the service runs under **`muze daemon`**, a tiny supervisor:
+
+- `/restart` (or `/reload` on code change) makes `serve` exit with rc=100 and
+  the daemon relaunches it **immediately** — that is the hot-update path when
+  you edit config/skills by hand.
+- Crashes get exponential backoff (5s → 60s, reset after a stable run).
+- On Windows the child sits in a Job Object with KILL_ON_JOB_CLOSE: if the
+  daemon dies for *any* reason the kernel kills serve instantly, so an
+  orphaned serve can never hold the web port or the database.
+
+For the deployment box (a plain git checkout + venv) two scripts wrap the
+whole lifecycle — `scripts/deploy.ps1` (first install) and
+`scripts/update.ps1` (one-click update):
+
+```powershell
+# first install (dependencies + config bootstrap + optional logon auto-start)
+powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -Extras rag-local -InstallTask
+
+# ONE-CLICK UPDATE: stop -> checkout latest tag -> uv sync -> start -> verify
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1
+
+# variants
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.56  # pin a tag
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull             # just restart
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Extras rag-local,rag-onnx
+```
+
+Updates can also ship as a **wheel** — for boxes without git access. Build
+with `uv build` on the dev machine, copy (or host) the wheel, and point the
+same script at it: stop → `uv pip install --reinstall` → start → verify:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel C:\dist\copilot_muze-0.1.0a57-py3-none-any.whl
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel https://host/copilot_muze-0.1.0a57-py3-none-any.whl -Extras rag-local
+```
+
+The wheel carries only the `muze` package: `scripts\` and the repo-level
+`skills\` stay from the original checkout (user skills can live in
+`data\skills`), and `config.yaml` / `data\` are never touched by either route.
+
+`update.ps1` prints the old → new version and tails the startup log so a
+failed update is visible immediately. Notes:
+
+- **Stop is a hard kill** (Windows cannot Ctrl-C a process attached to
+  another console). This is safe here: SQLite WAL plus per-conversation
+  roaming watermarks, and the `on_start` pull recovers every message missed
+  while down.
+- `git checkout --force` discards local edits to tracked files — a deployment
+  checkout must not carry code changes. `config.yaml` and `data/` are
+  untracked and never touched.
+- `-InstallTask` registers a logon scheduled task (`muze-autostart`) that
+  starts the service via `update.ps1 -SkipPull`; remove it with
+  `Unregister-ScheduledTask -TaskName muze-autostart`.
 
 ## Commands (QQ / Web / CLI share one implementation)
 
