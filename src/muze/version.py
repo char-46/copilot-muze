@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from functools import lru_cache
 
-BASE_VERSION = "0.1.0-alpha.36"
+BASE_VERSION = "0.1.0-alpha.37"
 
 
 def _git(args: list[str]) -> str | None:

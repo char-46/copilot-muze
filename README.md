@@ -84,6 +84,10 @@ actually supports and degrades lazily.
 | `/sync [force] [target]` | roaming backfill now; `force` ignores the watermark and pulls EVERYTHING to the roaming end (duplicates are upsert-deduped — recovers holes) |
 | `/unread` | recently active conversations with previews |
 | `/search <kw> [n]` | full-text search over the archive |
+| `/day <date> [target]` | what happened on a day (`YYYY-MM-DD`/`today`/`yesterday`); scoped or overview |
+| `/between <d1> <d2> [target] [n]` | date-range query |
+| `/top [days]` | busiest conversations (all-time or recent) |
+| `/range <target>` | that conversation's local archive: count + earliest/latest |
 | `/msg <scene/peer> <seq>` | single message detail + media status |
 | `/media <scene/peer> <seq>` | extract downloaded media (sends images back) |
 | `/summary <scene/peer> [n]` | LLM summary incl. image descriptions |

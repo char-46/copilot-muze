@@ -700,6 +700,120 @@ class ControlService:
             lines.append("探测范围内无缺口（本地已覆盖）")
         return CommandOutcome("\n".join(lines))
 
+    # ------------------------------------------------- archive query
+    @staticmethod
+    def parse_day(spec: str) -> tuple[int, int]:
+        """'YYYY-MM-DD' | 'today' | 'yesterday' | ISO -> [start, end) local unix ts."""
+        from datetime import datetime, timedelta
+
+        s = (spec or "").strip().lower()
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if s in ("today", "今天"):
+            d = today
+        elif s in ("yesterday", "昨天"):
+            d = today - timedelta(days=1)
+        else:
+            try:
+                d = datetime.fromisoformat(spec.strip())
+            except ValueError:
+                raise ValueError(f"无法解析日期: {spec}（用 YYYY-MM-DD / today / yesterday）")
+            d = d.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = int(d.timestamp())
+        return start, start + 86400
+
+    def _timeline(self, rows: list[dict], limit: int = 120) -> list[str]:
+        out = []
+        for r in rows[:limit]:
+            t = (epoch_iso(r["time"]) or "")[11:16]
+            body = (r["text_content"] or "(无文本)")[:90]
+            out.append(f"  {t} {r['sender_id']}: {body}")
+        if len(rows) > limit:
+            out.append(f"  … 另有 {len(rows) - limit} 条")
+        return out
+
+    @slash("day", "/day <日期> [scene/peer]", "某天消息概况：YYYY-MM-DD / today / yesterday")
+    async def cmd_day(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            return CommandOutcome.err("用法: /day <YYYY-MM-DD|today|yesterday> [scene/peer]")
+        try:
+            start, end = self.parse_day(args[0])
+        except ValueError as e:
+            return CommandOutcome.err(str(e))
+        if len(args) > 1:
+            scene, peer = self.parse_target(args[1])
+            rows = await self.repo.messages_between(scene, peer, start, end, limit=400)
+            counts = await self.repo.sender_counts(start, end, scene, peer, limit=10)
+            head = f"{args[0]} @ {conv_id(scene, peer)}: {len(rows)} 条"
+            who = "  发言: " + ", ".join(f"{c['sender_id']}({c['n']})" for c in counts) if counts else ""
+            return CommandOutcome("\n".join([head, who] + self._timeline(rows)))
+        counts = await self.repo.day_counts(start, end)
+        total = sum(c["n"] for c in counts)
+        lines = [f"{args[0]}: 共 {total} 条 / {len(counts)} 个会话"]
+        for c in counts[:25]:
+            lines.append(
+                f"  {conv_id(c['scene'], c['peer_id'])} {c['name'] or ''} {c['n']}条".rstrip()
+            )
+        return CommandOutcome("\n".join(lines))
+
+    @slash("between", "/between <起> <止> [scene/peer] [limit]", "日期区间查询；日期同 /day")
+    async def cmd_between(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if len(args) < 2:
+            return CommandOutcome.err("用法: /between <起> <止> [scene/peer] [limit]")
+        try:
+            start, _ = self.parse_day(args[0])
+            _, end = self.parse_day(args[1])
+        except ValueError as e:
+            return CommandOutcome.err(str(e))
+        if end <= start:
+            return CommandOutcome.err("结束日期必须晚于开始日期")
+        rest = args[2:]
+        limit = 400
+        if rest and rest[-1].isdigit():
+            limit = min(int(rest[-1]), 2000)
+            rest = rest[:-1]
+        if rest:
+            scene, peer = self.parse_target(rest[0])
+            rows = await self.repo.messages_between(scene, peer, start, end, limit=limit)
+            head = f"{args[0]}~{args[1]} @ {conv_id(scene, peer)}: {len(rows)} 条"
+            return CommandOutcome("\n".join([head] + self._timeline(rows)))
+        counts = await self.repo.day_counts(start, end)
+        total = sum(c["n"] for c in counts)
+        lines = [f"{args[0]}~{args[1]}: 共 {total} 条 / {len(counts)} 个会话"]
+        lines += [
+            f"  {conv_id(c['scene'], c['peer_id'])} {c['name'] or ''} {c['n']}条".rstrip()
+            for c in counts[:25]
+        ]
+        return CommandOutcome("\n".join(lines))
+
+    @slash("top", "/top [天数]", "会话活跃排行；无数=全史，30=近30天")
+    async def cmd_top(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        days = int(args[0]) if args and args[0].isdigit() else 0
+        since = int(time.time() - days * 86400) if days else 0
+        rows = await self.repo.top_conversations(since, limit=20)
+        if not rows:
+            return CommandOutcome("该范围没有数据")
+        scope = f"近{days}天" if days else "全部历史"
+        lines = [f"活跃排行（{scope}）:"]
+        for i, c in enumerate(rows, 1):
+            lines.append(
+                f"  {i}. {conv_id(c['scene'], c['peer_id'])} {c['name'] or ''} {c['n']}条".rstrip()
+            )
+        return CommandOutcome("\n".join(lines))
+
+    @slash("range", "/range <scene/peer>", "该会话本地归档：条数 + 最早/最新时间")
+    async def cmd_range(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            return CommandOutcome.err("用法: /range <scene/peer>")
+        scene, peer = self.parse_target(args[0])
+        st = await self.repo.coverage_stats(scene, peer)
+        if not st or not st.get("n"):
+            return CommandOutcome(f"{conv_id(scene, peer)} 本地无归档")
+        return CommandOutcome(
+            f"{conv_id(scene, peer)}: {st['n']} 条\n"
+            f"最早: {epoch_iso(st['min_time'])}  (seq {st['min_seq']})\n"
+            f"最新: {epoch_iso(st['max_time'])}  (seq {st['max_seq']})"
+        )
+
     @slash("help", "/help", "命令列表（自动扫描生成）", scope="app")
     async def cmd_help(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(COMMANDS.help_text())

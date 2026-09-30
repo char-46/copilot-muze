@@ -35,6 +35,8 @@ SPEC = [
                 "例: cli({\"command\": \"search 报价 20\"})、cli({\"command\": \"msg group/123 456\"})。"
                 "查询/搜索/读取消息/展开转发/标记已读/定时任务等都走这个工具；"
                 "归档规模与时间范围（最早/最新消息日期）用 cli({\"command\": \"status\"})；"
+                "按日期查消息用 day <YYYY-MM-DD|today|yesterday> [会话] 或 between <起> <止> [会话]；"
+                "会话活跃排行 top [天数]；单会话时间范围 range <会话>；"
                 "不确定用法时先 cli({\"command\": \"help\"})。"
             ),
             "parameters": {

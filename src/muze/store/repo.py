@@ -543,6 +543,52 @@ class Repository:
             row = await cur.fetchone()
         return dict(row) if row else {}
 
+    async def day_counts(self, start_ts: int, end_ts: int, limit: int = 40) -> list[dict]:
+        """Per-conversation message counts in a window, busiest first."""
+        async with self.conn.execute(
+            """
+            SELECT m.scene, m.peer_id, COUNT(*) AS n, c.name AS name
+            FROM messages m
+            LEFT JOIN conversations c ON c.scene = m.scene AND c.peer_id = m.peer_id
+            WHERE m.time >= ? AND m.time < ?
+            GROUP BY m.scene, m.peer_id
+            ORDER BY n DESC LIMIT ?
+            """,
+            (start_ts, end_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def top_conversations(self, since_ts: int, limit: int = 15) -> list[dict]:
+        """Lifetime message counts since a timestamp, busiest first."""
+        async with self.conn.execute(
+            """
+            SELECT m.scene, m.peer_id, COUNT(*) AS n, c.name AS name
+            FROM messages m
+            LEFT JOIN conversations c ON c.scene = m.scene AND c.peer_id = m.peer_id
+            WHERE m.time >= ?
+            GROUP BY m.scene, m.peer_id
+            ORDER BY n DESC LIMIT ?
+            """,
+            (since_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def sender_counts(
+        self, start_ts: int, end_ts: int, scene: str, peer_id: int, limit: int = 20
+    ) -> list[dict]:
+        async with self.conn.execute(
+            """
+            SELECT sender_id, COUNT(*) AS n FROM messages
+            WHERE time >= ? AND time < ? AND scene = ? AND peer_id = ?
+            GROUP BY sender_id ORDER BY n DESC LIMIT ?
+            """,
+            (start_ts, end_ts, scene, peer_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     # ---------------------------------------------------------------- memories
     async def add_memory(
         self, kind: str, subject: str, content: str, source: str = "",
