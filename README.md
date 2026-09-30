@@ -112,21 +112,47 @@ every feature commit bumps the pre-release and is tagged. `muze version`,
 
 ## Multiple accounts
 
-Each QQ account runs as its own isolated stack — one LLBot login, one
-config, one data dir, one daemon:
+Two supported layouts:
 
-```bash
-# account A
-muze daemon -c muze-a.yaml    # storage.data_dir: ./data-a, web.port: 8300
-# account B
-muze daemon -c muze-b.yaml    # storage.data_dir: ./data-b, web.port: 8301
+**Single process, many accounts** (recommended) — an `instances:` list in one
+config; top-level keys are shared defaults, each entry deep-merges over them.
+Every account keeps its own database (owner-bound), media, webui port and
+schedules; the embedded console switches accounts with `/use <name>` and the
+CLI picks one with `-i <name>`:
+
+```yaml
+llm: {chat: {base_url: "...", api_key: "...", model: glm-4.7}}
+instances:
+  - name: main
+    milky: {base_url: "http://127.0.0.1:3010"}
+    storage: {data_dir: ./data-a}
+    web: {port: 8300}
+  - name: alt
+    milky: {base_url: "http://127.0.0.1:3011"}
+    storage: {data_dir: ./data-b, db_file: ""}   # db_file overrides the sqlite path
+    web: {port: 8301}
 ```
 
-Everything (messages, media, logs, dreams, memories, scheduled tasks,
-console history) lives under the account's `storage.data_dir`. The
-database binds itself to the first account that opens it and **refuses to
-start (exit code 4) if a different account points at the same data dir**,
-so accounts can never silently mix.
+**Process per account** — separate config files, separate `muze daemon`s.
+
+Either way the database binds itself to the first account that opens it and
+**refuses to start (exit code 4) if a different account points at the same
+data dir**, so accounts can never silently mix. If any instance exits (or
+crashes) in multi-instance mode, all instances stop and the daemon restarts
+the whole process.
+
+## Quick configuration
+
+```bash
+uv run muze cfg init                    # interactive wizard → minimal config
+uv run muze cfg show                    # whole config (secrets masked)
+uv run muze cfg show llm.chat.model     # one dotted path
+uv run muze cfg set web.port 8301       # edit file (rewrites YAML, comments lost)
+```
+
+The WebUI has a **Settings** tab (grouped form; secrets stay masked unless
+you type a new value) that applies changes at runtime — persist them by
+editing `config.yaml` and running `/reload`.
 
 ## Tests
 

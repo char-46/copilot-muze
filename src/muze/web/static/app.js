@@ -54,6 +54,7 @@ $$("nav button").forEach((b) => b.addEventListener("click", () => {
   if (b.dataset.tab === "logs") loadLogs();
   if (b.dataset.tab === "status") loadStatus();
   if (b.dataset.tab === "chats") loadConversations();
+  if (b.dataset.tab === "settings") loadSettings();
 }));
 
 $("#saveToken").addEventListener("click", () => {
@@ -287,6 +288,79 @@ async function loadPending() {
 async function pendingBadgeReload() {
   try { const d = await api("/api/pending"); pendingBadge(d.pending.length); } catch {}
 }
+
+/* ---------------- settings ---------------- */
+const CFG_FIELDS = [
+  { group: "协议端 (milky)", items: [
+    { path: "milky.base_url", label: "base_url", type: "text" },
+    { path: "milky.access_token", label: "access_token（留空保持）", type: "password", secret: true },
+  ]},
+  { group: "控制 (control)", items: [
+    { path: "control.admin_users", label: "管理员QQ（逗号分隔）", type: "text" },
+    { path: "control.control_group", label: "控制群号（0=禁用）", type: "number" },
+    { path: "control.confirm_all_sends", label: "代发需确认", type: "checkbox" },
+  ]},
+  { group: "LLM · chat", items: [
+    { path: "llm.chat.base_url", label: "base_url", type: "text" },
+    { path: "llm.chat.model", label: "model", type: "text" },
+    { path: "llm.chat.api_key", label: "api_key（留空保持）", type: "password", secret: true },
+  ]},
+  { group: "LLM · vision", items: [
+    { path: "llm.vision.model", label: "model（空=禁用视觉）", type: "text" },
+    { path: "llm.vision.api_key", label: "api_key（留空保持）", type: "password", secret: true },
+  ]},
+  { group: "做梦 (digest)", items: [
+    { path: "digest.enabled", label: "启用", type: "checkbox" },
+    { path: "digest.at", label: "每日时间 HH:MM", type: "text" },
+    { path: "digest.inject_context", label: "注入处理上下文", type: "checkbox" },
+  ]},
+];
+
+function cfgGet(obj, path) {
+  return path.split(".").reduce((o, k) => (o == null ? o : o[k]), obj);
+}
+
+async function loadSettings() {
+  const box = $("#settingsForm");
+  try {
+    const d = await api("/api/config");
+    box.innerHTML = "";
+    for (const g of CFG_FIELDS) {
+      const div = document.createElement("div");
+      div.className = "group";
+      div.innerHTML = `<h3>${esc(g.group)} · 实例 ${esc(d.instance || "")}</h3>`;
+      for (const it of g.items) {
+        const val = cfgGet(d.masked, it.path);
+        const f = document.createElement("div");
+        f.className = "field";
+        const shown = it.type === "checkbox" ? (val ? "checked" : "")
+          : (val === "***set***" ? "" : (val ?? ""));
+        f.innerHTML = `<label>${esc(it.label)}</label>` +
+          `<input data-path="${esc(it.path)}" type="${it.type}" value="${esc(String(shown))}" ${shown}>`;
+        div.appendChild(f);
+      }
+      box.appendChild(div);
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+$("#cfgSave").addEventListener("click", async () => {
+  const updates = {};
+  $$("#settingsForm input[data-path]").forEach((inp) => {
+    const path = inp.dataset.path;
+    let v = inp.type === "checkbox" ? inp.checked : inp.value.trim();
+    if (inp.type === "password" && v === "") v = "";
+    updates[path] = v;
+  });
+  try {
+    const d = await api("/api/config", { method: "POST", body: { updates } });
+    alert("已生效: " + (d.applied || []).join(", ") + "\n" + (d.hint || ""));
+  } catch (e) {
+    alert("保存失败: " + e.message);
+  }
+});
 
 /* ---------------- logs / status ---------------- */
 async function loadLogs() {

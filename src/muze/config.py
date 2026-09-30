@@ -7,6 +7,7 @@ All settings live in a single YAML file (see config.example.yaml). Secrets
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Literal
 
 import yaml
@@ -22,6 +23,7 @@ class MilkyConfig(BaseModel):
 
 class StorageConfig(BaseModel):
     data_dir: Path = Path("./data")
+    db_file: str = ""  # explicit sqlite path override; empty -> data_dir/muze.db
 
     @property
     def media_dir(self) -> Path:
@@ -33,7 +35,7 @@ class StorageConfig(BaseModel):
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / "muze.db"
+        return Path(self.db_file) if self.db_file else self.data_dir / "muze.db"
 
 
 class Watchlist(BaseModel):
@@ -152,15 +154,85 @@ def load_config(path: str | Path) -> MuzeConfig:
             f"config file not found: {p} (copy config.example.yaml to config.yaml first)"
         )
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    try:
-        cfg = MuzeConfig.model_validate(raw)
-    except ValidationError as e:
-        raise ValueError(f"invalid config {p}:\n{e}") from e
+    cfg = _validate_config(raw, p)
     if cfg.ingest.scope == "watchlist" and not (
         cfg.ingest.watchlist.friends or cfg.ingest.watchlist.groups
     ):
         raise ValueError("ingest.scope=watchlist but watchlist is empty")
     return cfg
+
+
+def _validate_config(raw: dict, p) -> MuzeConfig:
+    try:
+        return MuzeConfig.model_validate(raw)
+    except ValidationError as e:
+        raise ValueError(f"invalid config {p}:\n{e}") from e
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+@dataclass
+class InstanceSpec:
+    """One account stack: a name plus its fully-resolved MuzeConfig."""
+
+    name: str
+    config: MuzeConfig
+
+
+def load_instances(path: str | Path) -> list[InstanceSpec]:
+    """Load one or many account instances from a config file.
+
+    Multi-account layout — top-level keys act as shared defaults, each
+    `instances[]` entry deep-merges over them (per-account milky / storage /
+    web / control ...)::
+
+        llm: {...}                    # shared
+        instances:
+          - name: main
+            milky: {base_url: "http://127.0.0.1:3010"}
+            storage: {data_dir: ./data-a}
+            web: {port: 8300}
+          - name: alt
+            milky: {base_url: "http://127.0.0.1:3011"}
+            storage: {db_file: ./data-b/alt.db, data_dir: ./data-b}
+            web: {port: 8301}
+
+    Without `instances` the file is a classic single-account config.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"config file not found: {p} (copy config.example.yaml to config.yaml first)"
+        )
+    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid config {p}: not a mapping")
+
+    entries = raw.get("instances")
+    if isinstance(entries, list) and entries:
+        base = {k: v for k, v in raw.items() if k != "instances"}
+        specs: list[InstanceSpec] = []
+        seen: set[str] = set()
+        for i, inst in enumerate(entries):
+            if not isinstance(inst, dict):
+                raise ValueError(f"instances[{i}] must be a mapping")
+            name = str(inst.get("name") or f"inst{i + 1}")
+            if name in seen:
+                raise ValueError(f"duplicate instance name: {name}")
+            seen.add(name)
+            merged = _deep_merge(base, inst)
+            specs.append(InstanceSpec(name, _validate_config(merged, p)))
+        return specs
+
+    return [InstanceSpec("main", _validate_config(raw, p))]
 
 
 def describe_watch(cfg: MuzeConfig, scene: str, peer_id: int) -> bool:

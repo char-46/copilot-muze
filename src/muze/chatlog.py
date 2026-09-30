@@ -37,7 +37,7 @@ class ConsoleStreamHandler(logging.StreamHandler):
                     self.stream.write(_console.clear_line_seq())
                 self.stream.write(msg + self.terminator)
                 if _console.prompt_shown():
-                    self.stream.write("muze> ")
+                    self.stream.write(_console.current_prompt())
                 self.flush()
         except RecursionError:
             raise

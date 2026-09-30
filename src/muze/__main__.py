@@ -16,6 +16,11 @@ def main(argv: list[str] | None = None) -> int:
         print(get_version())
         return 0
 
+    if cmd == "cfg":
+        from muze.cfgcli import run_cfg
+
+        return run_cfg(rest)
+
     if cmd == "daemon":
         from muze.daemon import run_daemon
 
@@ -31,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_cli(rest)
 
-    print(f"unknown command: {cmd} (expected: serve | daemon | cli | version)", file=sys.stderr)
+    print(f"unknown command: {cmd} (expected: serve | daemon | cli | cfg | version)", file=sys.stderr)
     return 2
 
 

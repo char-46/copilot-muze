@@ -100,6 +100,24 @@ main { flex: 1; overflow: hidden; }
 .card .ops { margin-top: 8px; display: flex; gap: 8px; }
 .card .ops .ok { border-color: var(--ok); } .card .ops .no { border-color: var(--err); }
 
+/* settings */
+.settings {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 10px;
+}
+.settings .group {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg2);
+  padding: 10px 12px;
+}
+.settings .group h3 { margin: 0 0 8px; font-size: 13px; color: var(--dim); }
+.settings .field { display: flex; flex-direction: column; margin-bottom: 8px; }
+.settings .field label { font-size: 12px; color: var(--dim); margin-bottom: 3px; }
+.settings .field input {
+  width: 100%; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px;
+}
+.settings .field input[type="checkbox"] { width: auto; }
+
 /* logs / status */
 .logview {
   background: var(--bg2); border: 1px solid var(--line); border-radius: 8px;

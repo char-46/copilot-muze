@@ -1,5 +1,26 @@
 # copilot-muze configuration
 # Copy to config.yaml and adjust. `config.yaml` is gitignored.
+#
+# ── Multi-account (optional) ────────────────────────────────────────────────
+# To run several QQ accounts in ONE muze process, use an `instances:` list.
+# Top-level keys act as shared defaults; each entry deep-merges over them.
+# Every instance gets its own database (owner-bound), media, webui port and
+# schedule; the console switches accounts with `/use <name>`.
+#
+# llm:
+#   chat: {base_url: "https://open.bigmodel.cn/api/paas/v4/", api_key: "", model: glm-4.7}
+# instances:
+#   - name: main
+#     milky: {base_url: "http://127.0.0.1:3010", access_token: ""}
+#     storage: {data_dir: ./data-a}
+#     web: {port: 8300}
+#     control: {admin_users: [10001]}
+#   - name: alt
+#     milky: {base_url: "http://127.0.0.1:3011", access_token: ""}
+#     storage: {data_dir: ./data-b, db_file: ""}   # db_file: explicit sqlite path override
+#     web: {port: 8301}
+#     control: {admin_users: [10001]}
+# ────────────────────────────────────────────────────────────────────────────
 
 milky:
   # LLBot (or Lagrange.Milky) serving the Milky protocol.

@@ -41,6 +41,80 @@ def create_app(service: ControlService, repo: Repository, runtime: Runtime, toke
         )
 
     # ------------------------------------------------------------------
+    SECRET_PATHS = (
+        ("milky", "access_token"),
+        ("llm", "chat", "api_key"),
+        ("llm", "vision", "api_key"),
+        ("web", "token"),
+    )
+    SET_MASK = "***set***"
+
+    def _mask(cfg_dict: dict) -> dict:
+        import copy
+
+        d = copy.deepcopy(cfg_dict)
+        for path in SECRET_PATHS:
+            node = d
+            try:
+                for k in path[:-1]:
+                    node = node[k]
+                if node.get(path[-1]):
+                    node[path[-1]] = SET_MASK
+            except (KeyError, TypeError):
+                continue
+        return d
+
+    def _apply_updates(cfg_dict: dict, updates: dict) -> list[str]:
+        """Apply dotted-path updates onto a config dict in place.
+
+        Masked/empty secrets keep the stored value. Returns applied paths.
+        """
+        applied: list[str] = []
+        for dotted, value in updates.items():
+            keys = [k for k in str(dotted).split(".") if k]
+            if not keys:
+                continue
+            node_new = updates
+            node_old = cfg_dict
+            ok = True
+            for k in keys[:-1]:
+                if not isinstance(node_old.get(k), dict):
+                    ok = False
+                    break
+                node_old = node_old[k]
+            if not ok:
+                continue
+            leaf = keys[-1]
+            if tuple(keys) in SECRET_PATHS and (value == SET_MASK or value == ""):
+                continue  # keep existing secret
+            if isinstance(node_old.get(leaf), bool):
+                value = str(value).strip().lower() in ("1", "true", "yes", "on")
+            elif isinstance(node_old.get(leaf), int) and str(value).strip().lstrip("-").isdigit():
+                value = int(value)
+            elif isinstance(node_old.get(leaf), list):
+                if isinstance(value, str):
+                    value = [x.strip() for x in value.replace("，", ",").split(",") if x.strip()]
+            node_old[leaf] = value
+            applied.append(".".join(keys))
+        return applied
+
+    async def _persist_runtime(cfg_dict_updates: dict) -> None:
+        """Push applied updates into the live MuzeConfig + LLM client."""
+        from muze.config import MuzeConfig
+
+        merged = service.cfg.model_dump(mode="json")
+        _apply_updates(merged, cfg_dict_updates)
+        try:
+            fresh = MuzeConfig.model_validate(merged)
+        except Exception as e:
+            raise web.HTTPBadRequest(text=f"invalid config: {e}")
+        for name in MuzeConfig.model_fields:
+            setattr(service.cfg, name, getattr(fresh, name))
+        llm = getattr(runtime, "llm", None)
+        if llm is not None:
+            llm.apply_config(service.cfg.llm)
+
+    # ------------------------------------------------------------------
     @web.middleware
     async def auth(request: web.Request, handler):
         if request.path.startswith("/api/"):
@@ -181,6 +255,32 @@ def create_app(service: ControlService, repo: Repository, runtime: Runtime, toke
             {"text": outcome.text, "is_error": outcome.is_error}
         )
 
+    async def api_config_get(_request: web.Request) -> web.Response:
+        cfg_dict = service.cfg.model_dump(mode="json")
+        return web.json_response(
+            {
+                "instance": getattr(runtime, "instance_name", "main"),
+                "masked": _mask(cfg_dict),
+                "hint": "secrets 显示为 ***set***；留空/保持掩码提交则不修改。运行时生效，持久化请编辑 config.yaml 后 /reload",
+            }
+        )
+
+    async def api_config_post(request: web.Request) -> web.Response:
+        data = await request.json()
+        updates = data.get("updates") or {}
+        if not isinstance(updates, dict) or not updates:
+            return web.json_response({"error": "missing updates"}, status=400)
+        try:
+            await _persist_runtime(updates)
+        except web.HTTPBadRequest as e:
+            return web.json_response({"error": e.text}, status=400)
+        return web.json_response(
+            {
+                "applied": list(updates.keys()),
+                "hint": "已运行时生效；持久化请编辑 config.yaml 后执行 /reload",
+            }
+        )
+
     async def api_logs_tail(request: web.Request) -> web.Response:
         lines = max(10, min(int(request.query.get("lines", 300)), 3000))
         path = Path(runtime.log_path)
@@ -212,6 +312,8 @@ def create_app(service: ControlService, repo: Repository, runtime: Runtime, toke
     app.router.add_get("/api/pending", api_pending)
     app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)
     app.router.add_get("/api/logs/tail", api_logs_tail)
+    app.router.add_get("/api/config", api_config_get)
+    app.router.add_post("/api/config", api_config_post)
     return app
 
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from muze.ai.agent import Agent
 from muze.ai.llm import LLMClient
 from muze.chatlog import ChatLog, setup_logging
-from muze.config import MuzeConfig, load_config
+from muze.config import InstanceSpec, MuzeConfig, load_instances
 from muze.core.service import ControlContext, ControlService, Runtime
 from muze.ingest.backfill import Backfiller
 from muze.ingest.pipeline import IngestPipeline
@@ -44,11 +44,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 class App:
-    def __init__(self, cfg: MuzeConfig, config_path: str) -> None:
+    def __init__(self, cfg: MuzeConfig, config_path: str, name: str = "main") -> None:
         self.cfg = cfg
         self.config_path = config_path
+        self.name = name
         self.chatlog = ChatLog()
         self.runtime = Runtime()
+        self.runtime.instance_name = name
         self._stop = asyncio.Event()
         self.restart_requested = False
         self.conn = None
@@ -124,6 +126,7 @@ class App:
         self.runtime.reloader = self.reloader
         self.runtime.request_restart = self._request_restart
         self.runtime.request_stop = self._request_stop
+        self.runtime.llm = self.llm
 
         if cfg.web.enabled:
             from muze.web.server import start_web
@@ -141,11 +144,12 @@ class App:
         self._stop.set()
 
     # ------------------------------------------------------------- events
-    async def run(self) -> None:
+    async def run(self, spawn_console: bool = True, console_registry=None) -> None:
         self._loop = asyncio.get_running_loop()
         await self.backfiller.start_background()
         asyncio.create_task(self._maintenance_loop())
-        self._spawn_console()
+        if spawn_console:
+            self._spawn_console(console_registry)
         events_task = asyncio.create_task(self._consume_events())
         stopper = asyncio.create_task(self._stop.wait())
         try:
@@ -162,7 +166,7 @@ class App:
             await self.dispatch(ev)
 
     # ------------------------------------------------------------- console
-    def _spawn_console(self) -> None:
+    def _spawn_console(self, registry=None) -> None:
         """Interactive REPL on stdin when running in a foreground terminal."""
         import os
 
@@ -170,6 +174,7 @@ class App:
         if not forced and not (sys.stdin.isatty() and sys.stdout.isatty()):
             log.info("stdin is not a tty; console disabled (use `muze cli`, the webui, or MUZE_FORCE_CONSOLE=1)")
             return
+        self._console_registry = registry
         t = threading.Thread(
             target=self._console_thread,
             name="muze-console",
@@ -189,8 +194,9 @@ class App:
             auto_confirm=True,
         )
         history = self.cfg.storage.data_dir / "console_history"
+        registry = getattr(self, "_console_registry", None)
         try:
-            repl_thread(self._loop, self.service, ctx, history, self._stop)
+            repl_thread(self._loop, self.service, ctx, history, self._stop, registry=registry)
         except Exception:
             log.exception("console thread crashed")
 
@@ -279,18 +285,24 @@ RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve
 def run_main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
-        cfg = load_config(args.config)
+        specs: list[InstanceSpec] = load_instances(args.config)
     except (FileNotFoundError, ValueError) as e:
         print(f"config error: {e}", file=sys.stderr)
         return 2
 
-    log_path = setup_logging(cfg.log, cfg.storage)
-    log.info("muze %s starting (config=%s)", get_version(), args.config)
+    log_path = setup_logging(specs[0].config.log, specs[0].config.storage)
+    log.info(
+        "muze %s starting (config=%s, instances=%s)",
+        get_version(), args.config, [s.name for s in specs],
+    )
     log.info("log file: %s (never rotated)", log_path)
 
-    app = App(cfg, args.config)
+    apps = [App(s.config, args.config, name=s.name) for s in specs]
     try:
-        asyncio.run(_bootstrap(app))
+        if len(apps) == 1:
+            asyncio.run(_bootstrap(apps[0]))
+        else:
+            asyncio.run(_multi_bootstrap(apps))
     except KeyboardInterrupt:
         log.info("interrupted by user")
         return 0
@@ -301,7 +313,7 @@ def run_main(argv: list[str]) -> int:
     except RuntimeError as e:
         log.error("%s", e)
         return 4
-    if app.restart_requested:
+    if any(a.restart_requested for a in apps):
         log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
         return RESTART_EXIT
     return 0
@@ -317,3 +329,46 @@ async def _bootstrap(app: App) -> None:
             log.exception("cleanup after failed setup crashed")
         raise
     await app.run()
+
+
+async def _multi_bootstrap(apps: list[App]) -> None:
+    """Run several account instances in one process. Any instance exiting
+    (shutdown / restart / crash) stops the others; the exit code is
+    aggregated in run_main."""
+    registry: dict[str, ControlService] = {}
+    try:
+        for app in apps:
+            await app.setup()
+            registry[app.name] = app.service
+    except BaseException:
+        log.error("instance setup failed; shutting down already-started instances")
+        for a in apps:
+            try:
+                await a.shutdown()
+            except Exception:
+                log.exception("cleanup after failed setup crashed")
+        raise
+
+    log.info("running %s instances: %s", len(apps), ", ".join(registry))
+    tasks = [
+        asyncio.create_task(
+            app.run(
+                spawn_console=(i == 0),
+                console_registry=registry if len(apps) > 1 else None,
+            ),
+            name=f"instance:{app.name}",
+        )
+        for i, app in enumerate(apps)
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for app in apps:
+        app._request_stop()
+    for t in pending:
+        try:
+            await t
+        except Exception:
+            pass
+    for t in done:
+        exc = t.exception()
+        if exc:
+            log.error("instance task crashed: %s", exc)

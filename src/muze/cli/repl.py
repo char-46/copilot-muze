@@ -15,7 +15,7 @@ import sys
 from muze.ai.agent import Agent
 from muze.ai.llm import LLMClient
 from muze.chatlog import ChatLog, setup_logging
-from muze.config import load_config
+from muze.config import load_instances
 from muze.console import repl_async
 from muze.core.service import ControlContext, ControlService, Runtime
 from muze.provider.base import ProtocolError
@@ -28,16 +28,34 @@ from muze.version import get_version
 def parse_cli_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="muze cli", description="copilot-muze interactive console")
     p.add_argument("-c", "--config", default="config.yaml", help="path to config.yaml")
+    p.add_argument(
+        "-i", "--instance", default=None,
+        help="instance name when the config defines multiple accounts",
+    )
     return p.parse_args(argv)
 
 
 def run_cli(argv: list[str]) -> int:
     args = parse_cli_args(argv)
     try:
-        cfg = load_config(args.config)
+        load_instances(args.config)
     except (FileNotFoundError, ValueError) as e:
         print(f"config error: {e}", file=sys.stderr)
         return 2
+
+    specs = load_instances(args.config)
+    spec = specs[0]
+    if args.instance:
+        matches = [s for s in specs if s.name == args.instance]
+        if not matches:
+            print(
+                f"instance {args.instance!r} not found; available: "
+                + ", ".join(s.name for s in specs),
+                file=sys.stderr,
+            )
+            return 2
+        spec = matches[0]
+    cfg = spec.config
 
     setup_logging(cfg.log, cfg.storage)  # keep the shared chat log growing
 
