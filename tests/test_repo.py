@@ -44,6 +44,14 @@ async def test_message_timestamp_stored_and_fallback(repo):
     assert row0["time"] > 0
 
 
+async def test_stats_include_archive_range(repo):
+    for seq in (1, 5, 3):
+        await repo.upsert_message(make_msg(seq=seq), "x", "event")
+    stats = await repo.stats()
+    assert stats["oldest_ts"] == 1759000001
+    assert stats["newest_ts"] == 1759000005
+
+
 async def test_watermark_tracks_max_seq(repo):
     for seq in (1, 5, 3):
         await repo.upsert_message(make_msg(seq=seq), "x", "event")

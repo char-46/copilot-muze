@@ -624,6 +624,8 @@ class ControlService:
             + (f" (inject={'on' if self.cfg.digest.inject_context else 'off'})" if bg else ""),
             f"conversations={stats['conversations']} messages={stats['messages']} "
             f"(by scene: {stats.get('messages_by_scene')})",
+            f"archive: {epoch_iso(stats.get('oldest_ts')) or '-'} ~ "
+            f"{epoch_iso(stats.get('newest_ts')) or '-'}",
             f"media done/failed/pending={stats['media']['done']}/{stats['media']['failed']}"
             f"/{stats['media']['pending']} size={size_fmt(stats['media']['bytes'])}",
             f"pending confirmations={stats['pending_actions']} agent={'on' if self.agent else 'off'}",

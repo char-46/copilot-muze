@@ -595,6 +595,11 @@ class Repository:
             "SELECT scene, COUNT(*) FROM messages GROUP BY scene"
         ) as cur:
             out["messages_by_scene"] = {r[0]: r[1] for r in await cur.fetchall()}
+        async with self.conn.execute(
+            "SELECT MIN(time), MAX(time) FROM messages"
+        ) as cur:
+            row = await cur.fetchone()
+        out["oldest_ts"], out["newest_ts"] = (row[0], row[1]) if row else (None, None)
         out["media"] = await self.media_stats()
         out["pending_actions"] = len(await self.list_pending_actions())
         return out

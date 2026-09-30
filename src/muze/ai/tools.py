@@ -28,6 +28,7 @@ SPEC = [
                 "执行 muze 内部命令（与 /help 列出的一致，不要带斜杠）。"
                 "例: cli({\"command\": \"search 报价 20\"})、cli({\"command\": \"msg group/123 456\"})。"
                 "查询/搜索/读取消息/展开转发/标记已读/定时任务等都走这个工具；"
+                "归档规模与时间范围（最早/最新消息日期）用 cli({\"command\": \"status\"})；"
                 "不确定用法时先 cli({\"command\": \"help\"})。"
             ),
             "parameters": {
