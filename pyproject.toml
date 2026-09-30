@@ -7,7 +7,7 @@ license = { text = "MIT" }
 authors = [{ name = "muze" }]
 # Pre-release is bumped per feature commit; build metadata (git sha, build time)
 # is appended at runtime by muze.version.get_version().
-version = "0.1.0a39"
+version = "0.1.0a40"
 dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
@@ -16,6 +16,7 @@ dependencies = [
     "openai>=1.40",
     "prompt-toolkit>=3.0",
     "python-docx>=1.1",
+    "pillow>=12.3.0",
 ]
 
 [project.scripts]

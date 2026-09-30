@@ -23,7 +23,7 @@ log = logging.getLogger("muze.ai")
 # the controller's session but are routed to the controller for approval in
 # any other conversation (see ControlService.requires_approval).
 # send_message routes itself via ControlService.request_send.
-WRITE_TOOLS = {"schedule_task", "remember"}
+WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete"}
 
 SPEC = [
     {
@@ -136,6 +136,58 @@ SPEC = [
                     "message_seq": {"type": "integer"},
                 },
                 "required": ["scene", "peer_id", "message_seq"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_media",
+            "description": "发送图片/表情/文件/视频：归档媒体(media_id 或 scene/peer/message_seq)或本地文件(path)。受权限约束",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scene": {"type": "string", "enum": ["friend", "group"]},
+                    "peer_id": {"type": "integer"},
+                    "media_id": {"type": "integer", "description": "归档媒体 id（与 message_seq 二选一）"},
+                    "message_seq": {"type": "integer", "description": "取该消息的第一件媒体"},
+                    "path": {"type": "string", "description": "本地文件绝对路径（如生成的图表）"},
+                    "caption": {"type": "string", "description": "随附文本，可选"},
+                },
+                "required": ["scene", "peer_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ocr_image",
+            "description": "识别某条消息图片中的文字（OCR）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scene": {"type": "string", "enum": ["friend", "group"]},
+                    "peer_id": {"type": "integer"},
+                    "message_seq": {"type": "integer"},
+                },
+                "required": ["scene", "peer_id", "message_seq"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_chart",
+            "description": "生成柱状/折线图 PNG（labels/values 等长），随后可用 send_media 发送",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                    "values": {"type": "array", "items": {"type": "number"}},
+                    "kind": {"type": "string", "enum": ["bar", "line"], "description": "默认 bar"},
+                },
+                "required": ["title", "labels", "values"],
             },
         },
     },
@@ -281,6 +333,49 @@ SPEC = [
                     "kind": {"type": "string", "enum": ["identity", "preference", "relation", "fact"]},
                 },
                 "required": ["subject", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "检索长期记忆（按关键词/主题），返回 [{id,subject,kind,content}]",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_update",
+            "description": "修订一条长期记忆的内容（控制者会话外需审批）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "content": {"type": "string"},
+                },
+                "required": ["id", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_delete",
+            "description": "停用（软删除）一条长期记忆（控制者会话外需审批）",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"],
             },
         },
     },
@@ -582,6 +677,97 @@ class ToolRunner:
         )
         return {"result": outcome.text, "is_error": outcome.is_error}
 
+    async def t_send_media(self, args: dict) -> dict:
+        from pathlib import Path
+
+        from muze.provider.milky.models import out_file, out_image, out_record, out_video
+        from muze.store.media import to_file_uri
+
+        scene = args.get("scene")
+        peer = args.get("peer_id")
+        seg = None
+        preview = ""
+
+        if args.get("path"):
+            p = Path(str(args["path"]))
+            if not p.exists():
+                return {"error": f"文件不存在: {p}"}
+            kind = _kind_by_ext(p.suffix.lower())
+            uri = to_file_uri(p)
+            seg = _seg_for_kind(kind, uri, p.name, out_image, out_record, out_video, out_file)
+            preview = f"[{kind}] {p.name}"
+        else:
+            row = None
+            if args.get("media_id"):
+                row = await self.repo.media_by_id(int(args["media_id"]))
+            elif peer is not None and args.get("message_seq") is not None:
+                rows = await self.repo.media_for_message(
+                    scene, int(peer), int(args["message_seq"])
+                )
+                row = rows[0] if rows else None
+            if not row:
+                return {"error": "未找到媒体（给 media_id，或 scene/peer/message_seq，或 path）"}
+            if row["status"] != "done" or not row.get("file_path"):
+                return {"error": f"媒体不可用（status={row['status']}）"}
+            seg = _seg_for_kind(
+                row["kind"], to_file_uri(row["file_path"]), row.get("file_name") or "",
+                out_image, out_record, out_video, out_file,
+            )
+            preview = f"[{row['kind']}] {row.get('file_name') or Path(row['file_path']).name}"
+
+        segments = [seg]
+        caption = str(args.get("caption", "") or "").strip()
+        if caption:
+            segments.append(out_text(caption))
+            preview += f" {caption}"
+        outcome = await self.service.request_send(
+            scene, int(peer), segments, preview, self.ctx, "agent"
+        )
+        return {"result": outcome.text, "is_error": outcome.is_error}
+
+    async def t_ocr_image(self, args: dict) -> dict:
+        medias = await self.repo.media_for_message(
+            args["scene"], args["peer_id"], args["message_seq"]
+        )
+        imgs = [
+            m for m in medias
+            if m["kind"] in ("image", "face") and m["status"] == "done" and m.get("file_path")
+        ]
+        if not imgs:
+            return {"error": "该消息没有已下载的图片"}
+        if self.llm is None:
+            return {"error": "未配置视觉模型"}
+        out = []
+        for m in imgs[:3]:
+            out.append(
+                await self.llm.vision_describe(
+                    m["file_path"], "识别并逐字输出图片中的所有文字（保留换行），不要解释。"
+                )
+            )
+        return {"text": "\n---\n".join(out)}
+
+    async def t_make_chart(self, args: dict) -> dict:
+        import asyncio
+
+        from muze.mediaops import make_chart
+
+        labels = args.get("labels") or []
+        values = args.get("values") or []
+        if not isinstance(labels, list) or not isinstance(values, list) or len(labels) != len(values):
+            return {"error": "labels/values 必须等长且非空"}
+        try:
+            path = await asyncio.to_thread(
+                make_chart,
+                self.service.cfg.storage.data_dir,
+                str(args.get("title", "chart")),
+                labels,
+                values,
+                str(args.get("kind", "bar")),
+            )
+        except Exception as e:
+            return {"error": f"绘图失败: {e}"}
+        return {"path": str(path), "note": "已生成 PNG；用 send_media(path=...) 发送"}
+
     async def t_schedule_task(self, args: dict) -> dict:
         scheduler = self.service.runtime.scheduler
         if scheduler is None:
@@ -706,6 +892,32 @@ class ToolRunner:
         log.info("MEM        | + [%s/%s] %s (via remember tool)", subject, kind, content)
         return {"saved": True, "id": mid}
 
+    async def t_memory_search(self, args: dict) -> dict:
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return {"error": "query 不能为空"}
+        rows = await self.repo.search_memories(
+            q, subject=args.get("subject") or None, limit=int(args.get("limit", 30))
+        )
+        return {
+            "count": len(rows),
+            "memories": [
+                {"id": r["id"], "subject": r["subject"], "kind": r["kind"], "content": r["content"]}
+                for r in rows
+            ],
+        }
+
+    async def t_memory_update(self, args: dict) -> dict:
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"error": "content 不能为空"}
+        ok = await self.repo.update_memory(int(args["id"]), content)
+        return {"updated": True} if ok else {"error": f"记忆 #{args['id']} 不存在"}
+
+    async def t_memory_delete(self, args: dict) -> dict:
+        ok = await self.repo.retire_memory(int(args["id"]))
+        return {"deleted": True} if ok else {"error": f"记忆 #{args['id']} 不存在"}
+
     async def t_read_skill(self, args: dict) -> dict:
         skills = self.service.runtime.skills
         if skills is None:
@@ -723,3 +935,23 @@ class ToolRunner:
 def _args_brief(args: dict) -> str:
     s = json.dumps(args, ensure_ascii=False, default=str)
     return s[:300]
+
+
+def _kind_by_ext(ext: str) -> str:
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+        return "image"
+    if ext in (".mp4", ".mov", ".mkv", ".webm"):
+        return "video"
+    if ext in (".amr", ".silk", ".mp3", ".wav", ".ogg"):
+        return "record"
+    return "file"
+
+
+def _seg_for_kind(kind, uri, name, out_image, out_record, out_video, out_file) -> dict:
+    if kind in ("image", "face"):
+        return out_image(uri)
+    if kind == "record":
+        return out_record(uri)
+    if kind == "video":
+        return out_video(uri)
+    return out_file(uri, name or "")

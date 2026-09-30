@@ -162,3 +162,30 @@ async def test_cli_write_command_gated_read_allowed(env):
 
     read = json.loads(await runner.run("cli", {"command": "help"}))
     assert "命令列表" in read.get("output", "")
+
+
+async def test_memory_tools_gated_and_work(env):
+    import json
+
+    service, repo, adapter, _ = env
+    mid = await repo.add_memory("fact", "owner", "喜欢乌龙茶", source="chat")
+
+    outside = ToolRunner(service, repo, adapter, None, ctx_qq("group", 999))
+    # search = read -> allowed anywhere
+    res = json.loads(await outside.run("memory_search", {"query": "乌龙"}))
+    assert res["count"] == 1 and res["memories"][0]["id"] == mid
+    # update outside the control session -> gated
+    g = json.loads(await outside.run("memory_update", {"id": mid, "content": "喜欢普洱"}))
+    assert g.get("needs_approval") is True
+    rows = await repo.list_pending_actions()
+    assert rows and rows[0]["kind"] == "op"
+
+    # controller approves -> applied
+    await service.confirm_action(rows[0]["id"], ctx_qq("group", 20002))
+    assert (await repo.list_memories())[0]["content"] == "喜欢普洱"
+
+    # in the control session, deletes run directly
+    inside = ToolRunner(service, repo, adapter, None, ctx_qq("friend", 10001))
+    d = json.loads(await inside.run("memory_delete", {"id": mid}))
+    assert d.get("deleted") is True
+    assert await repo.list_memories() == []  # active-only listing empty

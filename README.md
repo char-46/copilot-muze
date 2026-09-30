@@ -123,16 +123,20 @@ images (vision model), expand forwarded messages, and draft sends.
 
 ### Permissions (agent & commands)
 
-- **Reads are unconditional anywhere**: archive search/browse, message
-  detail, media, stats, dreams, memories, skills, `fetch_url`, `read_document`,
-  `describe_image`.
+- **Reads are unconditional anywhere**: archive search/browse, structured
+  `search_archive` / `activity` / `directory`, message detail, media, stats,
+  dreams, memories (`memory_search`), skills, `fetch_url`, `read_document`,
+  `describe_image`, `ocr_image`, `make_chart`, `web_search`, `research`.
 - **Writes run freely only in the controller's session**: the control
   conversation (control group / authority DM) or a local front (CLI/WebUI/
-  console).
-- **Anywhere else, every write is routed to the controller**: sends,
-  scheduled tasks, memory writes, and write-capable `cli` commands become a
-  pending request sent to the controller (`/confirm <id>` approves,
-  `/cancel <id>` rejects). `/help` marks write commands with `[写]`.
+  console). That covers `send_message`, `send_media` (archive media or a
+  local file/chart), `schedule_task`, `remember`, `memory_update`,
+  `memory_delete`, and write-capable `cli` commands.
+- **Anywhere else, every write is routed to the controller**: sends
+  (text/media), scheduled tasks, memory writes, and write-capable `cli`
+  commands become a pending request sent to the controller
+  (`/confirm <id>` approves, `/cancel <id>` rejects). `/help` marks write
+  commands with `[写]`.
 
 ### Research (agent)
 

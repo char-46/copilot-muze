@@ -622,6 +622,26 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def search_memories(self, query: str, subject: str | None = None, limit: int = 30) -> list[dict]:
+        sql = "SELECT * FROM memories WHERE active=1 AND (content LIKE ? OR subject LIKE ?)"
+        args: list = [f"%{query}%", f"%{query}%"]
+        if subject:
+            sql += " AND subject=?"
+            args.append(subject)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        args.append(limit)
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_memory(self, memory_id: int, content: str) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE memories SET content=?, updated_at=? WHERE id=? AND active=1",
+            (content, _now(), memory_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
     async def retire_memory(self, memory_id: int) -> bool:
         cur = await self.conn.execute(
             "UPDATE memories SET active=0, updated_at=? WHERE id=? AND active=1",

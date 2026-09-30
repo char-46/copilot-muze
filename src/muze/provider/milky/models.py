@@ -374,3 +374,14 @@ def out_image(file_uri: str) -> dict:
 
 def out_record(file_uri: str) -> dict:
     return {"type": "record", "data": {"file_uri": file_uri}}
+
+
+def out_video(file_uri: str) -> dict:
+    return {"type": "video", "data": {"file_uri": file_uri}}
+
+
+def out_file(file_uri: str, file_name: str = "") -> dict:
+    data: dict = {"file_uri": file_uri}
+    if file_name:
+        data["file_name"] = file_name
+    return {"type": "file", "data": data}
