@@ -23,6 +23,7 @@ class ScriptLLM:
 
     async def chat(self, messages, tools=None):
         self.calls += 1
+        self.last_messages = messages
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -125,6 +126,20 @@ async def test_converse_uses_all_steps_then_notes(env, monkeypatch):
     agent = Agent(service, repo, llm, ChatLog(), 3)
     out = await agent.converse("loop", ctx())
     assert "步数上限" in out.text
+
+
+async def test_converse_strips_control_prefix(env):
+    service, repo = env
+    llm = ScriptLLM([{"role": "assistant", "content": "hi"}])
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    await agent.converse("::你好", ctx())
+    users = [m for m in llm.last_messages if m["role"] == "user"]
+    assert users and users[-1]["content"] == "你好"
+    assert not any(str(m.get("content", "")).startswith("::") for m in llm.last_messages)
+    # full-width colons too
+    llm.script = [{"role": "assistant", "content": "ok"}]
+    await agent.converse("：：再问一次", ctx())
+    assert llm.last_messages[-1]["content"] == "再问一次"
 
 
 async def test_structured_query_tools(env):

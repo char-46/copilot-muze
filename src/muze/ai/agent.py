@@ -9,7 +9,13 @@ import logging
 from muze.ai.llm import LLMClient
 from muze.ai.tools import SPEC, ToolRunner
 from muze.chatlog import ChatLog, epoch_iso
-from muze.core.service import CommandOutcome, ControlContext, ControlService
+from muze.core.service import (
+    CommandOutcome,
+    ControlContext,
+    ControlService,
+    is_llm_invocation,
+    strip_llm_prefix,
+)
 from muze.store.repo import Repository
 
 log = logging.getLogger("muze.ai")
@@ -193,6 +199,14 @@ class Agent:
     async def converse(self, text: str, ctx: ControlContext) -> CommandOutcome:
         if not self.llm.configured:
             return CommandOutcome("LLM 未配置（llm.chat.*）", is_error=True)
+        # the `::` control prefix must never reach the model: the QQ path
+        # strips it in service.execute, but other fronts (webui AI tab) call
+        # converse directly, so strip defensively here too.
+        text = (text or "").strip()
+        if is_llm_invocation(text):
+            text = strip_llm_prefix(text)
+        if not text:
+            return CommandOutcome.err("空输入")
         history = self._history(ctx.chat_key)
         history.append({"role": "user", "content": text})
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "in", text)
