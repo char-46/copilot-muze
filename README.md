@@ -81,7 +81,7 @@ actually supports and degrades lazily.
 | command | effect |
 |---|---|
 | `/status` | version+build, uptime, archive stats, capabilities |
-| `/sync [force] [target]` | roaming backfill now; `force` ignores the watermark and pulls EVERYTHING to the roaming end (duplicates are upsert-deduped — recovers holes) |
+| `/sync [force] [target]` | roaming backfill now; `force` ignores the watermark and pulls EVERYTHING to the roaming end (duplicates are upsert-deduped — recovers holes); if a pull is already running, its periodic reports are forwarded here |
 | `/unread` | recently active conversations with previews |
 | `/search <kw> [n]` | full-text search over the archive |
 | `/day <date> [target]` | what happened on a day (`YYYY-MM-DD`/`today`/`yesterday`); scoped or overview |

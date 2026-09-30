@@ -2,8 +2,9 @@
 
 Cadence (per user spec): immediate on start, then at minute 1, 2 and 3,
 then every 5 minutes, and a final summary on completion. Progress lines are
-delivered to the originating control conversation when QQ-reachable,
-otherwise written to the log.
+broadcast to every subscriber (the originating control conversation, plus any
+front that `/sync`s while the pull is still running); when there is no
+subscriber the lines are dropped (background pulls).
 """
 
 from __future__ import annotations
@@ -22,11 +23,13 @@ class ProgressReporter:
     def __init__(
         self,
         label: str,
-        emit: Callable[[str], Awaitable[None]],
+        emit: Callable[[str], Awaitable[None]] | None = None,
         now: Callable[[], float] | None = None,
     ) -> None:
         self.label = label
-        self.emit = emit
+        self._subs: list[Callable[[str], Awaitable[None]]] = []
+        if emit is not None:
+            self._subs.append(emit)
         self.now = now or time.monotonic
         self.t0 = self.now()
         self.new_msgs = 0
@@ -35,6 +38,23 @@ class ProgressReporter:
         self._milestones = list(self.FIRST_MILESTONES)
         self._next_periodic = float(self.PERIODIC)
         self.started_msg_sent = False
+
+    # ---------------------------------------------------------- subscribers
+    def add_subscriber(self, emit: Callable[[str], Awaitable[None]]) -> None:
+        """Register another delivery target (e.g. a later /sync trigger).
+
+        Progress is broadcast to every subscriber, so a pull started by one
+        front can also report to whoever asks while it is still running.
+        """
+        if emit not in self._subs:
+            self._subs.append(emit)
+
+    async def _emit(self, text: str) -> None:
+        for sub in list(self._subs):
+            try:
+                await sub(text)
+            except Exception:
+                log.exception("progress emit failed")
 
     # ------------------------------------------------------------- update
     def bump(self, new: int = 0, pages: int = 0, convs: int = 0) -> None:
@@ -45,10 +65,7 @@ class ProgressReporter:
     async def report_start(self, note: str = "") -> None:
         self.started_msg_sent = True
         text = f"▶ {self.label} 开始{('：' + note) if note else ''}"
-        try:
-            await self.emit(text)
-        except Exception:
-            log.exception("progress emit failed")
+        await self._emit(text)
 
     async def maybe_tick(self) -> bool:
         """Emit a progress line if a cadence point has been reached."""
@@ -60,10 +77,7 @@ class ProgressReporter:
             f"已翻 {self.pages} 页，新增 {self.new_msgs} 条"
             + (f"，完成会话 {self.convs_done} 个" if self.convs_done else "")
         )
-        try:
-            await self.emit(text)
-        except Exception:
-            log.exception("progress emit failed")
+        await self._emit(text)
         return True
 
     async def finish(self, note: str) -> None:
@@ -75,10 +89,7 @@ class ProgressReporter:
             f"{self.pages} 页，新增 {self.new_msgs} 条"
             + (f"，会话 {self.convs_done} 个" if self.convs_done else "")
         )
-        try:
-            await self.emit(text)
-        except Exception:
-            log.exception("progress emit failed")
+        await self._emit(text)
 
     async def abort(self, note: str) -> None:
         """Report that the job did not run (e.g. a pull was already active).
@@ -87,10 +98,7 @@ class ProgressReporter:
         happened and confuse the command's own report.
         """
         text = f"⚠ {self.label} 未执行：{note}"
-        try:
-            await self.emit(text)
-        except Exception:
-            log.exception("progress emit failed")
+        await self._emit(text)
 
     # -------------------------------------------------------------- timing
     def _pop_due(self) -> float | None:

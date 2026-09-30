@@ -15,6 +15,7 @@ import time
 from muze.chatlog import ChatLog, conv_id
 from muze.config import MuzeConfig, is_control_conversation
 from muze.ingest.pipeline import IngestPipeline
+from muze.progress import ProgressReporter
 from muze.provider.base import ProtocolAdapter, ProtocolError
 from muze.store.repo import Repository
 
@@ -41,6 +42,7 @@ class Backfiller:
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._rescan_task: asyncio.Task | None = None
+        self._reporter: ProgressReporter | None = None
 
     # ------------------------------------------------------------ targets
     async def target_conversations(self) -> list[tuple[str, int]]:
@@ -144,45 +146,78 @@ class Backfiller:
     async def run_once(
         self,
         targets: list[tuple[str, int]] | None = None,
-        reporter=None,
+        reporter: ProgressReporter | None = None,
         force: bool = False,
     ) -> int | None:
         if self.running:
             log.info("backfill already running; skipping")
             return None
         self.running = True
+        own_reporter = reporter is None
+        if reporter is None:
+            # Owned reporter: a background pull has no front to report to until
+            # someone /syncs, at which point they subscribe (see subscribe()).
+            reporter = ProgressReporter("全量补拉" + ("（强制全量）" if force else ""))
+        self._reporter = reporter
         started = time.time()
         new_total = 0
         try:
             targets = targets if targets is not None else await self.target_conversations()
-            log.info(
-                "backfill start: %s conversations (force=%s)", len(targets), force
+            log.info("backfill start: %s conversations (force=%s)", len(targets), force)
+            await reporter.report_start(
+                f"{len(targets)} 个会话" + ("（强制全量）" if force else "")
             )
-            if reporter is not None:
-                await reporter.report_start(
-                    f"{len(targets)} 个会话" + ("（强制全量）" if force else "")
-                )
-            for scene, peer in targets:
-                if self._stop.is_set():
-                    break
-                try:
-                    n = await self._backfill_conversation(scene, peer, reporter=reporter, force=force)
-                    new_total += n
-                    if reporter is not None:
+
+            concurrency = max(1, self.cfg.ingest.backfill.concurrency)
+            queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+            for t in targets:
+                queue.put_nowait(t)
+            counts = {"new": 0}
+
+            async def worker() -> None:
+                while not self._stop.is_set():
+                    try:
+                        scene, peer = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        n = await self._backfill_conversation(
+                            scene, peer, reporter=reporter, force=force
+                        )
+                        counts["new"] += n
                         reporter.bump(new=0, pages=0, convs=1)
                         await reporter.maybe_tick()
-                except Exception as e:
-                    log.warning("backfill conv %s crashed: %s", conv_id(scene, peer), e)
-                await asyncio.sleep(self.cfg.ingest.backfill.conv_delay)
+                    except Exception as e:
+                        log.warning("backfill conv %s crashed: %s", conv_id(scene, peer), e)
+                    await asyncio.sleep(self.cfg.ingest.backfill.conv_delay)
+
+            await asyncio.gather(*(worker() for _ in range(concurrency)))
+            new_total = counts["new"]
             self.last_new_messages = new_total
             self.last_run_at = time.time()
             log.info(
-                "backfill done: %s new messages in %.1fs",
-                new_total, self.last_run_at - started,
+                "backfill done: %s new messages in %.1fs (concurrency=%s)",
+                new_total, self.last_run_at - started, concurrency,
             )
+            if own_reporter:
+                await reporter.finish(f"完成，新增 {new_total} 条")
             return new_total
         finally:
+            self._reporter = None
             self.running = False
+
+    def subscribe(self, emit) -> bool:
+        """Attach a late delivery target to the currently-running pull.
+
+        Used when /sync is issued while a backfill is already active: its
+        periodic progress is forwarded to the new trigger. Returns True if
+        there was a running pull to subscribe to.
+        """
+        r = self._reporter
+        if not self.running or r is None:
+            return False
+        r.add_subscriber(emit)
+        return True
 
     # ---------------------------------------------------------- coverage
     async def probe_coverage(self, scene: str, peer_id: int, pages: int = 10) -> dict:

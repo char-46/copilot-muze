@@ -869,16 +869,21 @@ class ControlService:
             force = True
             args = args[1:]
 
-        if self.runtime.backfiller.running:
-            return CommandOutcome.err(
-                "已有补拉正在运行，本次未启动。等待其完成后再试（/status 查看）"
-            )
-
         async def emit(text: str) -> None:
             if ctx.qq_reachable:
                 await self.deliver(ctx, CommandOutcome(text))
             else:
                 self.chatlog.log.info("PROGRESS   | %s", text)
+
+        if self.runtime.backfiller.running:
+            if self.runtime.backfiller.subscribe(emit):
+                return CommandOutcome(
+                    "已有补拉正在运行；已把其定时汇报转发到此处"
+                    "（进行中按第 1/2/3 分钟及每 5 分钟汇报，完成时总结）"
+                )
+            return CommandOutcome.err(
+                "已有补拉正在运行，本次未启动。等待其完成后再试（/status 查看）"
+            )
 
         if args:
             scene, peer = self.parse_target(args[0])

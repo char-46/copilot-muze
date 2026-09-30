@@ -154,11 +154,92 @@ async def test_reporter_abort_is_not_a_completion():
     assert "✔" not in line and "共" not in line
 
 
-async def test_sync_while_backfill_running_reports_not_started(repo):
+async def test_reporter_broadcasts_to_all_subscribers():
+    a: list[str] = []
+    b: list[str] = []
+
+    async def emit_a(text):
+        a.append(text)
+
+    async def emit_b(text):
+        b.append(text)
+
+    rep = ProgressReporter("任务", emit_a)
+    rep.add_subscriber(emit_b)
+    rep.add_subscriber(emit_b)  # dedupe
+    await rep.report_start("x")
+    await rep.finish("完成")
+    assert len(rep._subs) == 2
+    assert a == b and a and a[-1].startswith("✔")
+
+
+async def test_backfiller_subscribe_false_when_idle(repo):
+    bf = Backfiller(FakeAdapter({}), repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    assert bf.subscribe(lambda text: None) is False
+
+
+async def test_run_once_owns_reporter_and_reports_finish(repo):
+    """A background pull (no reporter passed) still owns a reporter, so a
+    later /sync can subscribe and will receive the completion summary."""
+    pages = [{"start": 1, "seqs": [1, 2, 3], "next": None}]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    bf.cfg.ingest.backfill.conv_delay = 0
+
+    seen: list[str] = []
+    captured: dict = {}
+    orig = bf._backfill_conversation
+
+    async def collect(text):
+        seen.append(text)
+
+    async def spy(scene, peer, reporter=None, force=False):
+        captured["subscribed"] = bf.subscribe(collect)
+        return await orig(scene, peer, reporter=reporter, force=force)
+
+    bf._backfill_conversation = spy
+    new = await bf.run_once([("friend", 100)])
+    assert new == 3
+    assert captured["subscribed"] is True  # attachable while running
+    assert bf.subscribe(lambda t: None) is False  # gone after finish
+    assert any(s.startswith("✔") and "3" in s for s in seen)
+
+
+async def test_sync_while_backfill_running_forwards_progress(repo):
     from muze.core.service import ControlContext, ControlService, Runtime
 
     class RunningBF:
         running = True
+
+        def __init__(self):
+            self.subs: list = []
+
+        def subscribe(self, emit):
+            self.subs.append(emit)
+            return True
+
+        def status(self):
+            return {"running": True, "last_run_at": 0.0, "last_new_messages": 0}
+
+    bf = RunningBF()
+    runtime = Runtime()
+    runtime.backfiller = bf
+    svc = ControlService(MuzeConfig(), FakeAdapter({}), repo, ChatLog(), runtime)
+    ctx = ControlContext(source="qq", chat_key="qq:friend:1", scene="friend", peer_id=1)
+    out = await svc.run_command("/sync force", ctx)
+    assert not out.is_error and "转发" in out.text
+    assert len(bf.subs) == 1
+
+
+async def test_sync_when_running_without_reporter_reports_error(repo):
+    from muze.core.service import ControlContext, ControlService, Runtime
+
+    class RunningBF:
+        running = True
+
+        def subscribe(self, emit):
+            return False
 
         def status(self):
             return {"running": True, "last_run_at": 0.0, "last_new_messages": 0}

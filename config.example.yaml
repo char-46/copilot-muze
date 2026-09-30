@@ -53,6 +53,7 @@ ingest:
     page_limit: 30            # Milky max is 30
     page_delay: 1.0           # seconds between pages (rate-limit safety)
     conv_delay: 0.5           # seconds between conversations
+    concurrency: 4            # conversations pulled in parallel (1 = sequential)
     rescan_interval_min: 30   # periodic rescan (catches self-sent + missed events); 0 = off
     rescan_active_window_h: 24  # rescan only conversations active within this window
   media_download_concurrency: 3
