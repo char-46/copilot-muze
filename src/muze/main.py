@@ -62,6 +62,7 @@ class App:
         self.runtime.endpoint = spec.endpoint
         self._stop = asyncio.Event()
         self.restart_requested = False
+        self._shutdown_done = False
         self.conn = None
         self.repo = None
         self.adapter = None
@@ -145,6 +146,15 @@ class App:
 
     def _request_stop(self) -> None:
         self.restart_requested = False
+        self._stop.set()
+
+    def _stop_quiet(self) -> None:
+        """Stop this account WITHOUT changing its restart intent.
+
+        Used when a sibling account exits: the others must come down, but
+        an account that itself asked for a restart keeps that flag so
+        run_main still returns the daemon's restart code.
+        """
         self._stop.set()
 
     # ------------------------------------------------------------- events
@@ -270,19 +280,29 @@ class App:
                 log.exception("maintenance cycle failed")
 
     async def shutdown(self) -> None:
+        if getattr(self, "_shutdown_done", False):
+            return  # idempotent: run()'s finally and the bootstrap both call it
+        self._shutdown_done = True
         log.info("[%s] shutting down...", self.spec.name)
         self._stop.set()
+
+        async def _safe(what: str, coro) -> None:
+            try:
+                await coro
+            except Exception:
+                log.exception("[%s] %s failed during shutdown", self.spec.name, what)
+
         scheduler = getattr(self, "scheduler", None)
         if scheduler is not None:
-            await scheduler.stop()
+            await _safe("scheduler.stop", scheduler.stop())
         if self.backfiller is not None:
-            await self.backfiller.stop()
+            await _safe("backfiller.stop", self.backfiller.stop())
         if self.pipeline is not None:
-            await self.pipeline.drain_media(timeout=5)
+            await _safe("drain_media", self.pipeline.drain_media(timeout=5))
         if self.adapter is not None:
-            await self.adapter.close()
+            await _safe("adapter.close", self.adapter.close())
         if self.conn is not None:
-            await self.conn.close()
+            await _safe("conn.close", self.conn.close())
 
 
 RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve
@@ -361,7 +381,7 @@ async def _bootstrap(apps: list[App]) -> None:
         ]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for app in apps:
-            app._request_stop()
+            app._stop_quiet()  # bring siblings down, keep their restart intent
         for t in pending:
             try:
                 await t
