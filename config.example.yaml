@@ -69,6 +69,11 @@ digest:
   max_memories_per_night: 8
   weekly_enabled: true     # roll up completed weeks (2026-W40 style reports)
   monthly_enabled: true    # roll up completed months (2026-09 style reports)
+  inject_context: true     # feed latest day/week/month reports into every agent prompt
+  inject_day_chars: 900
+  inject_week_chars: 450
+  inject_month_chars: 450
+  inject_max_memories: 25
 
 log:
   level: INFO                # DEBUG for verbose protocol traffic

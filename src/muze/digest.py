@@ -446,8 +446,24 @@ async def extract_memories(
         return 0
 
     added = 0
+    retired = 0
     for item in items[: cfg.digest.max_memories_per_night]:
-        if not isinstance(item, dict) or item.get("action") != "add":
+        if not isinstance(item, dict):
+            continue
+        action = item.get("action")
+        if action == "retire":
+            mid = item.get("id")
+            if isinstance(mid, int):
+                try:
+                    if await repo.retire_memory(mid):
+                        retired += 1
+                        chatlog.log.info(
+                            "MEM        | - #%s retired: %s", mid, str(item.get("content", ""))[:80]
+                        )
+                except Exception:
+                    log.debug("retire #%s failed", mid)
+            continue
+        if action != "add":
             continue
         content = str(item.get("content", "")).strip()
         subject = str(item.get("subject", "owner")).strip() or "owner"
@@ -457,4 +473,6 @@ async def extract_memories(
         await repo.add_memory(kind, subject, content, source=f"dream:{date}")
         chatlog.log.info("MEM        | + [%s/%s] %s", subject, kind, content)
         added += 1
+    if retired:
+        log.info("memory pass retired %s outdated entr(y/ies)", retired)
     return added

@@ -57,22 +57,90 @@ class Agent:
     def reset_all(self) -> None:
         self._histories.clear()
 
-    async def _system_prompt(self) -> str:
+    async def _system_prompt(self, ctx: ControlContext) -> str:
+        """Assemble the system prompt: base + skills + dream background +
+        relevance-ordered long-term memories.
+
+        This is how the nightly reports shape message handling: the agent
+        starts every conversation already knowing yesterday's threads,
+        open TODOs and the distilled facts about the people involved.
+        """
         parts = [SYSTEM_PROMPT]
+
         skills = getattr(self.service.runtime, "skills", None)
         if skills is not None:
             lines = skills.index_lines()
             if lines:
                 parts.append("已安装技能（相关时先 read_skill 读全文再操作）:\n" + "\n".join(lines))
-        # long-term memories (grown by nightly dreaming + remember tool)
+
+        # --- dream background (day/week/month reports) ---
+        dc = self.service.cfg.digest
+        bg_meta: dict[str, str] = {}
+        if dc.inject_context:
+            sections: list[str] = []
+            for period, budget, label in (
+                ("day", dc.inject_day_chars, "最近一天"),
+                ("week", dc.inject_week_chars, "最近一周"),
+                ("month", dc.inject_month_chars, "最近一月"),
+            ):
+                try:
+                    latest = await self.repo.latest_digest(period=period)
+                    if not latest:
+                        continue
+                    full = await self.repo.get_digest(latest["date"])
+                    text = ((full or {}).get("report") or "").strip()
+                    if not text:
+                        continue
+                    if len(text) > budget:
+                        text = text[:budget] + "…"
+                    sections.append(f"### {label}做梦报告（{latest['date']}）\n{text}")
+                    bg_meta[period] = latest["date"]
+                except Exception:
+                    continue
+            if sections:
+                parts.append(
+                    "近期做梦报告背景（系统自动注入；处理消息时直接利用，"
+                    "需要更早/更详细再调 recall_dream）:\n\n" + "\n\n".join(sections)
+                )
+
+        # --- long-term memories, relevance-ordered for this conversation ---
         try:
-            rows = await self.repo.list_memories(limit=25)
+            mems = await self.repo.list_memories(limit=200)
         except Exception:
-            rows = []
-        if rows:
-            lines = [f"- [{r['subject']}] {r['content']}" for r in reversed(rows)]
+            mems = []
+        n_mems = 0
+        if mems:
+            peer_key = (
+                f"group/{ctx.peer_id}" if ctx.scene == "group" else str(ctx.peer_id)
+            )
+            member_keys: set[str] = set()
+            owner_key = "owner"
+
+            def rank(m: dict) -> int:
+                s = m.get("subject", "")
+                if s == peer_key:
+                    return 0  # this very conversation
+                if s == owner_key:
+                    return 1  # the owner themself
+                if ctx.scene == "group" and s.isdigit():
+                    return 2  # possible member of this group
+                if s in member_keys:
+                    return 2
+                return 3
+
+            ordered = sorted(mems, key=rank)
+            picked = ordered[: dc.inject_max_memories]
+            n_mems = len(picked)
+            lines = [f"- [{m['subject']}] {m['content']}" for m in picked]
             parts.append(
-                "长期记忆（做梦沉淀，回答时可利用，也可用 remember 工具随时补充）:\n" + "\n".join(lines)
+                "长期记忆（做梦沉淀+对话补充，按与当前会话相关性排序）:\n" + "\n".join(lines)
+            )
+
+        if bg_meta or n_mems:
+            log.info(
+                "PROMPT bg   | day=%s week=%s month=%s memories=%s",
+                bg_meta.get("day", "-"), bg_meta.get("week", "-"),
+                bg_meta.get("month", "-"), n_mems,
             )
         return "\n\n".join(parts)
 
@@ -86,7 +154,7 @@ class Agent:
 
         runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         messages: list[dict] = [
-            {"role": "system", "content": await self._system_prompt()},
+            {"role": "system", "content": await self._system_prompt(ctx)},
             *history[:-1][-MAX_HISTORY:],
             {"role": "user", "content": text},
         ]

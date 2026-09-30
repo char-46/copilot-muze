@@ -568,11 +568,24 @@ class ControlService:
         stats = await self.repo.stats()
         caps = self.adapter.caps
         bf = self.runtime.backfiller.status() if self.runtime.backfiller else {}
+        bg = []
+        try:
+            for period, label in (("day", "日"), ("week", "周"), ("month", "月")):
+                latest = await self.repo.latest_digest(period=period)
+                if latest:
+                    bg.append(f"{label}{latest['date']}")
+            mem_n = len(await self.repo.list_memories(limit=500))
+            if mem_n:
+                bg.append(f"记忆{mem_n}条")
+        except Exception:
+            pass
         lines = [
             f"muze {get_version()}",
             f"self={self.runtime.self_id} uptime={uptime_since(self.runtime.started_at)}",
             f"backfill: running={bf.get('running')} last_new={bf.get('last_new_messages')} "
             f"last_run={epoch_iso(bf.get('last_run_at')) or '-'}",
+            f"context: {'; '.join(bg) if bg else '无做梦背景'}"
+            + (f" (inject={'on' if self.cfg.digest.inject_context else 'off'})" if bg else ""),
             f"conversations={stats['conversations']} messages={stats['messages']} "
             f"(by scene: {stats.get('messages_by_scene')})",
             f"media done/failed/pending={stats['media']['done']}/{stats['media']['failed']}"

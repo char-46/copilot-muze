@@ -125,6 +125,13 @@ class DigestConfig(BaseModel):
     # hierarchical rollups for long-term context compression
     weekly_enabled: bool = True
     monthly_enabled: bool = True
+    # inject dream reports + memories into every agent prompt so reports
+    # actually shape how later messages are handled ("smarter over time")
+    inject_context: bool = True
+    inject_day_chars: int = 900
+    inject_week_chars: int = 450
+    inject_month_chars: int = 450
+    inject_max_memories: int = 25
 
 
 class MuzeConfig(BaseModel):
