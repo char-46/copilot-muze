@@ -861,6 +861,13 @@ class Repository:
             rows = await cur.fetchall()
         return {int(r["id"]): dict(r) for r in rows}
 
+    async def rag_doc_counts(self) -> dict[str, int]:
+        """rag_docs row count per kind (for /status and the webui)."""
+        async with self.conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM rag_docs GROUP BY kind"
+        ) as cur:
+            return {r["kind"]: int(r["n"]) for r in await cur.fetchall()}
+
     async def list_rag_docs(self, kind: str | None = None, limit: int = 1000) -> list[dict]:
         sql = "SELECT * FROM rag_docs"
         args: list = []

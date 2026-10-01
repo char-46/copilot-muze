@@ -839,8 +839,29 @@ class ControlService:
             mem_n = len(await self.repo.list_memories(limit=500))
             if mem_n:
                 bg.append(f"记忆{mem_n}条")
+            prof_n = len(await self.repo.list_profiles())
+            if prof_n:
+                bg.append(f"档案{prof_n}份")
         except Exception:
             pass
+        rag_line = ""
+        rag = getattr(self.runtime, "rag", None)
+        if rag is not None:
+            try:
+                rs = await rag.status()
+                if rs["enabled"]:
+                    kinds = " ".join(f"{k}:{v}" for k, v in sorted(rs["docs_by_kind"].items()))
+                    rag_line = (
+                        f"rag: on 文档{rs['docs']}篇（{kinds or '空'}）"
+                        f" 模型={rs['vec_model'] or '-'}"
+                        f" 上次索引={epoch_iso(rs['last_index_at']) or '-'}"
+                        + (" [含聊天窗口]" if rs["chat_enabled"] else "")
+                        + ("" if rs["embedding_healthy"] else " [embedding异常]")
+                    )
+                else:
+                    rag_line = "rag: off（rag.enabled 未开或 embedding 不可用）"
+            except Exception:
+                rag_line = "rag: 状态获取失败"
         lines = [
             f"muze {get_version()}",
             f"self={self.runtime.self_id} uptime={uptime_since(self.runtime.started_at)}",
@@ -848,6 +869,10 @@ class ControlService:
             f"last_run={epoch_iso(bf.get('last_run_at')) or '-'}",
             f"context: {'; '.join(bg) if bg else '无做梦背景'}"
             + (f" (inject={'on' if self.cfg.digest.inject_context else 'off'})" if bg else ""),
+        ]
+        if rag_line:
+            lines.append(rag_line)
+        lines += [
             f"conversations={stats['conversations']} messages={stats['messages']} "
             f"(by scene: {stats.get('messages_by_scene')})",
             f"archive: {epoch_iso(stats.get('oldest_ts')) or '-'} ~ "
@@ -1420,6 +1445,7 @@ class Runtime:
         self.endpoint = None  # live protocol endpoint object, injected by main
         self.llm = None  # LLMClient, injected by main
         self.backfiller = None  # Backfiller, injected by main
+        self.rag = None  # RagIndexer, injected by main
         self.log_path = ""
         self.skills = None  # SkillStore, injected by main
         self.reloader = None  # Reloader, injected by main

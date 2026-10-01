@@ -272,6 +272,29 @@ class RagIndexer:
             "text": f"会话 {scene}/{peer}\n" + "\n".join(lines),
         }
 
+    # ----------------------------------------------------------- status
+    async def status(self) -> dict:
+        """Snapshot for /status and the webui (never raises)."""
+        try:
+            counts = await self.repo.rag_doc_counts()
+        except Exception:
+            counts = {}
+        emb = self.embedder
+        return {
+            "enabled": self.enabled,
+            "chat_enabled": bool(self.cfg.rag.chat),
+            "running": self.running,
+            "docs": sum(counts.values()),
+            "docs_by_kind": counts,
+            "vec_model": await self.repo.rag_get_state("vec_model") or "",
+            "vec_dims": int(await self.repo.rag_get_state("vec_dims") or 0),
+            "embedding_model": getattr(emb, "model_id", ""),
+            "embedding_available": bool(getattr(emb, "available", False)),
+            "embedding_healthy": bool(getattr(emb, "healthy", True)),
+            "last_index_at": self.last_index_at,
+            "last_count": self.last_count,
+        }
+
     # ----------------------------------------------------------- retrieval
     async def search(
         self, query: str, k: int | None = None, *, kind: str | None = None,

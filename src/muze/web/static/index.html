@@ -19,6 +19,8 @@
   <button data-tab="chats" class="active">会话</button>
   <button data-tab="search">搜索</button>
   <button data-tab="ai">AI</button>
+  <button data-tab="memories">记忆</button>
+  <button data-tab="rag">RAG</button>
   <button data-tab="pending">待确认 <span id="pendingBadge" class="badge hidden">0</span></button>
   <button data-tab="settings">设置</button>
   <button data-tab="logs">日志</button>
@@ -58,6 +60,32 @@
       <input id="aiinput" placeholder="输入消息，回车发送…">
       <button id="aiSend">发送</button>
     </div>
+  </section>
+
+  <!-- memories -->
+  <section id="tab-memories" class="tab">
+    <div class="bar">
+      <input id="memq" placeholder="搜索长期记忆（留空列出全部）">
+      <button id="memBtn">搜索</button>
+    </div>
+    <div id="memlist"><div class="dim pad">加载中…</div></div>
+  </section>
+
+  <!-- rag -->
+  <section id="tab-rag" class="tab">
+    <div id="ragstate" class="bar"><span class="dim">加载中…</span></div>
+    <div class="bar">
+      <input id="ragq" placeholder="语义检索，如：谁抱怨过加班">
+      <select id="ragKind">
+        <option value="">全部类型</option>
+        <option value="profile">身份档案</option>
+        <option value="memory">长期记忆</option>
+        <option value="digest">做梦报告</option>
+        <option value="chat">聊天窗口</option>
+      </select>
+      <button id="ragBtn">检索</button>
+    </div>
+    <div id="ragresults"></div>
   </section>
 
   <!-- pending -->

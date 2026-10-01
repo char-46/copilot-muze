@@ -4,8 +4,58 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
-let TOKEN = localStorage.getItem("muze_token") || "";
+/* ---- storage that cannot kill the app ----
+ * localStorage THROWS in some browsers (block-all-cookies, some private
+ * modes, extension interference). The old code read it at line ~7, so one
+ * SecurityError killed every event handler on the page: nothing clickable,
+ * no requests, nothing stored. Probe first and fall back to memory. */
+let storageOK = true;
+const memStore = {};
+try {
+  localStorage.setItem("muze_probe", "1");
+  localStorage.removeItem("muze_probe");
+} catch (e) {
+  storageOK = false;
+}
+function store(k, v) {
+  memStore[k] = v;
+  if (storageOK) { try { localStorage.setItem(k, v); } catch (e) { storageOK = false; } }
+}
+function recall(k) {
+  if (k in memStore) return memStore[k];
+  if (!storageOK) return null;
+  try { return localStorage.getItem(k); } catch (e) { storageOK = false; return null; }
+}
+
+/* ---- surface JS errors on screen instead of dying silently ----
+ * "clicked, nothing happened, no request" is undebuggable for the user;
+ * a red bar with the error message is not. */
+function fatal(msg) {
+  let bar = document.getElementById("jserr");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "jserr";
+    bar.style.cssText =
+      "position:fixed;top:0;left:0;right:0;z-index:9999;background:#b00;" +
+      "color:#fff;padding:6px 10px;font:12px/1.5 monospace;white-space:pre-wrap";
+    (document.body || document.documentElement).appendChild(bar);
+  }
+  bar.textContent = "JS 错误（页面可能部分失效）: " + msg;
+}
+window.addEventListener("error", (e) => {
+  const at = e.filename ? " @" + String(e.filename).split("/").pop() + ":" + e.lineno : "";
+  fatal((e.message || "unknown error") + at);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const r = e.reason;
+  fatal("未处理的异常: " + ((r && (r.stack || r.message)) || String(r)));
+});
+
+let TOKEN = recall("muze_token") || "";
 $("#token").value = TOKEN;
+if (!storageOK) {
+  fatal("localStorage 不可用（浏览器阻止了站点数据？）。本次可用，但 token 不会被记住。");
+}
 let authorized = !!TOKEN;
 let ACCT = ""; // selected account name; "" -> server default (first)
 
@@ -17,7 +67,10 @@ function withAccount(path) {
 
 async function api(path, opts = {}) {
   const o = Object.assign({}, opts);
-  o.headers = Object.assign({ Authorization: "Bearer " + TOKEN }, opts.headers || {});
+  // headers must be latin1; a token pasted with CJK chars (IME on, or a
+  // copied line like "...并点保存") would make fetch() throw synchronously
+  const bearer = String(TOKEN).replace(/[^\x20-\xFF]/g, "");
+  o.headers = Object.assign({ Authorization: "Bearer " + bearer }, opts.headers || {});
   if (o.body && typeof o.body !== "string") {
     o.body = JSON.stringify(o.body);
     o.headers["Content-Type"] = "application/json";
@@ -38,7 +91,7 @@ async function api(path, opts = {}) {
 function authHint() {
   return authorized
     ? ""
-    : '<div class="dim pad">未授权：请把 data/logs/muze.log 中 WEBUI 行的 token 填到右上角并点“保存”</div>';
+    : '<div class="dim pad">未授权（401）：token 不对。常见原因：复制了 muze.log 里<b>旧一次启动</b>的 WEBUI 行（每次重启随机 token 都会变）、或把结尾的右括号“)”一起复制了。建议在 config.yaml 设固定 web.token 后重启，再填到这里并点“保存”。</div>';
 }
 
 function esc(s) {
@@ -62,13 +115,30 @@ $$("nav button").forEach((b) => b.addEventListener("click", () => {
   if (b.dataset.tab === "status") loadStatus();
   if (b.dataset.tab === "chats") loadConversations();
   if (b.dataset.tab === "settings") loadSettings();
+  if (b.dataset.tab === "memories") loadMemories();
+  if (b.dataset.tab === "rag") loadRag();
 }));
 
+/* tolerate sloppy pastes: "(token: xxx)" / trailing ')' / quotes / whitespace */
+function cleanToken(raw) {
+  let t = (raw || "").trim();
+  t = t.replace(/^[-(]?\s*token:?\s*/i, "");
+  return t.replace(/[)\]}"'“”‘’,，、;；\s]+$/g, "");
+}
+
 $("#saveToken").addEventListener("click", () => {
-  TOKEN = $("#token").value.trim();
-  localStorage.setItem("muze_token", TOKEN);
+  TOKEN = cleanToken($("#token").value);
+  if (/[^\x20-\x7E]/.test(TOKEN)) {
+    // CJK in a token is always a paste mistake -- say so, loudly
+    fatal("token 里混入了中文/全角字符（可能把提示文字一起复制了，或输入法在中文状态）。已自动剔除，若仍 401 请重新纯文本粘贴。");
+    TOKEN = TOKEN.replace(/[^\x20-\x7E]/g, "");
+  }
+  $("#token").value = TOKEN;
+  store("muze_token", TOKEN);
   refreshAll();
 });
+/* Enter in the token box also saves */
+$("#token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#saveToken").click(); });
 
 /* refresh everything after (re)authorization */
 function refreshAll() {
@@ -188,7 +258,7 @@ function renderMessage(m) {
   div.className = "m" + (m.recalled ? " recalled" : "");
   div.dataset.seq = m.message_seq;
   let raw;
-  try { raw = JSON.parse(m.raw_json); } catch { raw = { segments: []; }; }
+  try { raw = JSON.parse(m.raw_json); } catch { raw = { segments: [] }; }
   const segs = raw.segments || [];
   let body = esc(m.text_content || "(无文本)");
   const thumbs = [];
@@ -279,6 +349,99 @@ $("#aiReset").addEventListener("click", async () => {
   await api("/api/agent/reset", { method: "POST", body: {} });
   $("#aichat").innerHTML = "";
 });
+
+/* ---------------- memories ---------------- */
+async function loadMemories() {
+  const box = $("#memlist");
+  const q = $("#memq").value.trim();
+  box.innerHTML = '<div class="dim pad">加载中…</div>';
+  try {
+    const d = await api(q ? "/api/memories?q=" + encodeURIComponent(q) : "/api/memories");
+    if (!d.memories || !d.memories.length) {
+      box.innerHTML = '<div class="dim pad">暂无记忆（做梦提炼或 :: 让 muze remember 后出现）</div>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const m of d.memories) {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML =
+        `<div class="head"><b>[${esc(m.kind || "fact")}] ${esc(m.subject || "")}</b>` +
+        `<span class="dim">#${m.id}${m.active ? "" : " · 已停用"}</span></div>` +
+        `<div>${esc(m.content || "")}</div>` +
+        (m.active ? '<div class="ops"><button class="no">停用</button></div>' : "");
+      const btn = card.querySelector("button");
+      if (btn) btn.addEventListener("click", async () => {
+        try {
+          await api("/api/command", { method: "POST", body: { text: "forget " + m.id } });
+          btn.disabled = true;
+          btn.textContent = "已停用";
+        } catch (e) { btn.textContent = "失败: " + e.message; }
+      });
+      box.appendChild(card);
+    }
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+$("#memBtn").addEventListener("click", loadMemories);
+$("#memq").addEventListener("keydown", (e) => { if (e.key === "Enter") loadMemories(); });
+
+/* ---------------- rag ---------------- */
+async function loadRag() {
+  const bar = $("#ragstate");
+  try {
+    const s = await api("/api/rag");
+    if (!s.enabled) {
+      bar.innerHTML = '<span class="dim">RAG 未启用（config.yaml 开 rag.enabled 且 embedding 可用后自动生效；检索工具同时停用）</span>';
+      return;
+    }
+    const kinds = Object.entries(s.docs_by_kind || {})
+      .map(([k, v]) => `${k}:${v}`).join(" · ") || "空";
+    bar.innerHTML =
+      `<b>RAG 开启</b> · 文档 <b>${s.docs}</b> 篇（${esc(kinds)}）` +
+      ` · 模型 ${esc(s.vec_model || "-")}` +
+      `${s.chat_enabled ? " · 含聊天窗口" : " · 仅摘要"}` +
+      ` · 上次索引 ${s.last_index_at ? esc(fmtTime(s.last_index_at)) : "-"}` +
+      (s.embedding_healthy ? "" : ' · <b style="color:#b00">embedding 异常</b>');
+  } catch (e) {
+    bar.innerHTML = e.unauthorized ? authHint()
+      : '<span class="dim">状态加载失败：' + esc(e.message) + "</span>";
+  }
+}
+async function runRagSearch() {
+  const q = $("#ragq").value.trim();
+  const box = $("#ragresults");
+  if (!q) return;
+  box.innerHTML = '<div class="dim pad">检索中…</div>';
+  try {
+    let url = "/api/rag/search?q=" + encodeURIComponent(q) + "&k=8";
+    const kind = $("#ragKind").value;
+    if (kind) url += "&kind=" + encodeURIComponent(kind);
+    const d = await api(url);
+    if (d.enabled === false) {
+      box.innerHTML = '<div class="dim pad">RAG 未启用</div>';
+      return;
+    }
+    box.innerHTML = (d.results && d.results.length) ? "" : '<div class="dim pad">无结果（索引可能还在后台闲时构建中）</div>';
+    for (const r of d.results || []) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const when = r.time_start ? esc(fmtTime(r.time_start)) : "";
+      card.innerHTML =
+        `<div class="head"><b>[${esc(r.kind)}] ${esc(r.ref || "")}</b>` +
+        `<span class="dim">score ${r.score}${when ? " · " + when : ""}</span></div>` +
+        `<div class="dim pad" style="white-space:pre-wrap">${esc((r.text || "").slice(0, 500))}</div>`;
+      box.appendChild(card);
+    }
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">检索失败：' + esc(e.message) + "</div>";
+  }
+}
+$("#ragBtn").addEventListener("click", runRagSearch);
+$("#ragq").addEventListener("keydown", (e) => { if (e.key === "Enter") runRagSearch(); });
 
 /* ---------------- pending ---------------- */
 async function loadPending() {
@@ -417,6 +580,10 @@ async function loadStatus() {
       `== 账号 ${a.name} (self ${a.self_id}) ==\n` +
       `agent: ${a.agent ? "on" : "off"}\n` +
       `conversations: ${s.conversations}   messages: ${s.messages}\n` +
+      `memories: ${a.memories ?? "-"}   profiles: ${a.profiles ?? "-"}\n` +
+      `rag: ${a.rag && a.rag.enabled
+        ? `on docs=${a.rag.docs}(${Object.entries(a.rag.docs_by_kind || {}).map(([k, v]) => k + ":" + v).join(" ")}) model=${a.rag.vec_model || "-"}${a.rag.chat_enabled ? " +chat" : ""}`
+        : "off"}\n` +
       `archive: ${(s.oldest_ts ? new Date(s.oldest_ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-")} ~ ${(s.newest_ts ? new Date(s.newest_ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-")}\n` +
       `by scene: ${JSON.stringify(s.messages_by_scene || {})}\n` +
       `media: ${JSON.stringify(s.media || {})}\n` +

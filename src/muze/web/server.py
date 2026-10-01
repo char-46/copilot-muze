@@ -116,6 +116,19 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
         for name, (service, repo, runtime) in accounts.items():
             stats = await repo.stats()
             bf = runtime.backfiller.status() if runtime.backfiller else {}
+            try:
+                mem_n = len(await repo.list_memories(limit=500))
+            except Exception:
+                mem_n = 0
+            try:
+                prof_n = len(await repo.list_profiles())
+            except Exception:
+                prof_n = 0
+            rag = getattr(runtime, "rag", None)
+            try:
+                rag_state = await rag.status() if rag is not None else {"enabled": False}
+            except Exception:
+                rag_state = {"enabled": False}
             per.append(
                 {
                     "name": name,
@@ -123,6 +136,9 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                     "stats": stats,
                     "backfill": bf,
                     "agent": service.agent is not None,
+                    "memories": mem_n,
+                    "profiles": prof_n,
+                    "rag": rag_state,
                     "capabilities": service.adapter.caps.summary_lines(),
                 }
             )
@@ -133,6 +149,52 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                 "accounts": per,
             }
         )
+
+    async def api_memories(request: web.Request) -> web.Response:
+        _, repo, _ = pick(request)
+        q = request.query.get("q", "").strip()
+        subject = request.query.get("subject", "").strip() or None
+        try:
+            rows = (
+                await repo.search_memories(q, subject=subject, limit=100)
+                if q
+                else await repo.list_memories(subject=subject, limit=200)
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"memories": rows})
+
+    async def api_rag(request: web.Request) -> web.Response:
+        _, _, runtime = pick(request)
+        rag = getattr(runtime, "rag", None)
+        if rag is None:
+            return web.json_response(
+                {"enabled": False, "docs": 0, "docs_by_kind": {}}
+            )
+        try:
+            return web.json_response(await rag.status())
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def api_rag_search(request: web.Request) -> web.Response:
+        _, _, runtime = pick(request)
+        q = request.query.get("q", "").strip()
+        if not q:
+            return web.json_response({"error": "missing q"}, status=400)
+        rag = getattr(runtime, "rag", None)
+        if rag is None or not rag.enabled:
+            return web.json_response({"enabled": False, "results": []})
+        k = int(request.query.get("k", "6") or 6)
+        kind = request.query.get("kind", "").strip() or None
+        scene = request.query.get("scene", "").strip() or None
+        peer = request.query.get("peer", "").strip()
+        try:
+            results = await rag.search(
+                q, k, kind=kind, scene=scene, peer_id=int(peer) if peer else None
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"enabled": True, "results": results})
 
     async def api_conversations(request: web.Request) -> web.Response:
         _, repo, _ = pick(request)
@@ -386,7 +448,17 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
             return web.json_response({"error": str(e)}, status=500)
         return web.json_response({"lines": tail})
 
-    app = web.Application(middlewares=[auth])
+    @web.middleware
+    async def no_cache(request: web.Request, handler):
+        """HTML/JS/CSS must always revalidate: browsers heuristic-cache static
+        files when no cache headers are sent, and an old app.js paired with a
+        new index.html (or vice versa) breaks the webui with early JS errors."""
+        resp = await handler(request)
+        if request.path == "/" or request.path.startswith("/static/"):
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    app = web.Application(middlewares=[auth, no_cache])
     app.router.add_get("/", index)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
     app.router.add_get("/api/accounts", api_accounts)
@@ -403,6 +475,9 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
     app.router.add_post("/api/agent/reset", api_agent_reset)
     app.router.add_get("/api/pending", api_pending)
     app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)
+    app.router.add_get("/api/memories", api_memories)
+    app.router.add_get("/api/rag", api_rag)
+    app.router.add_get("/api/rag/search", api_rag_search)
     app.router.add_get("/api/logs/tail", api_logs_tail)
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config_post)

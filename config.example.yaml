@@ -92,7 +92,10 @@ web:                          # app-level: one webui serves every account
   enabled: true
   host: 127.0.0.1
   port: 8300
-  token: ""                   # empty -> random token generated and logged at startup
+  token: ""                   # "" -> random token generated and logged at startup;
+                              # SET A FIXED VALUE so you paste it into the webui only once
+                              # (a random one changes on every restart and must be re-copied
+                              #  from the log -- old log lines then stop working)
 
 research:                     # web search for the agent's research closure
   provider: ""                # tavily | brave | serper | searxng | duckduckgo | "" (off)
