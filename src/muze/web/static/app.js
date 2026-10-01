@@ -173,7 +173,7 @@ $$("nav button").forEach((b) => b.addEventListener("click", () => {
   if (b.dataset.tab === "logs") loadLogs();
   if (b.dataset.tab === "status") loadStatus();
   if (b.dataset.tab === "chats") loadConversations();
-  if (b.dataset.tab === "ai") { loadAiSessions(); if (aiMode !== "new") refreshAiSession(); }
+  if (b.dataset.tab === "ai") { loadAiSessions(); if (aiMode) pollSession(); }
   if (b.dataset.tab === "settings") loadSettings();
   if (b.dataset.tab === "memories") loadMemories();
   if (b.dataset.tab === "rag") loadRag();
@@ -379,148 +379,149 @@ async function runSearch() {
     : '<div class="dim pad">无结果</div>';
 }
 
-/* ---------------- ai: chat + sessions merged ----------------
- * Left pane: "新对话" plus recent agent sessions (icon/title/time, ▶继续
- * button on suspended/errored ones). Right pane: either the live new chat
- * (/api/agent) or one session's full trace — messages rendered as
- * markdown, tool calls collapsible, running sessions polled live. The
- * input box always targets whatever is selected. */
+/* ---------------- ai: session-based chat ----------------
+ * Every conversation is an agent session: persisted, resumable, with a
+ * live tool trace. "新对话" means no session open yet — the first message
+ * creates one (POST /api/sess) and the pane then follows it by polling
+ * /api/sess/<id>: messages render INCREMENTALLY (tool <details> keep
+ * their open state), tool events stream in as chips and round_chars
+ * shows live model output. Follow-ups POST /api/sess/<id>/msg; the ▶
+ * header button resumes suspended/errored turns from the interruption. */
 const SESS_ICON = { running: "⏳", done: "✔", error: "✖", suspend: "⏸" };
 const SESS_CN = { running: "运行中", done: "完成", error: "出错", suspend: "已暂停" };
 
-let aiMode = "new";      // "new" | session id
-let newMsgs = [];        // bubbles of the new chat (DOM nodes, reattached)
-let lastSess = null;     // detail of the open session
-let sessPoll = null;
+let aiMode = null;    // null = new chat, else open session id
+let lastSess = null;  // last detail fetched for the open session
+let sessPoll = null;  // polling interval handle
+let aiSeq = 0;        // invalidates stale async renders after switching
+let aiPinned = true;  // chat pane is scrolled to the bottom
+let aiSig = [];       // signatures of messages already in the DOM
+let sessCache = [];   // last session list (for the filter box)
 
-function bubbleNode(who, text, err) {
-  const div = document.createElement("div");
-  div.className = "msgrow " + who + (err ? " err" : "");
-  const body = who === "user" ? esc(text) : mdRender(text);
-  div.innerHTML = `<div class="who">${who === "user" ? "你" : "muze"}</div>` +
-    `<div class="bubble md">${body}</div>`;
-  return div;
+function sessSig(m) {
+  const calls = (m.tool_calls || []).map((c) => c.id).join(",");
+  return m.role + "|" + (m.content || "").length + "|" + calls + "|" + (m.tool_call_id || "");
 }
 
-function renderNewChat() {
-  const box = $("#aichat");
-  box.innerHTML = "";
-  if (!newMsgs.length) {
-    box.innerHTML = '<div class="dim pad">与 muze 的新对话；历史 AI 会话在左侧，点开可直接继续追问</div>';
-    return;
-  }
-  for (const m of newMsgs) box.appendChild(m);
-  box.scrollTop = 1e9;
+function scrollChat() {
+  const el = $("#aichat");
+  const jump = $("#aijump");
+  if (aiPinned) { el.scrollTop = el.scrollHeight; jump.classList.add("hidden"); }
+  else jump.classList.remove("hidden");
 }
-
-function selectNewChat() {
-  aiMode = "new";
-  stopSessPoll();
-  lastSess = null;
-  $("#aihead").innerHTML = "<b>新对话</b> <span class=\"dim\">直接输入与 muze 对话；左侧选历史会话可继续</span>";
-  $("#aiinput").placeholder = "输入消息，回车发送…";
-  renderNewChat();
-  markListSel(null);
-}
+$("#aijump").addEventListener("click", () => { aiPinned = true; scrollChat(); });
+$("#aichat").addEventListener("scroll", () => {
+  const el = $("#aichat");
+  aiPinned = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  if (aiPinned) $("#aijump").classList.add("hidden");
+});
 
 function markListSel(sid) {
-  const rows = $$("#ailist .conv");
-  rows.forEach((x) => x.classList.remove("sel"));
-  if (sid === null) { if (rows[0]) rows[0].classList.add("sel"); return; }
-  for (const r of rows) {
-    if (r.dataset.sid === sid) r.classList.add("sel");
-  }
+  $$("#aisses .srow").forEach((x) => x.classList.toggle(
+    "sel", sid === null ? x.dataset.sid === "" : x.dataset.sid === sid));
 }
 
-async function loadAiSessions() {
-  const box = $("#ailist");
-  box.innerHTML = '<div class="dim pad">加载中…</div>';
-  try {
-    const d = await api("/api/sess");
-    box.innerHTML = "";
-    const newDiv = document.createElement("div");
-    newDiv.className = "conv";
-    newDiv.dataset.sid = "";
-    newDiv.innerHTML =
-      '<div class="t"><span class="name">➕ 新对话</span></div>' +
-      '<div class="prev dim">直接输入与 muze 对话</div>';
-    newDiv.addEventListener("click", selectNewChat);
-    box.appendChild(newDiv);
-    for (const s of d.sessions || []) {
-      const div = document.createElement("div");
-      div.className = "conv";
-      div.dataset.sid = s.id;
-      div.innerHTML =
-        `<div class="t"><span class="name">${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</span>` +
-        `<span class="cnt">${esc(SESS_CN[s.status] || s.status)}</span></div>` +
-        `<div class="prev dim">${esc(s.chat_key)} · ${esc(fmtTime(s.updated))}</div>`;
-      div.addEventListener("click", () => openAiSession(s.id));
-      if (s.status === "suspend" || s.status === "error") {
-        const go = document.createElement("button");
-        go.className = "minibtn";
-        go.textContent = "▶ 继续";
-        go.title = "继续这个会话（/sess go）";
-        go.addEventListener("click", async (ev) => {
-          ev.stopPropagation();
-          try {
-            await api(`/api/sess/${encodeURIComponent(s.id)}/go`, { method: "POST", body: {} });
-            openAiSession(s.id);
-          } catch (e) { fatal(e.message); }
-        });
-        div.appendChild(go);
-      }
-      box.appendChild(div);
-    }
-    markListSel(aiMode === "new" ? null : aiMode);
-  } catch (e) {
-    box.innerHTML = e.unauthorized ? authHint()
-      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
-  }
-}
-
-function renderSessPane(s) {
-  let html =
-    `<div class="panehead"><b>${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</b>` +
-    ` <span class="dim">${esc(s.chat_key)} · ${esc(SESS_CN[s.status] || s.status)}` +
-    ` · ${esc(fmtTime(s.created))} · ${s.step}轮 · ${s.total_chars}字` +
-    (s.status === "running" ? ` · 空闲${s.idle}s` : "") + "</span></div>";
-  const msgs = s.messages || [];
-  for (const m of msgs) {
-    if (m.role === "user") {
-      html += `<div class="msgrow user"><div class="who">你</div>` +
-        `<div class="bubble">${esc(m.content || "")}</div></div>`;
-    } else if (m.role === "assistant") {
-      const calls = (m.tool_calls || []).map((c) =>
-        `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
-        `<code>${esc((c.function?.arguments || "").slice(0, 300))}</code>)</summary></details>`).join("");
-      html += `<div class="msgrow bot"><div class="who">muze</div>` +
-        `<div class="bubble md">${m.content ? mdRender(m.content) : ""}${calls}</div></div>`;
-    } else if (m.role === "tool") {
-      html += `<details class="tool"><summary>📤 工具结果 ${esc(m.name || m.tool_call_id || "")}</summary>` +
-        `<pre>${esc((m.content || "").slice(0, 1500))}</pre></details>`;
-    }
-  }
-  if (s.status === "running") html += '<div class="dim pad">⏳ 运行中，自动刷新…</div>';
-  const ev = (s.events || []).filter((e) => e.kind !== "prompt");
-  if (ev.length) {
-    html += `<details class="tool tl"><summary>⏱ 过程时间线（${ev.length} 项）</summary>` +
-      ev.map((e) => `<div><span class="dim">${e.t}s</span> ${esc(e.kind)}: ${esc(e.detail || "")}</div>`).join("") +
-      "</details>";
-  }
-  $("#aichat").innerHTML = html;
-  $("#aichat").scrollTop = 1e9;
-}
-
-async function refreshAiSession() {
-  if (aiMode === "new") return;
-  try {
-    lastSess = await api("/api/sess/" + encodeURIComponent(aiMode));
-  } catch (e) {
-    $("#aichat").innerHTML = e.unauthorized ? authHint()
-      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+function updateAiHead(s) {
+  const h = $("#aihead");
+  if (!s) {
+    h.classList.add("dim");
+    h.innerHTML = "<b>新对话</b> <span>输入即开始；历史会话在左侧，随时继续</span>";
     return;
   }
-  renderSessPane(lastSess);
+  h.classList.remove("dim");
+  const run = s.status === "running";
+  h.innerHTML =
+    `<b>${SESS_ICON[s.status] || "?"} ${esc(s.title || "#" + s.id)}</b>` +
+    `<span class="chipst ${esc(s.status)}">${SESS_CN[s.status] || s.status}${run ? ' <span class="runDot"></span>' : ""}</span>` +
+    `<span class="dim"> #${esc(s.id)} · ${esc(s.chat_key)} · ${s.step}轮 · ${s.total_chars}字` +
+    (run ? ` · 本轮已收${s.round_chars}字 · 空闲${s.idle}s` : "") + `</span>` +
+    (s.status === "suspend" || s.status === "error"
+      ? ' <button id="aiGo" title="从中断处继续（/sess go）">▶ 从中断处继续</button>' : "");
+  $("#aiSend").disabled = run;
+  $("#aiinput").placeholder = run
+    ? "会话运行中，稍候即可发送下一条…"
+    : "继续会话 #" + s.id + "，Enter 发送，Shift+Enter 换行…";
+}
+$("#aihead").addEventListener("click", async (e) => {
+  if (e.target.id !== "aiGo" || aiMode === null) return;
+  e.target.disabled = true;
+  try {
+    await api(`/api/sess/${encodeURIComponent(aiMode)}/go`, { method: "POST", body: {} });
+    pollSession();
+  } catch (err) { fatal(err.message); }
+});
+
+function msgNode(m) {
+  const row = document.createElement("div");
+  if (m.role === "user") {
+    row.className = "msgrow user";
+    row.innerHTML = `<div class="ava">你</div><div class="col">` +
+      `<div class="bubble">${esc(m.content || "")}</div></div>`;
+    return row;
+  }
+  if (m.role === "assistant") {
+    row.className = "msgrow bot";
+    const calls = (m.tool_calls || []).map((c) =>
+      `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
+      `<code>${esc((c.function?.arguments || "").slice(0, 240))}</code>)</summary></details>`).join("");
+    row.innerHTML = `<div class="ava">M</div><div class="col">` +
+      (m.content ? `<div class="bubble md">${mdRender(m.content)}</div>` : "") +
+      calls + (m.content ? `<a class="copybtn">⧉ 复制</a>` : "") + `</div>`;
+    return row;
+  }
+  if (m.role === "tool") {
+    row.className = "toolrow";
+    row.innerHTML = `<details class="tool"><summary>📤 ${esc(m.name || m.tool_call_id || "工具")} 结果</summary>` +
+      `<pre>${esc(m.content || "")}</pre></details>`;
+    return row;
+  }
+  return document.createTextNode("");
+}
+
+function renderSession(s) {
+  const el = $("#aichat");
+  const msgs = s.messages || [];
+  const newSig = msgs.map(sessSig);
+  // append-only fast path: resume can REWRITE the tail (dangling tool_calls
+  // get synthesized results), so any prefix mismatch forces a full redraw
+  const prefixOk = aiSig.length <= newSig.length && aiSig.every((x, i) => x === newSig[i]);
+  const live = el.querySelector("#ailive");
+  const tl = el.querySelector("#aitl");
+  if (live) live.remove();
+  if (tl) tl.remove();
+  if (!prefixOk) { el.innerHTML = ""; aiSig = []; }
+  const frag = document.createDocumentFragment();
+  for (let i = aiSig.length; i < msgs.length; i++) frag.appendChild(msgNode(msgs[i]));
+  aiSig = newSig;
+  el.appendChild(frag);
+  if (s.status === "running") {
+    const z = document.createElement("div");
+    z.id = "ailive";
+    z.className = "ailive";
+    const ev = (s.events || []).filter((e) =>
+      e.kind === "tool" || e.kind === "tool_result" || e.kind === "llm");
+    const chips = ev.slice(-4).map((e) => {
+      const icon = e.kind === "tool" ? "🔧" : e.kind === "tool_result" ? "✅" : "🧠";
+      return `<span class="chip">${icon} ${esc((e.detail || "").slice(0, 90))}</span>`;
+    }).join("");
+    z.innerHTML =
+      `<div>⏳ 第${s.step || 1}轮进行中 · 本轮已收 <b>${s.round_chars}</b> 字 · 空闲 ${s.idle}s</div>` +
+      (chips ? `<div style="margin-top:4px">${chips}</div>` : "");
+    el.appendChild(z);
+  } else if (tl) {
+    el.appendChild(tl); // keep the existing <details> (open state preserved)
+  } else {
+    const ev = (s.events || []).filter((e) => e.kind !== "prompt");
+    if (ev.length) {
+      const d = document.createElement("details");
+      d.id = "aitl";
+      d.className = "tool tl";
+      d.innerHTML = `<summary>⏱ 过程时间线（${ev.length} 项）</summary>` +
+        ev.map((e) => `<div><span class="dim">${e.t}s</span> ${esc(e.kind)}: ${esc(e.detail || "")}</div>`).join("");
+      el.appendChild(d);
+    }
+  }
+  scrollChat();
 }
 
 function stopSessPoll() {
@@ -528,69 +529,194 @@ function stopSessPoll() {
 }
 function startSessPoll() {
   stopSessPoll();
-  sessPoll = setInterval(async () => {
-    await refreshAiSession();
-    if (lastSess && lastSess.status !== "running") {
-      stopSessPoll();
-      loadAiSessions();
-    }
-  }, 2500);
+  sessPoll = setInterval(pollSession, 1200);
 }
 
-async function openAiSession(sid) {
-  aiMode = sid;
-  stopSessPoll();
-  markListSel(sid);
-  $("#aiinput").placeholder = "输入消息继续此会话，回车发送…";
-  await refreshAiSession();
-  if (lastSess && lastSess.status === "running") startSessPoll();
-}
-
-async function sendSessMsg(text) {
-  const div = document.createElement("div");
-  div.className = "msgrow user";
-  div.innerHTML = `<div class="who">你</div><div class="bubble">${esc(text)}</div>`;
-  $("#aichat").appendChild(div);
-  $("#aichat").scrollTop = 1e9;
+async function pollSession() {
+  if (aiMode === null) return;
+  const seq = aiSeq;
+  let s;
   try {
-    await api(`/api/sess/${encodeURIComponent(aiMode)}/msg`, { method: "POST", body: { text } });
-    startSessPoll();
-  } catch (e) {
-    const err = document.createElement("div");
-    err.className = "dim pad";
-    err.textContent = "发送失败: " + (e.message || "");
-    $("#aichat").appendChild(err);
+    s = await api("/api/sess/" + encodeURIComponent(aiMode));
+  } catch (e) { return; } // transient network error; keep polling
+  if (seq !== aiSeq || !s || !s.id) return; // switched away / 404 body
+  if (s.error) {
+    stopSessPoll();
+    $("#aichat").innerHTML = '<div class="dim pad">会话不存在（可能已被清理）</div>';
+    return;
+  }
+  const wasRunning = lastSess !== null && lastSess.status === "running";
+  lastSess = s;
+  updateAiHead(s);
+  renderSession(s);
+  if (s.status === "running") {
+    if (!sessPoll) startSessPoll();
+  } else {
+    stopSessPoll();
+    if (wasRunning) { // just landed: refresh list (auto-title arrives late)
+      loadAiSessions();
+      setTimeout(() => { if (aiMode !== null) loadAiSessions(); }, 4000);
+    }
   }
 }
 
-async function aiSend() {
-  const input = $("#aiinput");
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = "";
-  if (aiMode !== "new") { await sendSessMsg(text); return; }
-  const u = bubbleNode("user", text);
-  const holder = bubbleNode("bot", "…");
-  newMsgs.push(u, holder);
-  $("#aichat").appendChild(u);
-  $("#aichat").appendChild(holder);
-  $("#aichat").scrollTop = 1e9;
+async function openSession(sid) {
+  aiSeq++;
+  stopSessPoll();
+  aiMode = sid;
+  aiSig = [];
+  lastSess = null;
+  $("#aichat").innerHTML = "";
+  markListSel(sid);
+  await pollSession();
+}
+
+function selectNewChat() {
+  aiSeq++;
+  stopSessPoll();
+  aiMode = null;
+  lastSess = null;
+  aiSig = [];
+  $("#aichat").innerHTML =
+    `<div class="aiempty"><div style="font-size:34px">💬</div>` +
+    `<div><b>与 muze 对话</b></div>` +
+    `<div class="dim" style="margin:6px 0 14px">直接输入开始新会话；它能查询你的消息档案、发消息、管理记忆。左侧是全部历史会话，点开即可继续。</div>` +
+    ["总结一下今天群里的热门话题", "帮我查查老王最近说过什么", "这两周有谁提到过我？"]
+      .map((t) => `<span class="ex">${esc(t)}</span>`).join("") + `</div>`;
+  updateAiHead(null);
+  $("#aiSend").disabled = false;
+  markListSel(null);
+  const inp = $("#aiinput");
+  inp.placeholder = "输入消息，Enter 发送，Shift+Enter 换行…";
+  inp.focus();
+  autosize();
+}
+$("#aiNew").addEventListener("click", selectNewChat);
+
+/* example prompts fill the composer; copy buttons copy the bubble */
+$("#aichat").addEventListener("click", async (e) => {
+  if (e.target.classList.contains("ex")) {
+    const inp = $("#aiinput");
+    inp.value = e.target.textContent.trim();
+    inp.focus();
+    autosize();
+    return;
+  }
+  if (e.target.classList.contains("copybtn")) {
+    const bubble = e.target.closest(".col")?.querySelector(".bubble");
+    if (!bubble) return;
+    try {
+      await navigator.clipboard.writeText(bubble.textContent);
+      e.target.textContent = "✓ 已复制";
+      setTimeout(() => { e.target.textContent = "⧉ 复制"; }, 1200);
+    } catch (err) { e.target.textContent = "复制失败"; }
+  }
+});
+
+/* ---------------- session list ---------------- */
+function dayLabel(ts) {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const a = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const b = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const diff = Math.round((b - a) / 86400000);
+  if (diff <= 0) return "今天";
+  if (diff === 1) return "昨天";
+  if (diff <= 7) return "本周";
+  return d.toLocaleDateString("zh-CN");
+}
+
+async function loadAiSessions() {
+  const box = $("#aisses");
   try {
-    const d = await api("/api/agent", { method: "POST", body: { text } });
-    holder.querySelector(".bubble").innerHTML = mdRender(d.text || "(空)");
-    pendingBadgeReload();
-    loadAiSessions();
+    const d = await api("/api/sess");
+    sessCache = d.sessions || [];
   } catch (e) {
-    holder.querySelector(".bubble").textContent = "调用失败: " + e.message;
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+    return;
+  }
+  renderSessList();
+}
+
+function renderSessList() {
+  const box = $("#aisses");
+  const q = ($("#aiFilter").value || "").trim().toLowerCase();
+  const list = sessCache.filter((s) =>
+    !q || (s.title || "").toLowerCase().includes(q) || s.id.includes(q) ||
+    (s.prompt || "").toLowerCase().includes(q));
+  if (!list.length) {
+    box.innerHTML = '<div class="dim pad">（无会话）</div>';
+    return;
+  }
+  let html = "";
+  let lastDay = "";
+  for (const s of list) {
+    const day = dayLabel(s.updated);
+    if (day !== lastDay) { html += `<div class="sessgroup">${day}</div>`; lastDay = day; }
+    const run = s.status === "running";
+    const hhmm = new Date(s.updated * 1000)
+      .toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+    html +=
+      `<div class="srow${aiMode === s.id ? " sel" : ""}" data-sid="${esc(s.id)}">` +
+      `<div class="t"><span class="name">${run ? '<span class="runDot"></span>' : (SESS_ICON[s.status] || "")} ${esc(s.title || "#" + s.id)}</span>` +
+      `<span class="cnt">${hhmm}</span></div>` +
+      `<div class="prev dim">${esc(s.result_preview || s.prompt || "")}</div></div>`;
+  }
+  box.innerHTML = html;
+  box.querySelectorAll(".srow").forEach((r) =>
+    r.addEventListener("click", () => openSession(r.dataset.sid)));
+}
+$("#aiFilter").addEventListener("input", renderSessList);
+
+/* ---------------- composer ---------------- */
+function autosize() {
+  const t = $("#aiinput");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 180) + "px";
+}
+$("#aiinput").addEventListener("input", autosize);
+$("#aiinput").addEventListener("keydown", (e) => {
+  // isComposing: Enter during IME composition must NOT send
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    aiSend();
+  }
+});
+
+async function aiSend() {
+  const inp = $("#aiinput");
+  const text = inp.value.trim();
+  if (!text) return;
+  if (aiMode !== null && lastSess && lastSess.status === "running") return;
+  inp.value = "";
+  autosize();
+  if (aiMode === null) {
+    try {
+      const d = await api("/api/sess", { method: "POST", body: { text } });
+      openSession(d.id);
+    } catch (e) { fatal(e.message); }
+    return;
+  }
+  const row = msgNode({ role: "user", content: text }); // optimistic bubble
+  $("#aichat").appendChild(row);
+  aiSig.push(sessSig({ role: "user", content: text }));
+  aiPinned = true;
+  scrollChat();
+  try {
+    await api(`/api/sess/${encodeURIComponent(aiMode)}/msg`, { method: "POST", body: { text } });
+    pollSession();
+  } catch (e) {
+    row.remove();
+    aiSig.pop();
+    inp.value = text;
+    autosize();
+    fatal("发送失败: " + e.message);
   }
 }
 $("#aiSend").addEventListener("click", aiSend);
-$("#aiinput").addEventListener("keydown", (e) => { if (e.key === "Enter") aiSend(); });
-$("#aiReset").addEventListener("click", async () => {
-  await api("/api/agent/reset", { method: "POST", body: {} });
-  newMsgs = [];
-  selectNewChat();
-});
+
+selectNewChat();
 
 /* ---------------- memories ---------------- */
 async function loadMemories() {

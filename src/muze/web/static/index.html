@@ -49,17 +49,23 @@
     <div id="searchresults"></div>
   </section>
 
-  <!-- ai (chat + session list merged) -->
+  <!-- ai: session-based chat -->
   <section id="tab-ai" class="tab">
     <div class="split">
-      <div id="ailist" class="pane list"><div class="dim pad">加载中…</div></div>
+      <div id="ailist" class="pane list">
+        <div class="bar slim">
+          <input id="aiFilter" placeholder="过滤会话…">
+          <button id="aiNew" title="开始新对话">＋</button>
+        </div>
+        <div id="aisses" class="sesslist"><div class="dim pad">加载中…</div></div>
+      </div>
       <div id="aipane" class="pane grow">
-        <div id="aihead" class="panehead"><b>新对话</b> <span class="dim">直接输入与 muze 对话；左侧选历史会话可继续</span></div>
+        <div id="aihead" class="panehead dim pad">新对话</div>
         <div id="aichat" class="aichat"></div>
-        <div class="bar">
-          <input id="aiinput" placeholder="输入消息，回车发送…">
+        <button id="aijump" class="jump hidden">↓ 有新内容</button>
+        <div class="composer">
+          <textarea id="aiinput" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行…"></textarea>
           <button id="aiSend">发送</button>
-          <button id="aiReset" title="清空新对话上下文">清空</button>
         </div>
       </div>
     </div>

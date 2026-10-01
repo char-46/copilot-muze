@@ -417,6 +417,22 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
         service.agent.resume(s, ctx(), extra_text=text)
         return web.json_response({"ok": True, "id": s.id, "status": "running"})
 
+    async def api_sess_create(request: web.Request) -> web.Response:
+        """Start a NEW agent session from the webui (fire-and-forget like
+        `::` on QQ): returns the session id immediately; the frontend then
+        polls /api/sess/<id> for the live tool trace."""
+        service, _, _ = pick(request)
+        if service.agent is None:
+            return web.json_response({"error": "LLM 未配置"}, status=503)
+        data = await request.json()
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return web.json_response({"error": "missing text"}, status=400)
+        session = service.agent.submit(text, ctx())
+        return web.json_response(
+            {"ok": True, "id": session.id, "status": session.status}
+        )
+
     async def api_agent_reset(request: web.Request) -> web.Response:
         service, _, _ = pick(request)
         if service.agent is not None:
@@ -569,6 +585,7 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
     app.router.add_post("/api/command", api_command)
     app.router.add_post("/api/agent", api_agent)
     app.router.add_get("/api/sess", api_sess)
+    app.router.add_post("/api/sess", api_sess_create)
     app.router.add_get("/api/sess/{sid}", api_sess)
     app.router.add_post("/api/sess/{sid}/go", api_sess_go)
     app.router.add_post("/api/sess/{sid}/msg", api_sess_msg)

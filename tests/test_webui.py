@@ -62,6 +62,7 @@ async def client(tmp_path):
 
         def __init__(self):
             self.resumed = []
+            self.submitted = []
 
         async def get_session(self, sid):
             from muze.ai.sessions import Session
@@ -71,6 +72,14 @@ async def client(tmp_path):
 
         def resume(self, s, ctx, extra_text=None):
             self.resumed.append((s.id, extra_text))
+
+        def submit(self, text, ctx):
+            from muze.ai.sessions import Session
+
+            self.submitted.append(text)
+            s = Session(id="ne11ew", chat_key=ctx.chat_key, prompt=text)
+            s.finish(True, "ok")
+            return s
 
         def reset(self, chat_key):
             pass
@@ -198,6 +207,19 @@ async def test_sess_go_and_msg_endpoints(client):
     assert r.status == 400
     r = await client.post("/api/sess/deadbe/go", json={})
     assert r.status == 404
+
+
+async def test_sess_create_endpoint(client):
+    r = await client.post("/api/sess", json={"text": "查一下最近的群消息"})
+    assert r.status == 200
+    d = await r.json()
+    assert d["ok"] is True and d["id"] == "ne11ew" and d["status"] == "done"
+    assert client.agent.submitted == ["查一下最近的群消息"]
+
+    r = await client.post("/api/sess", json={"text": "  "})
+    assert r.status == 400
+    r = await client.post("/api/sess", json={})
+    assert r.status == 400
 
 
 async def test_shared_embedder_one_instance_per_config():
