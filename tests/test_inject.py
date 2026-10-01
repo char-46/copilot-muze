@@ -141,3 +141,61 @@ async def test_extract_memories_retires_contradicted(repo):
     remaining = await repo.list_memories()
     assert len(remaining) == 1 and "新工作" in remaining[0]["content"]
     assert old_id == 1  # the retired id matched
+
+
+# ------------------------------------------------- restart auto-resume
+async def test_ctx_rebuild_from_chat_key():
+    from muze.ai.agent import Agent
+
+    c = Agent._ctx_for_chat_key("qq:friend:1000000001")
+    assert c.source == "qq" and c.scene == "friend" and c.peer_id == 1000000001
+    assert c.qq_reachable and not c.is_local
+    c = Agent._ctx_for_chat_key("qq:group:456")
+    assert c.scene == "group" and c.peer_id == 456
+    c = Agent._ctx_for_chat_key("web:default")
+    assert c.is_local and not c.qq_reachable
+
+
+async def test_resume_interrupted_picks_crash_and_recent_error(repo):
+    import time as _t
+
+    from muze.ai.sessions import Session
+
+    agent, _ = make_agent(repo)
+
+    class LLM:
+        configured = True
+
+    agent.llm = LLM
+    calls = []
+    agent.resume = lambda s, ctx: calls.append(
+        (s.id, ctx.source, ctx.scene, ctx.peer_id)
+    )
+
+    def mk(sid, status, updated):
+        s = Session(id=sid, chat_key="qq:friend:123", prompt="p")
+        s.status = status
+        s.updated = updated
+        return s
+
+    now = _t.time()
+    agent.sessions.add(mk("run1", "running", now))          # crash-interrupted
+    agent.sessions.add(mk("err1", "error", now - 60))       # recent error
+    agent.sessions.add(mk("old1", "error", now - 99_999))   # stale error
+    agent.sessions.add(mk("sus1", "suspend", now))          # manual only
+    agent.sessions.add(mk("ok1", "done", now))
+
+    n = await agent.resume_interrupted()
+    assert n == 2
+    ids = [c[0] for c in calls]
+    assert "run1" in ids and "err1" in ids
+    assert "old1" not in ids and "sus1" not in ids and "ok1" not in ids
+    # crash-interrupted sessions flip to suspend so resume() accepts them
+    assert agent.sessions.get("run1").status == "suspend"
+    # the rebuilt ctx targets the original conversation
+    for c in calls:
+        assert c[1] == "qq" and c[2] == "friend" and c[3] == 123
+
+    # no LLM configured -> nothing happens
+    agent.llm = None
+    assert await agent.resume_interrupted() == 0

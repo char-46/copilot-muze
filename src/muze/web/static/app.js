@@ -57,7 +57,7 @@ if (!storageOK) {
   fatal("localStorage 不可用（浏览器阻止了站点数据？）。本次可用，但 token 不会被记住。");
 }
 let authorized = !!TOKEN;
-let ACCT = ""; // selected account name; "" -> server default (first)
+let ACCT = recall("muze_acct") || ""; // selected account; persists across reloads
 
 /* inject the account selector param into every api call */
 function withAccount(path) {
@@ -173,7 +173,7 @@ $$("nav button").forEach((b) => b.addEventListener("click", () => {
   if (b.dataset.tab === "logs") loadLogs();
   if (b.dataset.tab === "status") loadStatus();
   if (b.dataset.tab === "chats") loadConversations();
-  if (b.dataset.tab === "sess") loadSess();
+  if (b.dataset.tab === "ai") { loadAiSessions(); if (aiMode !== "new") refreshAiSession(); }
   if (b.dataset.tab === "settings") loadSettings();
   if (b.dataset.tab === "memories") loadMemories();
   if (b.dataset.tab === "rag") loadRag();
@@ -212,6 +212,7 @@ function refreshAll() {
 let acctNames = null;
 $("#acctSel").addEventListener("change", () => {
   ACCT = $("#acctSel").value;
+  store("muze_acct", ACCT);
   curConv = null;
   $("#msglist").innerHTML = "";
   $("#msghead").textContent = "选择左侧会话";
@@ -227,7 +228,7 @@ async function loadAccounts() {
       .map((a) => `<option value="${esc(a.name)}">${esc(a.name)} (${a.self_id})</option>`)
       .join("");
     sel.classList.toggle("hidden", d.accounts.length < 2);
-    if (!ACCT) ACCT = d.default || (acctNames[0] || "");
+    if (!ACCT || !acctNames.includes(ACCT)) ACCT = d.default || (acctNames[0] || "");
     sel.value = ACCT;
   } catch { /* dot handled */ }
 }
@@ -378,31 +379,207 @@ async function runSearch() {
     : '<div class="dim pad">无结果</div>';
 }
 
-/* ---------------- ai ---------------- */
+/* ---------------- ai: chat + sessions merged ----------------
+ * Left pane: "新对话" plus recent agent sessions (icon/title/time, ▶继续
+ * button on suspended/errored ones). Right pane: either the live new chat
+ * (/api/agent) or one session's full trace — messages rendered as
+ * markdown, tool calls collapsible, running sessions polled live. The
+ * input box always targets whatever is selected. */
 const SESS_ICON = { running: "⏳", done: "✔", error: "✖", suspend: "⏸" };
 const SESS_CN = { running: "运行中", done: "完成", error: "出错", suspend: "已暂停" };
 
-function aiBubble(who, text, err) {
+let aiMode = "new";      // "new" | session id
+let newMsgs = [];        // bubbles of the new chat (DOM nodes, reattached)
+let lastSess = null;     // detail of the open session
+let sessPoll = null;
+
+function bubbleNode(who, text, err) {
   const div = document.createElement("div");
   div.className = "msgrow " + who + (err ? " err" : "");
   const body = who === "user" ? esc(text) : mdRender(text);
   div.innerHTML = `<div class="who">${who === "user" ? "你" : "muze"}</div>` +
     `<div class="bubble md">${body}</div>`;
-  $("#aichat").appendChild(div);
-  $("#aichat").scrollTop = 1e9;
   return div;
 }
+
+function renderNewChat() {
+  const box = $("#aichat");
+  box.innerHTML = "";
+  if (!newMsgs.length) {
+    box.innerHTML = '<div class="dim pad">与 muze 的新对话；历史 AI 会话在左侧，点开可直接继续追问</div>';
+    return;
+  }
+  for (const m of newMsgs) box.appendChild(m);
+  box.scrollTop = 1e9;
+}
+
+function selectNewChat() {
+  aiMode = "new";
+  stopSessPoll();
+  lastSess = null;
+  $("#aihead").innerHTML = "<b>新对话</b> <span class=\"dim\">直接输入与 muze 对话；左侧选历史会话可继续</span>";
+  $("#aiinput").placeholder = "输入消息，回车发送…";
+  renderNewChat();
+  markListSel(null);
+}
+
+function markListSel(sid) {
+  const rows = $$("#ailist .conv");
+  rows.forEach((x) => x.classList.remove("sel"));
+  if (sid === null) { if (rows[0]) rows[0].classList.add("sel"); return; }
+  for (const r of rows) {
+    if (r.dataset.sid === sid) r.classList.add("sel");
+  }
+}
+
+async function loadAiSessions() {
+  const box = $("#ailist");
+  box.innerHTML = '<div class="dim pad">加载中…</div>';
+  try {
+    const d = await api("/api/sess");
+    box.innerHTML = "";
+    const newDiv = document.createElement("div");
+    newDiv.className = "conv";
+    newDiv.dataset.sid = "";
+    newDiv.innerHTML =
+      '<div class="t"><span class="name">➕ 新对话</span></div>' +
+      '<div class="prev dim">直接输入与 muze 对话</div>';
+    newDiv.addEventListener("click", selectNewChat);
+    box.appendChild(newDiv);
+    for (const s of d.sessions || []) {
+      const div = document.createElement("div");
+      div.className = "conv";
+      div.dataset.sid = s.id;
+      div.innerHTML =
+        `<div class="t"><span class="name">${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</span>` +
+        `<span class="cnt">${esc(SESS_CN[s.status] || s.status)}</span></div>` +
+        `<div class="prev dim">${esc(s.chat_key)} · ${esc(fmtTime(s.updated))}</div>`;
+      div.addEventListener("click", () => openAiSession(s.id));
+      if (s.status === "suspend" || s.status === "error") {
+        const go = document.createElement("button");
+        go.className = "minibtn";
+        go.textContent = "▶ 继续";
+        go.title = "继续这个会话（/sess go）";
+        go.addEventListener("click", async (ev) => {
+          ev.stopPropagation();
+          try {
+            await api(`/api/sess/${encodeURIComponent(s.id)}/go`, { method: "POST", body: {} });
+            openAiSession(s.id);
+          } catch (e) { fatal(e.message); }
+        });
+        div.appendChild(go);
+      }
+      box.appendChild(div);
+    }
+    markListSel(aiMode === "new" ? null : aiMode);
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+function renderSessPane(s) {
+  let html =
+    `<div class="panehead"><b>${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</b>` +
+    ` <span class="dim">${esc(s.chat_key)} · ${esc(SESS_CN[s.status] || s.status)}` +
+    ` · ${esc(fmtTime(s.created))} · ${s.step}轮 · ${s.total_chars}字` +
+    (s.status === "running" ? ` · 空闲${s.idle}s` : "") + "</span></div>";
+  const msgs = s.messages || [];
+  for (const m of msgs) {
+    if (m.role === "user") {
+      html += `<div class="msgrow user"><div class="who">你</div>` +
+        `<div class="bubble">${esc(m.content || "")}</div></div>`;
+    } else if (m.role === "assistant") {
+      const calls = (m.tool_calls || []).map((c) =>
+        `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
+        `<code>${esc((c.function?.arguments || "").slice(0, 300))}</code>)</summary></details>`).join("");
+      html += `<div class="msgrow bot"><div class="who">muze</div>` +
+        `<div class="bubble md">${m.content ? mdRender(m.content) : ""}${calls}</div></div>`;
+    } else if (m.role === "tool") {
+      html += `<details class="tool"><summary>📤 工具结果 ${esc(m.name || m.tool_call_id || "")}</summary>` +
+        `<pre>${esc((m.content || "").slice(0, 1500))}</pre></details>`;
+    }
+  }
+  if (s.status === "running") html += '<div class="dim pad">⏳ 运行中，自动刷新…</div>';
+  const ev = (s.events || []).filter((e) => e.kind !== "prompt");
+  if (ev.length) {
+    html += `<details class="tool tl"><summary>⏱ 过程时间线（${ev.length} 项）</summary>` +
+      ev.map((e) => `<div><span class="dim">${e.t}s</span> ${esc(e.kind)}: ${esc(e.detail || "")}</div>`).join("") +
+      "</details>";
+  }
+  $("#aichat").innerHTML = html;
+  $("#aichat").scrollTop = 1e9;
+}
+
+async function refreshAiSession() {
+  if (aiMode === "new") return;
+  try {
+    lastSess = await api("/api/sess/" + encodeURIComponent(aiMode));
+  } catch (e) {
+    $("#aichat").innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+    return;
+  }
+  renderSessPane(lastSess);
+}
+
+function stopSessPoll() {
+  if (sessPoll) { clearInterval(sessPoll); sessPoll = null; }
+}
+function startSessPoll() {
+  stopSessPoll();
+  sessPoll = setInterval(async () => {
+    await refreshAiSession();
+    if (lastSess && lastSess.status !== "running") {
+      stopSessPoll();
+      loadAiSessions();
+    }
+  }, 2500);
+}
+
+async function openAiSession(sid) {
+  aiMode = sid;
+  stopSessPoll();
+  markListSel(sid);
+  $("#aiinput").placeholder = "输入消息继续此会话，回车发送…";
+  await refreshAiSession();
+  if (lastSess && lastSess.status === "running") startSessPoll();
+}
+
+async function sendSessMsg(text) {
+  const div = document.createElement("div");
+  div.className = "msgrow user";
+  div.innerHTML = `<div class="who">你</div><div class="bubble">${esc(text)}</div>`;
+  $("#aichat").appendChild(div);
+  $("#aichat").scrollTop = 1e9;
+  try {
+    await api(`/api/sess/${encodeURIComponent(aiMode)}/msg`, { method: "POST", body: { text } });
+    startSessPoll();
+  } catch (e) {
+    const err = document.createElement("div");
+    err.className = "dim pad";
+    err.textContent = "发送失败: " + (e.message || "");
+    $("#aichat").appendChild(err);
+  }
+}
+
 async function aiSend() {
   const input = $("#aiinput");
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
-  aiBubble("user", text);
-  const holder = aiBubble("bot", "…");
+  if (aiMode !== "new") { await sendSessMsg(text); return; }
+  const u = bubbleNode("user", text);
+  const holder = bubbleNode("bot", "…");
+  newMsgs.push(u, holder);
+  $("#aichat").appendChild(u);
+  $("#aichat").appendChild(holder);
+  $("#aichat").scrollTop = 1e9;
   try {
     const d = await api("/api/agent", { method: "POST", body: { text } });
     holder.querySelector(".bubble").innerHTML = mdRender(d.text || "(空)");
     pendingBadgeReload();
+    loadAiSessions();
   } catch (e) {
     holder.querySelector(".bubble").textContent = "调用失败: " + e.message;
   }
@@ -411,7 +588,8 @@ $("#aiSend").addEventListener("click", aiSend);
 $("#aiinput").addEventListener("keydown", (e) => { if (e.key === "Enter") aiSend(); });
 $("#aiReset").addEventListener("click", async () => {
   await api("/api/agent/reset", { method: "POST", body: {} });
-  $("#aichat").innerHTML = "";
+  newMsgs = [];
+  selectNewChat();
 });
 
 /* ---------------- memories ---------------- */
@@ -506,85 +684,6 @@ async function runRagSearch() {
 }
 $("#ragBtn").addEventListener("click", runRagSearch);
 $("#ragq").addEventListener("keydown", (e) => { if (e.key === "Enter") runRagSearch(); });
-
-/* ---------------- sess (agent sessions) ---------------- */
-async function loadSess() {
-  const box = $("#sesslist");
-  box.innerHTML = '<div class="dim pad">加载中…</div>';
-  try {
-    const d = await api("/api/sess");
-    if (!d.sessions || !d.sessions.length) {
-      box.innerHTML = '<div class="dim pad">暂无 AI 会话（在 AI 标签页或 QQ 里 :: 提问后出现）</div>';
-      return;
-    }
-    box.innerHTML = "";
-    for (const s of d.sessions) {
-      const div = document.createElement("div");
-      div.className = "conv";
-      div.innerHTML =
-        `<div class="t"><span class="name">${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</span>` +
-        `<span class="cnt">${esc(SESS_CN[s.status] || s.status)}</span></div>` +
-        `<div class="prev dim">${esc(s.chat_key)} · ${esc(fmtTime(s.updated))}</div>`;
-      div.addEventListener("click", () => loadSessDetail(s.id, div));
-      box.appendChild(div);
-    }
-  } catch (e) {
-    box.innerHTML = e.unauthorized ? authHint()
-      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
-  }
-}
-
-async function loadSessDetail(sid, div) {
-  $$("#sesslist .conv").forEach((x) => x.classList.remove("sel"));
-  if (div) div.classList.add("sel");
-  const pane = $("#sessdetail");
-  pane.innerHTML = '<div class="dim pad">加载中…</div>';
-  try {
-    const s = await api("/api/sess/" + encodeURIComponent(sid));
-    let html =
-      `<div class="panehead"><b>${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</b>` +
-      ` <span class="dim">${esc(s.chat_key)} · ${esc(SESS_CN[s.status] || s.status)}` +
-      ` · ${esc(fmtTime(s.created))} · ${s.step}轮 · ${s.total_chars}字` +
-      (s.status === "running" ? ` · 空闲${s.idle}s` : "") + "</span></div>";
-    /* prompt */
-    html += `<div class="card"><div class="head"><b>问</b></div>` +
-      `<div class="md">${mdRender(s.prompt)}</div></div>`;
-    /* tool-loop messages, replies rendered as markdown */
-    const msgs = s.messages || [];
-    if (msgs.length) {
-      html += '<div class="sessmsgs">';
-      for (const m of msgs) {
-        if (m.role === "user") {
-          html += `<div class="msgrow user"><div class="who">你</div>` +
-            `<div class="bubble">${esc(m.content || "")}</div></div>`;
-        } else if (m.role === "assistant") {
-          const calls = (m.tool_calls || []).map((c) =>
-            `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
-            `<code>${esc((c.function?.arguments || "").slice(0, 300))}</code>)</summary></details>`).join("");
-          html += `<div class="msgrow bot"><div class="who">muze</div>` +
-            `<div class="bubble md">${m.content ? mdRender(m.content) : ""}${calls}</div></div>`;
-        } else if (m.role === "tool") {
-          const txt = (m.content || "").slice(0, 1500);
-          html += `<details class="tool"><summary>📤 工具结果 ${esc(m.name || m.tool_call_id || "")}</summary>` +
-            `<pre>${esc(txt)}</pre></details>`;
-        }
-      }
-      html += "</div>";
-    }
-    /* event timeline (collapsed) */
-    const ev = (s.events || []).filter((e) => e.kind !== "prompt");
-    if (ev.length) {
-      html += `<details class="tool tl"><summary>⏱ 过程时间线（${ev.length} 项）</summary>` +
-        ev.map((e) =>
-          `<div><span class="dim">${e.t}s</span> ${esc(e.kind)}: ${esc(e.detail || "")}</div>`).join("") +
-        "</details>";
-    }
-    pane.innerHTML = html;
-  } catch (e) {
-    pane.innerHTML = e.unauthorized ? authHint()
-      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
-  }
-}
 
 /* ---------------- pending ---------------- */
 async function loadPending() {

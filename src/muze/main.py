@@ -67,6 +67,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+_EMBEDDER_CACHE: dict[tuple, object] = {}
+
+
+def _shared_embedder(emb_cfg):
+    """One model instance per unique embedding config: multi-account
+    processes share the weights (RAM/VRAM) instead of loading one copy per
+    account. The key covers everything that selects a backend/model."""
+    from muze.ai.embeddings import Embedder
+
+    key = (
+        emb_cfg.provider, emb_cfg.backend, emb_cfg.model,
+        emb_cfg.remote_model, emb_cfg.base_url, emb_cfg.api_key,
+        emb_cfg.device,
+    )
+    inst = _EMBEDDER_CACHE.get(key)
+    if inst is None:
+        inst = Embedder(emb_cfg)
+        _EMBEDDER_CACHE[key] = inst
+    return inst
+
+
 class App:
     """One account stack inside the process."""
 
@@ -150,7 +171,7 @@ class App:
             emb.base_url = cfg.llm.chat.base_url
         if not emb.api_key:
             emb.api_key = cfg.llm.chat.api_key
-        self.embedder = Embedder(emb)
+        self.embedder = _shared_embedder(emb)
         self.governor = ResourceGovernor(cfg.rag)
         self.rag = RagIndexer(
             self.repo, self.vec, self.embedder, cfg,
@@ -452,6 +473,12 @@ class App:
             await asyncio.sleep(20)
             if self._stop.is_set():
                 return
+            # LLM turns that were in flight when the process died resume
+            # first (user-visible continuation), then the slower enrichment
+            if getattr(self, "agent", None) is not None:
+                n = await self.agent.resume_interrupted()
+                if n:
+                    log.info("[%s] resumed %s interrupted LLM session(s)", self.spec.name, n)
             if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
                 n = await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
                 self._last_profile_refresh = time.time()

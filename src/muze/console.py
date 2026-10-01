@@ -396,7 +396,17 @@ def _console_line(loop, switcher, ctx, line) -> str:
     if use_out:
         write_above(use_out)
         return "continue"
-    return _run_on_loop(loop, switcher.current, ctx, line)
+    action = _run_on_loop(loop, switcher.current, ctx, line)
+    # /help is auto-generated from the @slash registry, which cannot see the
+    # console-front built-ins — append them so they're discoverable here.
+    low = line.strip().lower()
+    if low in ("/help", ".help", "help") and action == "continue":
+        extra = ["", "console 专属（仅本控制台，不在 /help 注册表）:"]
+        if switcher.multi:
+            extra.append(f"  /use <name> 切换实例（当前 {switcher.name}，/use 列出全部）")
+        extra.append("  /exit|/quit|/q 关闭控制台（服务继续运行）")
+        write_above("\n".join(extra))
+    return action
 
 
 def _submit_and_run(loop, switcher, ctx, stop_event, line: str, prompt: str) -> str | None:

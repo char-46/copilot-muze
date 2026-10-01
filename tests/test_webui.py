@@ -56,7 +56,26 @@ async def client(tmp_path):
     conn = await open_db(str(tmp_path / "webui.db"))
     repo = Repository(conn)
     svc = ControlService(MuzeConfig(), Recorder(), repo, ChatLog(), Runtime())
-    svc.agent = object()  # agent=on
+
+    class FakeAgent:
+        sessions = None
+
+        def __init__(self):
+            self.resumed = []
+
+        async def get_session(self, sid):
+            from muze.ai.sessions import Session
+
+            row = await repo.get_ai_session(sid)
+            return Session.from_row(row) if row else None
+
+        def resume(self, s, ctx, extra_text=None):
+            self.resumed.append((s.id, extra_text))
+
+        def reset(self, chat_key):
+            pass
+
+    svc.agent = FakeAgent()  # agent=on
 
     cfg = MuzeConfig()
     cfg.rag.enabled = True
@@ -85,6 +104,7 @@ async def client(tmp_path):
     cl = TestClient(server)
     await cl.start_server()
     cl.session.headers["Authorization"] = "Bearer test-token"
+    cl.agent = svc.agent
     yield cl
     await cl.close()
     await conn.close()
@@ -159,3 +179,37 @@ async def test_sess_list_and_detail(client):
 
     r = await client.get("/api/sess/deadbe")
     assert r.status == 404
+
+
+async def test_sess_go_and_msg_endpoints(client):
+    r = await client.post("/api/sess/ab12cd/go", json={})
+    assert r.status == 200
+    d = await r.json()
+    assert d["ok"] is True and d["id"] == "ab12cd"
+    assert client.agent.resumed == [("ab12cd", None)]
+
+    r = await client.post(
+        "/api/sess/ab12cd/msg", json={"text": "再讲一个"}
+    )
+    assert r.status == 200
+    assert client.agent.resumed[-1] == ("ab12cd", "再讲一个")
+
+    r = await client.post("/api/sess/ab12cd/msg", json={"text": "  "})
+    assert r.status == 400
+    r = await client.post("/api/sess/deadbe/go", json={})
+    assert r.status == 404
+
+
+async def test_shared_embedder_one_instance_per_config():
+    from muze.main import _EMBEDDER_CACHE, _shared_embedder
+
+    _EMBEDDER_CACHE.clear()
+    a = MuzeConfig().rag.embedding
+    a.provider, a.model = "local", "m1"
+    b = MuzeConfig().rag.embedding
+    b.provider, b.model = "local", "m1"
+    c = MuzeConfig().rag.embedding
+    c.provider, c.model = "local", "m2"
+    assert _shared_embedder(a) is _shared_embedder(b)  # same config -> shared
+    assert _shared_embedder(a) is not _shared_embedder(c)  # different model
+    _EMBEDDER_CACHE.clear()

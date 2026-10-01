@@ -19,7 +19,6 @@
   <button data-tab="chats" class="active">会话</button>
   <button data-tab="search">搜索</button>
   <button data-tab="ai">AI</button>
-  <button data-tab="sess">AI会话</button>
   <button data-tab="memories">记忆</button>
   <button data-tab="rag">RAG</button>
   <button data-tab="pending">待确认 <span id="pendingBadge" class="badge hidden">0</span></button>
@@ -50,25 +49,18 @@
     <div id="searchresults"></div>
   </section>
 
-  <!-- ai -->
+  <!-- ai (chat + session list merged) -->
   <section id="tab-ai" class="tab">
-    <div class="bar">
-      <span class="dim">与 copilot 对话（可用自然语言查询档案、代发消息等）</span>
-      <button id="aiReset">清空上下文</button>
-    </div>
-    <div id="aichat" class="aichat"></div>
-    <div class="bar">
-      <input id="aiinput" placeholder="输入消息，回车发送…">
-      <button id="aiSend">发送</button>
-    </div>
-  </section>
-
-  <!-- sess -->
-  <section id="tab-sess" class="tab">
     <div class="split">
-      <div id="sesslist" class="pane list"><div class="dim pad">加载中…</div></div>
-      <div id="sessdetail" class="pane grow">
-        <div class="panehead dim pad">选择左侧 AI 会话查看完整过程（含工具调用），回复按 Markdown 渲染</div>
+      <div id="ailist" class="pane list"><div class="dim pad">加载中…</div></div>
+      <div id="aipane" class="pane grow">
+        <div id="aihead" class="panehead"><b>新对话</b> <span class="dim">直接输入与 muze 对话；左侧选历史会话可继续</span></div>
+        <div id="aichat" class="aichat"></div>
+        <div class="bar">
+          <input id="aiinput" placeholder="输入消息，回车发送…">
+          <button id="aiSend">发送</button>
+          <button id="aiReset" title="清空新对话上下文">清空</button>
+        </div>
       </div>
     </div>
   </section>

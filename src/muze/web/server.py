@@ -364,6 +364,59 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
             }
         )
 
+    async def _load_agent_session(service, repo, sid: str):
+        """Session via the agent (live+persisted) with a repo-only fallback."""
+        gs = getattr(service.agent, "get_session", None)
+        if gs is not None:
+            try:
+                s = await gs(sid)
+                if s is not None:
+                    return s
+            except Exception:
+                pass
+        from muze.ai.sessions import Session
+
+        try:
+            row = await repo.get_ai_session(sid)
+        except Exception:
+            row = None
+        try:
+            return Session.from_row(row) if row else None
+        except Exception:
+            return None
+
+    async def api_sess_go(request: web.Request) -> web.Response:
+        """Quick-continue a suspended/errored/finished session (=/sess go)."""
+        service, repo, _ = pick(request)
+        if service.agent is None:
+            return web.json_response({"error": "LLM 未配置"}, status=503)
+        sid = request.match_info["sid"]
+        s = await _load_agent_session(service, repo, sid)
+        if s is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        if s.status == "running":
+            return web.json_response({"error": "运行中，稍后刷新"}, status=409)
+        service.agent.resume(s, ctx())
+        return web.json_response({"ok": True, "id": s.id, "status": "running"})
+
+    async def api_sess_msg(request: web.Request) -> web.Response:
+        """Continue a session with a new message (=/sess <id> <msg>)."""
+        service, repo, _ = pick(request)
+        if service.agent is None:
+            return web.json_response({"error": "LLM 未配置"}, status=503)
+        data = await request.json()
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return web.json_response({"error": "missing text"}, status=400)
+        sid = request.match_info["sid"]
+        s = await _load_agent_session(service, repo, sid)
+        if s is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        if s.status == "running":
+            return web.json_response({"error": "运行中，稍后再发"}, status=409)
+        service.agent.resume(s, ctx(), extra_text=text)
+        return web.json_response({"ok": True, "id": s.id, "status": "running"})
+
     async def api_agent_reset(request: web.Request) -> web.Response:
         service, _, _ = pick(request)
         if service.agent is not None:
@@ -517,6 +570,8 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
     app.router.add_post("/api/agent", api_agent)
     app.router.add_get("/api/sess", api_sess)
     app.router.add_get("/api/sess/{sid}", api_sess)
+    app.router.add_post("/api/sess/{sid}/go", api_sess_go)
+    app.router.add_post("/api/sess/{sid}/msg", api_sess_msg)
     app.router.add_post("/api/agent/reset", api_agent_reset)
     app.router.add_get("/api/pending", api_pending)
     app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)

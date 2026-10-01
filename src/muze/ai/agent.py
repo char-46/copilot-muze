@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from muze.ai.llm import LLMClient
-from muze.ai.sessions import Session, SessionStore
+from muze.ai.sessions import ERROR, RUNNING, SUSPEND, Session, SessionStore
 from muze.ai.tools import SPEC, ToolRunner
 from muze.chatlog import ChatLog, epoch_iso
 from muze.core.service import (
@@ -250,6 +251,43 @@ class Agent:
         `extra_text` None resumes a suspended/errored turn from where it
         stopped; a message continues a finished session as a new turn."""
         self._track(self._run_resume(session, ctx, extra_text))
+
+    @staticmethod
+    def _ctx_for_chat_key(chat_key: str) -> ControlContext:
+        """Best-effort ControlContext rebuilt from a persisted chat_key so a
+        restarted session can still deliver its reply to the right place
+        (qq:friend/group:<peer> -> the original conversation; anything else
+        is local/system and simply logs the result)."""
+        parts = (chat_key or "").split(":")
+        src = parts[0] if parts else ""
+        if src == "qq" and len(parts) >= 3 and parts[2].isdigit():
+            return ControlContext(
+                source="qq", chat_key=chat_key,
+                scene=parts[1], peer_id=int(parts[2]), user_label=parts[2],
+            )
+        return ControlContext(source=(src or "system"), chat_key=chat_key, scene="", peer_id=0)
+
+    async def resume_interrupted(self, error_grace_sec: float = 900.0) -> int:
+        """After a restart, continue LLM turns that were in flight when the
+        process died (persisted status=running) or errored very recently.
+        Step-limit suspensions stay manual (/sess go) — they paused for a
+        reason. Returns how many sessions were relaunched."""
+        if self.llm is None or not getattr(self.llm, "configured", False):
+            return 0
+        now = time.time()
+        picked = [
+            s for s in self.sessions.latest(self.sessions.cap)
+            if s.status == RUNNING
+            or (s.status == ERROR and now - s.updated <= error_grace_sec)
+        ]
+        for s in picked:
+            if s.status == RUNNING:
+                s.status = SUSPEND  # stale "running" == crash-interrupted
+                s.event("interrupted", "进程重启时中断，自动继续")
+            self.resume(s, self._ctx_for_chat_key(s.chat_key))
+        if picked:
+            log.info("resumed %d interrupted LLM session(s) after restart", len(picked))
+        return len(picked)
 
     async def _run_resume(
         self, session: Session, ctx: ControlContext, extra_text: str | None

@@ -145,3 +145,9 @@ details.tool pre { background: rgba(127,127,127,.1); border-radius: 6px; padding
 details.tl { margin: .5em; }
 #sessdetail { display: flex; flex-direction: column; overflow-y: auto; }
 
+
+/* merged ai pane */
+#aipane { display: flex; flex-direction: column; min-height: 0; }
+#aipane .aichat { flex: 1; }
+.conv .minibtn { font-size: .75em; padding: 1px 10px; margin: 2px 0 4px; }
+
