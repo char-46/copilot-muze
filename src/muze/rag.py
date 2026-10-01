@@ -267,7 +267,17 @@ class RagIndexer:
         wm = int(self.cfg.rag.window_messages)
         wc = int(self.cfg.rag.window_chars)
         done = 0
-        for conv in await self.repo.list_conversations(limit=300):
+        # NOTE: list_conversations caps at 1000 rows ordered by last_active_at
+        # DESC. A limit below the archive's conversation count starves the
+        # least-recently-active tail FOREVER (they sit in the progress
+        # denominator but are never visited) — hit with 346 convs vs 300.
+        convs = await self.repo.list_conversations(limit=1000)
+        if len(convs) >= 1000:
+            log.warning(
+                "rag chat indexing reached the 1000-conversation cap; "
+                "older conversations are not being indexed"
+            )
+        for conv in convs:
             if stop is not None and stop.is_set():
                 break
             if not force and not self._idle():
