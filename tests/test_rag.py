@@ -182,19 +182,28 @@ def test_governor_idle_rules():
     assert g.idle(last_activity=0)[0] is False  # on battery
     g = _gov(power=True, cpu=90, gpu=0, free=8)
     assert g.idle(last_activity=0)[0] is False  # cpu busy
-    g = _gov(power=True, cpu=5, gpu=80, free=8)
-    assert g.idle(last_activity=0)[0] is False  # gpu busy
+    # a busy GPU is NOT a veto anymore: indexing just runs on CPU
+    g = _gov(power=True, cpu=5, gpu=99, free=8)
+    assert g.idle(last_activity=0)[0] is True
     g = _gov(power=True, cpu=5, gpu=0, free=8)
     import time as _t
     assert g.idle(last_activity=_t.time())[0] is False  # recent activity
     assert g.idle(last_activity=0)[0] is True
 
 
-def test_governor_device_and_threads():
+def test_governor_device_tiers():
+    # comfortable: free covers model + reserve -> cuda
     assert _gov(power=True, cpu=5, gpu=5, free=8).choose_device() == "cuda"
-    assert _gov(power=True, cpu=5, gpu=5, free=1).choose_device() == "cpu"  # can't fit
-    # fits, but the GPU is already busy -> CPU
+    # squeeze: free covers the model (1.6G) but not the reserve -> still cuda
+    assert _gov(power=True, cpu=5, gpu=5, free=2).choose_device() == "cuda"
+    # cannot even fit the model -> cpu
+    assert _gov(power=True, cpu=5, gpu=5, free=1).choose_device() == "cpu"
+    # fits, but the GPU is busy -> cpu
     assert _gov(power=True, cpu=5, gpu=99, free=8).choose_device() == "cpu"
+    # explicit device wins
+    cfg = MuzeConfig()
+    cfg.rag.embedding.device = "cuda"
+    assert ResourceGovernor(cfg.rag).choose_device() == "cuda"
     assert _gov(power=True, cpu=0, gpu=0, free=8).cpu_threads() >= 1
     assert _gov(power=True, cpu=100, gpu=0, free=8).cpu_threads() == 1
 
@@ -243,3 +252,66 @@ async def test_embedder_falls_back_to_remote():
     assert emb.available is True
     vecs = await emb.embed(["hello"])
     assert vecs == [[0.1, 0.2]]
+
+
+# ------------------------------------------------------ query_context
+async def test_query_context_retrieves_and_never_raises(repo):
+    await repo.upsert_profile("friend/1", "老王", "老王喜欢钓鱼，昵称 渔翁")
+    cfg = MuzeConfig()
+    cfg.rag.enabled = True
+    vec = VecStore(repo)
+    await vec.setup()
+    indexer = RagIndexer(repo, vec, FakeEmbedder(), cfg)
+    await indexer.run_once()
+
+    hits = await indexer.query_context("钓鱼")
+    assert hits and any("钓鱼" in h["text"] for h in hits)
+    # blank / disabled -> [] without raising
+    assert await indexer.query_context("   ") == []
+    class Off(RagIndexer):
+        @property
+        def enabled(self):
+            return False
+    off = Off(repo, vec, FakeEmbedder(), cfg)
+    assert await off.query_context("钓鱼") == []
+
+
+# ------------------------------------------------------ auto-inject
+class FakeRag:
+    enabled = True
+
+    def __init__(self, hits):
+        self.hits = hits
+        self.queries = []
+
+    async def query_context(self, q, k=None):
+        self.queries.append((q, k))
+        return self.hits
+
+
+async def test_system_prompt_auto_injects_rag_hits(repo):
+    from muze.chatlog import ChatLog
+    from muze.core.service import ControlContext, ControlService, Runtime
+    from test_inject import StubAdapter, make_agent
+
+    cfg = MuzeConfig()
+    cfg.rag.enabled = True
+    cfg.rag.auto_inject = True
+    cfg.rag.inject_k = 3
+    agent, service = make_agent(repo, cfg)
+    rag = FakeRag([{"kind": "chat", "text": "张三: 又加班到半夜", "scene": "group", "peer_id": 7}])
+    service.runtime.rag = rag
+    ctx = ControlContext(source="qq", chat_key="k", scene="group", peer_id=7)
+
+    prompt = await agent._system_prompt(ctx, query="谁抱怨过加班")
+    assert "语义检索命中" in prompt and "又加班到半夜" in prompt
+    assert rag.queries == [("谁抱怨过加班", 3)]
+
+    # no query (bare resume) -> no retrieval, no section
+    p2 = await agent._system_prompt(ctx)
+    assert rag.queries == [("谁抱怨过加班", 3)] and "语义检索命中" not in p2
+
+    # switch off -> nothing injected even with a query
+    cfg.rag.auto_inject = False
+    p3 = await agent._system_prompt(ctx, query="谁抱怨过加班")
+    assert "语义检索命中" not in p3 and len(rag.queries) == 1

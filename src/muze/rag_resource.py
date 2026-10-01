@@ -5,10 +5,15 @@ corresponding signals are simply "unknown" and don't block. Probes are plain
 methods so tests can override them.
 
 Policy (see rag.embedding / rag):
-- only on AC power (``rag.require_ac_power`` + psutil battery),
-- only while CPU busy% and GPU util% are below their idle thresholds,
-- only after ``rag.min_idle_sec`` without user activity,
-- GPU is used only when enough free VRAM exists and the GPU is quiet.
+- indexing runs on AC power (``rag.require_ac_power`` + psutil battery) while
+  CPU busy% is below ``rag.idle_cpu_pct`` and the user has been inactive for
+  ``rag.min_idle_sec`` — a busy GPU does NOT block indexing, it only forces
+  the CPU device;
+- device choice is tiered: GPU when free VRAM covers the model (+ optional
+  headroom) and GPU util is low; a tight VRAM situation may still squeeze
+  onto the GPU by eating the headroom; otherwise CPU (thread-capped while
+  the machine is busy). CPU and GPU are never used in parallel — embedding
+  is batch-throughput work, one device saturates it.
 """
 
 from __future__ import annotations
@@ -87,6 +92,9 @@ class ResourceGovernor:
 
     # ------------------------------------------------------------- policy
     def idle(self, last_activity: float = 0.0) -> tuple[bool, str]:
+        """May background indexing run at all? A busy GPU is NOT a veto here —
+        it only steers the device choice (see choose_device), so chat
+        indexing can proceed on CPU while something renders/games on GPU."""
         now = time.time()
         if self.cfg.require_ac_power:
             p = self.power_plugged()
@@ -95,15 +103,12 @@ class ResourceGovernor:
         cpu = self.cpu_busy()
         if cpu is not None and cpu > self.cfg.idle_cpu_pct:
             return False, f"cpu {cpu:.0f}%"
-        gpu = self.gpu_util()
-        if gpu is not None and gpu > self.cfg.idle_gpu_pct:
-            return False, f"gpu {gpu:.0f}%"
         if last_activity and now - last_activity < self.cfg.min_idle_sec:
             return False, "recent activity"
         return True, "idle"
 
     def gpu_fits(self) -> tuple[bool, str]:
-        """Is the GPU fit AND quiet enough to host the embedding model?"""
+        """Comfortable tier: GPU has free VRAM (model + headroom) and is quiet."""
         free = self.gpu_free_gb()
         if free is None:
             return False, "no nvml"
@@ -116,13 +121,29 @@ class ResourceGovernor:
         return True, "ok"
 
     def choose_device(self) -> str:
+        """Tiered: explicit cuda/cpu is obeyed; auto picks GPU whenever the
+        model fits in free VRAM and the GPU isn't busy — including the
+        "squeeze" case where free VRAM covers the model but not the reserve
+        headroom — else CPU."""
         want = self.cfg.embedding.device
         if want in ("cuda", "cpu"):
             return want
-        ok, why = self.gpu_fits()
-        if ok:
+        if self._nvml is None and not self._ensure_nvml():
+            return "cpu"
+        free = self.gpu_free_gb()
+        if free is None:
+            return "cpu"
+        util = self.gpu_util()
+        if util is not None and util > self.cfg.embedding.gpu_max_util:
+            log.debug("RAG device=cpu (gpu busy %.0f%%)", util)
+            return "cpu"
+        weight = self.cfg.embedding.gpu_weight_gb
+        if free >= weight:
+            tier = "fit" if free >= weight + self.cfg.embedding.gpu_reserve_gb else "squeeze"
+            log.debug("RAG device=cuda (%s, vram free %.1fG, util %s%%)",
+                      tier, free, "?" if util is None else f"{util:.0f}")
             return "cuda"
-        log.debug("RAG device=cpu (%s)", why)
+        log.debug("RAG device=cpu (vram free %.1fG < %.1fG)", free, weight)
         return "cpu"
 
     def cpu_threads(self) -> int:

@@ -318,9 +318,10 @@ class Agent:
     def reset_all(self) -> None:
         self._histories.clear()
 
-    async def _system_prompt(self, ctx: ControlContext) -> str:
+    async def _system_prompt(self, ctx: ControlContext, query: str | None = None) -> str:
         """Assemble the system prompt: base + skills + dream background +
-        relevance-ordered long-term memories.
+        relevance-ordered long-term memories + (when a query is given)
+        semantic RAG hits for THIS message.
 
         This is how the nightly reports shape message handling: the agent
         starts every conversation already knowing yesterday's threads,
@@ -431,6 +432,37 @@ class Agent:
                     "身份档案索引（谁是谁；需要全文用 profile_get 或 /who <会话>）:\n"
                     + "\n".join(lines)
                 )
+        # --- semantic RAG hits for THIS message (auto-inject) ---
+        rc = getattr(self.service.cfg, "rag", None)
+        rag = getattr(self.service.runtime, "rag", None)
+        if (
+            query
+            and rc is not None
+            and getattr(rc, "auto_inject", False)
+            and rag is not None
+            and getattr(rag, "enabled", False)
+        ):
+            try:
+                hits = await rag.query_context(query, k=int(getattr(rc, "inject_k", 5)))
+            except Exception:
+                hits = []
+            if hits:
+                cap = int(getattr(rc, "inject_chars", 300))
+                label = {"profile": "档案", "memory": "记忆", "digest": "日报", "chat": "聊天"}
+                lines = []
+                for h in hits:
+                    t = " ".join((h.get("text") or "").split())
+                    if len(t) > cap:
+                        t = t[:cap] + "…"
+                    where = f" {h['scene']}/{h['peer_id']}" if h.get("scene") else ""
+                    lines.append(
+                        f"- [{label.get(h.get('kind'), h.get('kind'))}]{where} {t}"
+                    )
+                parts.append(
+                    "语义检索命中（系统按本条消息自动检索档案/记忆/日报/聊天；"
+                    "直接利用，需要更多结果用 semantic_search 工具）:\n" + "\n".join(lines)
+                )
+                log.info("PROMPT rag  | injected %s hits", len(hits))
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ converse
@@ -581,7 +613,7 @@ class Agent:
             prior = list(history[:-1])
         self.chatlog.agent(ctx.source, ctx.user_label or ctx.chat_key, "in", text)
         messages: list[dict] = [
-            {"role": "system", "content": await self._system_prompt(ctx)},
+            {"role": "system", "content": await self._system_prompt(ctx, query=text)},
             *prior[-MAX_HISTORY:],
             user_entry,
         ]
@@ -617,7 +649,7 @@ class Agent:
         session.status = "running"
         await self._persist(session)
         messages: list[dict] = [
-            {"role": "system", "content": await self._system_prompt(ctx)},
+            {"role": "system", "content": await self._system_prompt(ctx, query=extra_text)},
             *session.messages,
         ]
 

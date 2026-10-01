@@ -30,8 +30,10 @@ command configured; pytest is the gate. (Baseline: 187 tests.)
 
 ## Commit / release procedure (every feature batch)
 
-NEVER commit unless the user explicitly asks (「提交」「打」「打tag」).
-When asked, follow these steps in order:
+Commit and tag AUTOMATICALLY once a feature batch is complete and the test
+gate is green (standing permission from the user — no need to ask each
+time; still never commit mid-batch or with a red gate). Follow these steps
+in order:
 
 1. **Bump the version in THREE places** (they must stay in sync):
    - `src/muze/version.py` → `BASE_VERSION = "0.1.0-alpha.N"`

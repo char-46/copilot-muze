@@ -191,19 +191,20 @@ class RagEmbedding(BaseModel):
     min_interval_sec: float = 0.05  # throttle between local batches
     max_retries: int = 3  # local failures before the cooldown kicks in
     cooldown_sec: float = 300.0  # back-off after repeated failure
-    device: str = "auto"  # auto (GPU if it fits & is idle, else CPU) | cuda | cpu
+    device: str = "auto"  # auto (tiered pick, see ResourceGovernor) | cuda | cpu
     gpu_weight_gb: float = 1.6  # VRAM the model needs (0.6B fp16 + overhead)
-    gpu_reserve_gb: float = 0.8  # free VRAM kept as headroom when picking GPU
-    gpu_max_util: float = 30.0  # use GPU only while utilisation is below this
+    gpu_reserve_gb: float = 0.8  # comfortable tier headroom (squeeze tier eats it)
+    gpu_max_util: float = 50.0  # use GPU only while utilisation is below this
     cpu_max_threads: int = 4  # cap for CPU inference (dynamic below this)
     unload_idle_sec: float = 1800.0  # free the local model after this idle (0=never)
 
 
 class RagConfig(BaseModel):
     """Vector retrieval over summaries (profiles/memories/digests) and,
-    opt-in, chat message windows. Indexing is idle-scheduled: it only runs on
-    AC power, when CPU/GPU are quiet and the user hasn't been active, and it
-    can be interrupted at any time."""
+    opt-in, chat message windows. Indexing is idle-scheduled (AC power,
+    quiet CPU, no very recent activity; a busy GPU just forces CPU) and
+    interruptible. Every incoming message can auto-inject semantic hits
+    (``auto_inject``) so recall works without the agent calling tools."""
 
     enabled: bool = False  # master switch (needs a usable rag.embedding)
     chat: bool = False  # ALSO index message windows (opt-in, default off)
@@ -212,13 +213,15 @@ class RagConfig(BaseModel):
     window_messages: int = 12  # chat window size (messages)
     window_chars: int = 900  # and/or chars per chat window
     max_doc_chars: int = 2000  # truncate a doc before embedding
-    index_interval_min: float = 15.0  # background indexing cadence
+    index_interval_min: float = 5.0  # background indexing cadence (still gated)
+    # --- auto-inject: semantic hits for each incoming message ---
+    auto_inject: bool = True  # retrieve per message and add hits to the prompt
+    inject_k: int = 5  # hits per message
+    inject_chars: int = 300  # chars per hit
     # --- resource governor (best-effort; skipped when psutil/pynvml missing) ---
     require_ac_power: bool = True  # only run on AC power (needs psutil battery)
-    idle_cpu_pct: float = 25.0  # run only while CPU busy% is below this
-    idle_gpu_pct: float = 20.0  # and GPU utilisation below this
-    min_idle_sec: float = 120.0  # and no user activity for this long
-    governor_poll_sec: float = 30.0  # re-check cadence while indexing
+    idle_cpu_pct: float = 40.0  # run only while CPU busy% is below this
+    min_idle_sec: float = 30.0  # and no user activity for this long
 
 
 class DigestConfig(BaseModel):

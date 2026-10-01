@@ -158,7 +158,6 @@ class App:
         )
         self.runtime.rag = self.rag
         self._last_activity = time.time()
-        self._last_rag_index = 0.0
         self._last_profile_refresh = 0.0
         self._enrich_task = None
 
@@ -309,6 +308,7 @@ class App:
         await self.backfiller.start_background()
         self._mt_task = asyncio.create_task(self._maintenance_loop())
         self._enrich_task = asyncio.create_task(self._startup_enrich())
+        self._rag_task = asyncio.create_task(self._rag_loop())
         if os.environ.get("MUZE_SUPERVISOR_PID"):
             self._sup_task = asyncio.create_task(self._supervisor_watch())
         if spawn_console:
@@ -459,13 +459,34 @@ class App:
                     log.info("[%s] profiles refreshed: %s", self.spec.name, n)
             if getattr(self, "rag", None) is not None and self.rag.enabled:
                 n = await self.rag.run_once()
-                self._last_rag_index = time.time()
                 if n:
                     log.info("[%s] RAG indexed %s docs", self.spec.name, n)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("startup enrichment failed")
+
+    async def _rag_loop(self) -> None:
+        """Dedicated indexing cadence (rag.index_interval_min, default 5 min).
+        Each pass is still governor-gated and interruptible, so an aggressive
+        cadence only means the idle window is caught sooner."""
+        while not self._stop.is_set():
+            interval = max(30.0, float(self.cfg.rag.index_interval_min) * 60)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return  # stop set
+            except asyncio.TimeoutError:
+                pass
+            if getattr(self, "rag", None) is None or not self.rag.enabled:
+                continue
+            try:
+                n = await self.rag.run_once()
+                if n:
+                    log.info("[%s] RAG indexed %s docs", self.spec.name, n)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("rag indexing pass failed")
 
     async def _maintenance_loop(self) -> None:
         from muze.profiles import refresh_profiles
@@ -487,10 +508,6 @@ class App:
                     if now - self._last_profile_refresh >= self.cfg.profiles.interval_min * 60:
                         self._last_profile_refresh = now
                         await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
-                if getattr(self, "rag", None) is not None and self.rag.enabled:
-                    if now - self._last_rag_index >= self.cfg.rag.index_interval_min * 60:
-                        self._last_rag_index = now
-                        await self.rag.run_once()
             except Exception:
                 log.exception("maintenance cycle failed")
             await self._touch_seen()  # keep the last-operation time fresh
@@ -520,6 +537,8 @@ class App:
             self._mt_task.cancel()
         if getattr(self, "_enrich_task", None) is not None:
             self._enrich_task.cancel()
+        if getattr(self, "_rag_task", None) is not None:
+            self._rag_task.cancel()
         scheduler = getattr(self, "scheduler", None)
         if scheduler is not None:
             await _safe("scheduler.stop", scheduler.stop(), 5)

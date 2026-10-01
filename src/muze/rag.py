@@ -296,6 +296,21 @@ class RagIndexer:
         }
 
     # ----------------------------------------------------------- retrieval
+    async def query_context(self, query: str, k: int | None = None) -> list[dict]:
+        """Retrieve hits for an incoming message (auto-inject path).
+
+        Device-aware (loads the model via the governor, so a cold query after
+        idle unload lands on GPU when it fits) and best-effort: never raises,
+        returns [] on any failure so message handling is unaffected."""
+        if not self.enabled or not (query or "").strip():
+            return []
+        try:
+            await self._prepare()
+            return await self.search(query, k)
+        except Exception:
+            log.debug("rag query_context failed", exc_info=True)
+            return []
+
     async def search(
         self, query: str, k: int | None = None, *, kind: str | None = None,
         scene: str | None = None, peer_id: int | None = None,

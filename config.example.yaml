@@ -140,20 +140,22 @@ rag:                          # vector retrieval over summaries (+ optional chat
   top_k: 6
   window_messages: 12
   window_chars: 900
-  index_interval_min: 15      # background indexing cadence (still idle-gated)
+  index_interval_min: 5       # background indexing cadence (still gated)
+  auto_inject: true           # retrieve semantic hits per incoming message
+  inject_k: 5                 # hits injected per message
+  inject_chars: 300           # chars per injected hit
   require_ac_power: true      # only index on AC power (needs psutil battery)
-  idle_cpu_pct: 25            # only while CPU busy% is below this
-  idle_gpu_pct: 20            # and GPU utilisation below this
-  min_idle_sec: 120           # and no user activity for this long
+  idle_cpu_pct: 40            # only while CPU busy% is below this
+  min_idle_sec: 30            # and no user activity for this long
   embedding:
     provider: auto            # auto (local-first, remote fallback if configured) | local | openai
     backend: st               # st (sentence-transformers/torch, Qwen) | fastembed (ONNX)
     model: Qwen/Qwen3-Embedding-0.6B   # local model (install: uv sync --extra rag-local)
     query_instruction: ""     # optional instruction prefix for queries
-    device: auto              # auto (GPU if it fits & is quiet, else CPU) | cuda | cpu
+    device: auto              # auto (tiered: GPU if VRAM fits & GPU idle, else CPU) | cuda | cpu
     gpu_weight_gb: 1.6        # VRAM the model needs (0.6B fp16 + overhead)
-    gpu_reserve_gb: 0.8       # free VRAM kept as headroom
-    gpu_max_util: 30          # use GPU only while its utilisation is below this
+    gpu_reserve_gb: 0.8       # comfortable headroom; tight VRAM may squeeze without it
+    gpu_max_util: 50          # use GPU only while its utilisation is below this
     cpu_max_threads: 4        # cap for CPU inference (scaled down when busy)
     batch: 16
     min_interval_sec: 0.05    # pause between local batches
