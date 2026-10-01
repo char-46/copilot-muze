@@ -208,3 +208,39 @@ details.tool summary { cursor: pointer; color: #888; }
 details.tool pre { background: rgba(127,127,127,.1); border-radius: 6px; padding: .5em .7em; white-space: pre-wrap; margin: .3em 0; max-height: 20em; overflow-y: auto; }
 details.tl { margin: .5em; }
 
+
+/* data tab (read-only DB views) */
+.dgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 10px; }
+.dcard {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg2);
+  padding: 10px 12px;
+}
+.dcard h3 { margin: 0 0 8px; font-size: 13px; color: var(--dim); }
+.dcard h3 select { float: right; font-size: 12px; }
+.dlist { max-height: 360px; overflow: auto; }
+.drow {
+  display: block; padding: 6px 8px; border-radius: 6px; cursor: pointer;
+  color: inherit; text-decoration: none;
+}
+.drow:hover, .drow.sel { background: var(--bg3); }
+.drow .prev { font-size: 11px; }
+.dtag {
+  font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  background: var(--bg3); color: var(--dim);
+}
+.dtag.active { background: #2c6e49; color: #fff; }
+.dtag.done { background: #365e77; color: #fff; }
+.dtag.error, .dtag.cancelled { background: #7a2f2f; color: #fff; }
+button.mini {
+  padding: 1px 8px; font-size: 11px; border-radius: 4px;
+}
+.dview { margin-top: 8px; }
+.dpre {
+  white-space: pre-wrap; font: 12px/1.6 Consolas, monospace;
+  max-height: 300px; overflow: auto; background: var(--bg);
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+}
+.mthumb {
+  width: 44px; height: 44px; object-fit: cover; border-radius: 4px;
+  float: left; margin-right: 8px;
+}

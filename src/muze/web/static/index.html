@@ -22,6 +22,7 @@
   <button data-tab="memories">记忆</button>
   <button data-tab="rag">RAG</button>
   <button data-tab="pending">待确认 <span id="pendingBadge" class="badge hidden">0</span></button>
+  <button data-tab="data">数据</button>
   <button data-tab="settings">设置</button>
   <button data-tab="logs">日志</button>
   <button data-tab="status">状态</button>
@@ -100,6 +101,38 @@
   <!-- pending -->
   <section id="tab-pending" class="tab">
     <div id="pendinglist"><div class="dim pad">加载中…</div></div>
+  </section>
+
+  <!-- data: read-only DB views -->
+  <section id="tab-data" class="tab">
+    <div class="dgrid">
+      <div class="dcard">
+        <h3>计划任务</h3>
+        <div id="tasklist" class="dlist"><div class="dim pad">加载中…</div></div>
+      </div>
+      <div class="dcard">
+        <h3>做梦报告</h3>
+        <div id="digestlist" class="dlist"><div class="dim pad">加载中…</div></div>
+        <div id="digestview" class="dview hidden"></div>
+      </div>
+      <div class="dcard">
+        <h3>身份档案</h3>
+        <div id="profilelist" class="dlist"><div class="dim pad">加载中…</div></div>
+        <div id="profileview" class="dview hidden"></div>
+      </div>
+      <div class="dcard">
+        <h3>媒体库
+          <select id="mediaKind">
+            <option value="">全部</option>
+            <option value="image">图片</option>
+            <option value="record">语音</option>
+            <option value="video">视频</option>
+            <option value="file">文件</option>
+          </select>
+        </h3>
+        <div id="medialist" class="dlist"><div class="dim pad">加载中…</div></div>
+      </div>
+    </div>
   </section>
 
   <!-- settings -->

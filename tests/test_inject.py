@@ -1,6 +1,8 @@
 """Prompt injection of dream background + relevance-ordered memories,
 and the memory retire path."""
 
+import json
+
 import pytest
 
 from muze.ai.agent import Agent
@@ -101,6 +103,41 @@ async def _drain(agent):
     tasks = [t for t in agent._tasks if not t.done()]
     if tasks:
         await asyncio.gather(*tasks)
+
+
+async def test_schedule_task_tool_passes_timing_kwargs(repo):
+    """Regression (alpha.73): t_schedule_task assembled delay_sec/at_ts/interval_sec
+    into kwargs but never passed them to scheduler.create(), so every valid
+    call came back 'need one of at_ts / delay_sec / interval_sec' and the LLM
+    retried in a loop."""
+    from muze.ai.tools import ToolRunner
+    from muze.core.service import Runtime
+    from muze.scheduler import Scheduler
+
+    cfg = MuzeConfig()
+    cfg.control.controller = [1000000001]
+    service = ControlService(cfg, StubAdapter(), repo, ChatLog(), Runtime())
+    runner = ToolRunner(
+        service, repo, StubAdapter(), None,
+        ControlContext(source="cli", chat_key="cli", scene="", peer_id=0),
+    )
+
+    # no scheduler wired -> explicit error, not a crash
+    out = json.loads(await runner.run("schedule_task", {"prompt": "x", "delay_sec": 60}))
+    assert "error" in out
+
+    service.runtime.scheduler = Scheduler(repo, service, ChatLog())
+    for args in (
+        {"prompt": "两小时后提醒我喝水", "delay_sec": 7200, "note": "用户原话"},
+        {"prompt": "总结", "at_iso": "2026-10-02T09:00:00+08:00"},
+        {"prompt": "每小时总结一次", "interval_sec": 3600},
+    ):
+        out = json.loads(await runner.run("schedule_task", args))
+        assert out.get("created") is True, out
+        assert out.get("next_run")
+    # bad timing args still rejected with the tool-level message
+    out = json.loads(await runner.run("schedule_task", {"prompt": "没时间"}))
+    assert "delay_sec" in out["error"]
 
 
 async def test_resume_persists_terminal_state(repo):

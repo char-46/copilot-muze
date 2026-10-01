@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, AsyncIterator
 
 from muze.config import MilkyEndpoint
@@ -62,6 +63,7 @@ class MilkyAdapter(ProtocolAdapter):
         self._friend_names: dict[int, str] = {}
         self._member_names: dict[tuple[int, int], str] = {}
         self._member_lookups: dict[tuple[int, int], asyncio.Future[str]] = {}
+        self._member_lists: dict[int, tuple[float, list[GroupMember]]] = {}
         self._group_names: dict[int, str] = {}
         self._connected = asyncio.Event()
 
@@ -247,6 +249,26 @@ class MilkyAdapter(ProtocolAdapter):
 
     async def get_friend_name(self, user_id: int) -> str:
         return self._friend_names.get(user_id, "")
+
+    MEMBER_LIST_TTL = 600  # seconds; multi-group cross-queries are repeat-heavy
+
+    async def get_group_member_list(self, group_id: int) -> list[GroupMember]:
+        """Full member roster of one group, cached MEMBER_LIST_TTL seconds.
+
+        Cross-group queries ("which of my groups is uin X in") would otherwise
+        re-pull every roster per tool call; the cache also pre-warms the
+        per-member display-name cache."""
+        now = time.monotonic()
+        hit = self._member_lists.get(group_id)
+        if hit is not None and now - hit[0] < self.MEMBER_LIST_TTL:
+            return hit[1]
+        data = await self.client.call("get_group_member_list", {"group_id": group_id})
+        members = [GroupMember.model_validate(x) for x in _first_list(data, "members")]
+        for m in members:
+            if m.display:
+                self._member_names[(group_id, m.user_id)] = m.display
+        self._member_lists[group_id] = (now, members)
+        return members
 
     def cached_group_name(self, group_id: int) -> str:
         return self._group_names.get(group_id, "")

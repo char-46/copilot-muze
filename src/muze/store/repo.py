@@ -355,6 +355,34 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def list_media(
+        self,
+        kind: str | None = None,
+        scene: str | None = None,
+        peer_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Newest-first media library rows (downloaded files only)."""
+        sql = (
+            "SELECT id, scene, peer_id, message_seq, kind, status, file_name,"
+            " file_size, summary, time FROM media WHERE status='done'"
+        )
+        args: list = []
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        if scene:
+            sql += " AND scene=?"
+            args.append(scene)
+        if peer_id is not None:
+            sql += " AND peer_id=?"
+            args.append(peer_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(max(1, min(int(limit), 500)))
+        async with self.conn.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def retire_gone_media(self) -> int:
         """One-shot: historical failed rows whose error says the resource is
         gone (HTTP 404/410) become status='gone' so nothing retries them."""

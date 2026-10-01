@@ -108,6 +108,38 @@ async def client(tmp_path):
     ]
     await repo.upsert_ai_session(sess.to_row())
 
+    # data-tab views
+    import time as _t
+
+    now = int(_t.time())
+    await repo.create_task(
+        "once", "/status", "friend", 1, now + 3600, None, "agent", note="测试任务A"
+    )
+    tid = await repo.create_task(
+        "interval", "每日报到", "friend", 1, now + 86400, 86400, "command", note=""
+    )
+    await repo.finish_task(tid, "done", last_result="ok: 每日报到")
+    await repo.upsert_digest("2026-09-30", "梦见群里聊了钓鱼", 24, {}, period="day")
+    await repo.upsert_digest("2026-09-29", "梦见下雨", 24, {}, period="day")
+    await repo.upsert_profile("friend/777", "老王", "老王喜欢钓鱼，周末常去水库")
+    base = {
+        "resource_id": None, "file_id": None, "file_name": None, "file_hash": None,
+        "width": None, "height": None, "duration": None, "summary": None,
+    }
+    await repo.add_media({
+        **base,
+        "scene": "group", "peer_id": 42, "message_seq": 1, "seg_index": 0,
+        "kind": "image", "status": "done", "file_path": "x.jpg",
+        "file_size": 1234, "summary": "钓鱼照", "time": now,
+        "created_at": now, "updated_at": now,
+    })
+    await repo.add_media({
+        **base,
+        "scene": "group", "peer_id": 42, "message_seq": 2, "seg_index": 0,
+        "kind": "file", "status": "pending",
+        "file_name": "报表.xlsx", "created_at": now, "updated_at": now,
+    })
+
     app = create_app({"main": WebAccount(svc, repo, svc.runtime)}, "test-token")
     server = TestServer(app)
     cl = TestClient(server)
@@ -165,6 +197,36 @@ async def test_info_includes_rag_and_memories(client):
     assert a["memories"] == 2
     assert a["rag"]["enabled"] is True
     assert a["rag"]["docs"] >= 2
+
+
+# ------------------------------------------------------------ data tab views
+async def test_data_tab_endpoints(client):
+    r = await client.get("/api/tasks")
+    assert r.status == 200
+    d = await r.json()
+    assert len(d["tasks"]) == 2
+    assert {t["status"] for t in d["tasks"]} == {"active", "done"}
+
+    r = await client.get("/api/digests")
+    d = await r.json()
+    assert [g["date"] for g in d["digests"]] == ["2026-09-30", "2026-09-29"]
+
+    r = await client.get("/api/digests", params={"date": "2026-09-30"})
+    d = await r.json()
+    assert "梦见" in d["digest"]["report"]
+
+    r = await client.get("/api/profiles")
+    d = await r.json()
+    assert d["profiles"][0]["subject"] == "friend/777"
+
+    r = await client.get("/api/media")
+    d = await r.json()
+    kinds = {m["kind"] for m in d["media"]}
+    assert kinds == {"image"}  # only done rows
+
+    r = await client.get("/api/media", params={"kind": "file"})
+    d = await r.json()
+    assert d["media"] == []  # pending file excluded
 
 
 async def test_rag_endpoints_require_token(client):

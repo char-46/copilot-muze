@@ -163,21 +163,28 @@ function mdRender(text) {
   return out.join("\n").replace(/\x00CODE(\d+)\x00/g, (_, i) => codes[+i]);
 }
 
-/* ---------------- tabs ---------------- */
-$$("nav button").forEach((b) => b.addEventListener("click", () => {
+/* ---------------- tabs ----------------
+ * selection persists across reloads (tab + last chat + last AI session);
+ * switchTab(name, persist) — persist=false for the boot restore itself. */
+function switchTab(name, persist) {
+  const b = document.querySelector(`nav button[data-tab="${name}"]`);
+  if (!b) return;
   $$("nav button").forEach((x) => x.classList.remove("active"));
   b.classList.add("active");
   $$(".tab").forEach((x) => x.classList.remove("active"));
-  $("#tab-" + b.dataset.tab).classList.add("active");
-  if (b.dataset.tab === "pending") loadPending();
-  if (b.dataset.tab === "logs") loadLogs();
-  if (b.dataset.tab === "status") loadStatus();
-  if (b.dataset.tab === "chats") loadConversations();
-  if (b.dataset.tab === "ai") { loadAiSessions(); if (aiMode) pollSession(); }
-  if (b.dataset.tab === "settings") loadSettings();
-  if (b.dataset.tab === "memories") loadMemories();
-  if (b.dataset.tab === "rag") loadRag();
-}));
+  $("#tab-" + name).classList.add("active");
+  if (persist !== false) store("muze_tab", name);
+  if (name === "pending") loadPending();
+  if (name === "logs") loadLogs();
+  if (name === "status") loadStatus();
+  if (name === "chats") loadConversations();
+  if (name === "ai") { loadAiSessions(); if (aiMode) pollSession(); }
+  if (name === "settings") loadSettings();
+  if (name === "memories") loadMemories();
+  if (name === "rag") loadRag();
+  if (name === "data") loadDataTab();
+}
+$$("nav button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
 /* tolerate sloppy pastes: "(token: xxx)" / trailing ')' / quotes / whitespace */
 function cleanToken(raw) {
@@ -275,6 +282,13 @@ async function loadConversations() {
       div.addEventListener("click", () => openConversation(c.scene, c.peer_id, div));
       box.appendChild(div);
     }
+    // one-shot boot restore of the last opened conversation
+    if (convRestore) {
+      const want = convRestore;
+      convRestore = null;
+      const div = box.querySelector(`.conv[data-key="${CSS.escape(want)}"]`);
+      if (div) div.click();
+    }
   } catch (e) {
     box.innerHTML = e.unauthorized
       ? authHint()
@@ -282,11 +296,14 @@ async function loadConversations() {
   }
 }
 
+let convRestore = null; // set at boot from muze_chat; consumed once
+
 let curConv = null;
 async function openConversation(scene, peer, div) {
   $$(".conv").forEach((x) => x.classList.remove("sel"));
   if (div) div.classList.add("sel");
   curConv = { scene, peer };
+  store("muze_chat", scene + "/" + peer);
   const label = scene + "/" + peer;
   const name = convMeta[label]?.name || label;
   $("#msghead").innerHTML = `<b>${esc(name)}</b> <span class="dim">${esc(label)}</span>`;
@@ -564,6 +581,7 @@ async function openSession(sid) {
   aiSeq++;
   stopSessPoll();
   aiMode = sid;
+  store("muze_ai_sess", sid);
   aiSig = [];
   lastSess = null;
   $("#aichat").innerHTML = "";
@@ -575,6 +593,7 @@ function selectNewChat() {
   aiSeq++;
   stopSessPoll();
   aiMode = null;
+  store("muze_ai_sess", "new");
   lastSess = null;
   aiSig = [];
   $("#aichat").innerHTML =
@@ -637,7 +656,17 @@ async function loadAiSessions() {
     return;
   }
   renderSessList();
+  // one-shot boot restore of the last AI session (skipped when it's gone)
+  if (aiRestore !== null) {
+    const want = aiRestore;
+    aiRestore = null;
+    if (want && want !== "new" && sessCache.some((s) => s.id === want)) {
+      openSession(want);
+    }
+  }
 }
+
+let aiRestore = null; // set at boot from muze_ai_sess; consumed once
 
 function renderSessList() {
   const box = $("#aisses");
@@ -963,6 +992,148 @@ async function loadStatus() {
     `muze ${info.version}   uptime: ${info.uptime}\n\n` + parts.join("\n\n");
 }
 
+/* ---------------- data tab (read-only DB views) ---------------- */
+async function loadDataTab() {
+  loadTasksView();
+  loadDigestsView();
+  loadProfilesView();
+  loadMediaView();
+}
+
+async function loadTasksView() {
+  const box = $("#tasklist");
+  try {
+    const d = await api("/api/tasks");
+    if (!d.tasks.length) {
+      box.innerHTML = '<div class="dim pad">（无任务）</div>';
+      return;
+    }
+    box.innerHTML = d.tasks.map((t) => {
+      const next = t.status === "active" ? ` · 下次 ${fmtTime(t.next_run_at)}` : "";
+      const cancel = t.status === "active"
+        ? ` <button class="mini canceltask" data-id="${t.id}">取消</button>` : "";
+      const tail = (t.last_result || "").slice(0, 140).replace(/\n/g, " ");
+      return `<div class="drow">` +
+        `<div class="t">#${t.id} <span class="dtag ${esc(t.status)}">${esc(t.status)}</span>` +
+        `${cancel} ${esc((t.note || t.prompt || "").slice(0, 70))}</div>` +
+        `<div class="prev dim">${esc(t.kind)} → ${esc(t.control_scene || "")}/${esc(t.control_peer_id || "")}` +
+        ` · 创建 ${fmtTime(t.created_at)}${next}</div>` +
+        (tail ? `<div class="prev dim">${esc(tail)}</div>` : "") +
+        `</div>`;
+    }).join("");
+    box.querySelectorAll(".canceltask").forEach((b) => b.addEventListener("click", async () => {
+      await api("/api/command", { method: "POST", body: { text: "canceltask " + b.dataset.id } });
+      loadTasksView();
+    }));
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+async function loadDigestsView() {
+  const box = $("#digestlist");
+  const view = $("#digestview");
+  try {
+    const d = await api("/api/digests");
+    if (!d.digests.length) {
+      box.innerHTML = '<div class="dim pad">（还没有报告）</div>';
+      return;
+    }
+    const label = (g) => g.period === "week" ? "周报" : g.period === "month" ? "月报" : "日报";
+    box.innerHTML = d.digests.map((g) =>
+      `<div class="drow dg" data-date="${esc(g.date)}">` +
+      `<div class="t">${esc(g.date)} <span class="dim">${label(g)}</span></div>` +
+      `<div class="prev dim">${g.report_len} 字 · ${fmtTime(g.created_at)}</div></div>`
+    ).join("");
+    box.querySelectorAll(".dg").forEach((r) => r.addEventListener("click", async () => {
+      box.querySelectorAll(".dg").forEach((x) => x.classList.remove("sel"));
+      r.classList.add("sel");
+      const dd = await api("/api/digests?date=" + encodeURIComponent(r.dataset.date));
+      view.classList.remove("hidden");
+      view.innerHTML = `<div class="bar slim"><b>${esc(dd.digest.date)}</b>` +
+        `<button class="mini" id="dgClose">关闭</button></div>` +
+        `<pre class="dpre">${esc(dd.digest.report)}</pre>`;
+      $("#dgClose").addEventListener("click", () => {
+        view.classList.add("hidden");
+        view.innerHTML = "";
+      });
+    }));
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+async function loadProfilesView() {
+  const box = $("#profilelist");
+  const view = $("#profileview");
+  try {
+    const d = await api("/api/profiles");
+    if (!d.profiles.length) {
+      box.innerHTML = '<div class="dim pad">（还没有档案）</div>';
+      return;
+    }
+    box.innerHTML = d.profiles.map((p) =>
+      `<div class="drow pf" data-s="${esc(p.subject)}">` +
+      `<div class="t">${esc(p.name || p.subject)}</div>` +
+      `<div class="prev dim">${esc(p.subject)} · ${fmtTime(p.updated_at)}</div></div>`
+    ).join("");
+    box.querySelectorAll(".pf").forEach((r) => r.addEventListener("click", async () => {
+      box.querySelectorAll(".pf").forEach((x) => x.classList.remove("sel"));
+      r.classList.add("sel");
+      const dd = await api("/api/profiles");
+      const p = (dd.profiles || []).find((x) => x.subject === r.dataset.s);
+      if (!p) return;
+      view.classList.remove("hidden");
+      view.innerHTML = `<div class="bar slim"><b>${esc(p.name || p.subject)}</b>` +
+        `<span class="dim">${esc(p.subject)}</span>` +
+        `<button class="mini" id="pfClose">关闭</button></div>` +
+        `<pre class="dpre">${esc(p.content)}</pre>`;
+      $("#pfClose").addEventListener("click", () => {
+        view.classList.add("hidden");
+        view.innerHTML = "";
+      });
+    }));
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+async function loadMediaView() {
+  const box = $("#medialist");
+  const kind = $("#mediaKind").value;
+  try {
+    const d = await api("/api/media?limit=80" + (kind ? "&kind=" + encodeURIComponent(kind) : ""));
+    if (!d.media.length) {
+      box.innerHTML = '<div class="dim pad">（无媒体）</div>';
+      return;
+    }
+    box.innerHTML = d.media.map((m) => {
+      const href = `/api/mediafile/${m.id}?token=${encodeURIComponent(TOKEN)}`;
+      const label = m.summary || m.file_name || `${m.kind} #${m.id}`;
+      const size = m.file_size ? (m.file_size / 1024).toFixed(0) + "K" : "";
+      const thumb = m.kind === "image"
+        ? `<img class="mthumb" loading="lazy" src="${withAccount(href)}">` : "";
+      return `<a class="drow md" href="${withAccount(href)}" target="_blank">` +
+        `${thumb}<div class="t">${esc(String(label).slice(0, 50))}</div>` +
+        `<div class="prev dim">${esc(m.scene)}/${esc(m.peer_id)} · ${esc(m.kind)} · ${size} · ${fmtTime(m.time)}</div></a>`;
+    }).join("");
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+$("#mediaKind").addEventListener("change", loadMediaView);
+
 /* ---------------- boot ---------------- */
+convRestore = recall("muze_chat");
+aiRestore = recall("muze_ai_sess");
 refreshAll();
+const savedTab = recall("muze_tab");
+if (savedTab && savedTab !== "chats" &&
+    document.querySelector(`nav button[data-tab="${savedTab}"]`)) {
+  switchTab(savedTab, false); // HTML default is chats; only switch away
+}
 setInterval(loadInfo, 30000);

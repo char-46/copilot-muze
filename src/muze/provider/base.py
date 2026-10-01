@@ -21,6 +21,7 @@ from muze.provider.milky.models import (
     ForwardedMessage,
     Friend,
     Group,
+    GroupMember,
     HistoryResult,
     IncomingMessage,
     LoginInfo,
@@ -105,6 +106,10 @@ class ProtocolAdapter(ABC):
     @abstractmethod
     async def get_group_member_name(self, group_id: int, user_id: int) -> str:
         """Best-effort display name for a group member (cached)."""
+
+    async def get_group_member_list(self, group_id: int) -> list[GroupMember]:
+        """Full member roster of a group; implementations should cache."""
+        raise NotSupported("get_group_member_list not supported by this protocol side")
 
     async def get_friend_info(self, user_id: int) -> Friend:
         """Single friend info; used for lazy name resolution."""

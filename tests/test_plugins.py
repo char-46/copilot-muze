@@ -213,3 +213,47 @@ async def test_scheduler_roundtrip(tmp_path):
     row = await repo.get_task(t2["id"])
     assert row["status"] == "active" and row["next_run_at"] > int(time.time())
     await conn.close()
+
+
+async def test_agent_schedule_task_tool_passes_time_args(tmp_path):
+    """Regression (alpha.73): t_schedule_task assembled delay_sec/at_ts/
+    interval_sec into kwargs but never passed **kwargs to scheduler.create,
+    so every agent-made task died with 'need one of at_ts / delay_sec /
+    interval_sec' even with a perfectly valid delay_sec."""
+    import json
+
+    from muze.ai.tools import ToolRunner
+    from test_permissions import Recorder
+
+    conn = await open_db(str(tmp_path / "st.db"))
+    repo = Repository(conn)
+    cfg = MuzeConfig()
+    cfg.control.controller = [10001]
+    service = ControlService(cfg, Recorder(), repo, ChatLog(), Runtime())
+    service.runtime.scheduler = Scheduler(repo, service, ChatLog())
+    ctx = ControlContext(
+        source="qq", chat_key="qq:friend:10001", scene="friend", peer_id=10001
+    )
+    runner = ToolRunner(service, repo, service.adapter, None, ctx)
+
+    res = json.loads(
+        await runner.run(
+            "schedule_task",
+            {"prompt": "总结 friend/555 最近 50 条", "delay_sec": 3600, "note": "一小时后"},
+        )
+    )
+    assert res.get("created") is True, res
+    row = await repo.get_task(res["task_id"])
+    assert row["kind"] == "once" and row["status"] == "active"
+    assert row["next_run_at"] > int(time.time())
+
+    # at_iso path also reaches the scheduler now
+    import datetime as _dt
+
+    iso = (_dt.datetime.now().astimezone() + _dt.timedelta(hours=2)).isoformat()
+    res2 = json.loads(
+        await runner.run("schedule_task", {"prompt": "到点提醒", "at_iso": iso})
+    )
+    assert res2.get("created") is True, res2
+    await conn.close()
+    await conn.close()

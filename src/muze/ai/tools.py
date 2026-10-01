@@ -109,13 +109,29 @@ SPEC = [
         "type": "function",
         "function": {
             "name": "directory",
-            "description": "目录查询：conversations 会话列表 / friends 好友 / groups 群 / whois 查名字",
+            "description": (
+                "目录查询：conversations 会话列表 / friends 好友 / groups 群 /"
+                " members 群成员（单群全量或按 name/uin 过滤；多群 group_ids 联查："
+                "带过滤=此人在哪些群，无过滤=共同成员交集）/ whois 查名字"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["conversations", "friends", "groups", "whois"]},
-                    "uin": {"type": "integer"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["conversations", "friends", "groups", "members", "whois"],
+                    },
+                    "uin": {"type": "integer", "description": "members/whois: 按QQ号精确匹配"},
                     "group_id": {"type": "integer"},
+                    "group_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "members 多群联查：2~10 个群",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "members 过滤：匹配群名片/昵称/QQ号子串（不区分大小写）",
+                    },
                     "active_h": {"type": "number", "description": "conversations: 仅最近 N 小时活跃"},
                     "limit": {"type": "integer"},
                 },
@@ -713,7 +729,10 @@ class ToolRunner:
                 gid = args.get("group_id")
                 if uin:
                     try:
-                        out["friend_name"] = await self.adapter.ensure_friend_name(int(uin))
+                        f = await self.adapter.get_friend_info(int(uin))
+                        out["friend_name"] = f.display
+                        if f.user_remark:
+                            out["friend_remark"] = f.user_remark
                     except Exception:
                         out["friend_name"] = ""
                     if gid:
@@ -729,9 +748,109 @@ class ToolRunner:
                     except Exception:
                         out["group_name"] = ""
                 return out
+            if kind == "members":
+                return await self._members(args, limit)
         except ProtocolError as e:
             return {"error": f"协议端错误: {e}"}
         return {"error": f"未知 kind: {kind}"}
+
+    async def _members(self, args: dict, limit: int) -> dict:
+        """Group rosters: one group (full list / filtered) or cross-group
+        lookup ("which groups is this person in") / intersection."""
+        gids: list[int] = []
+        raw = args.get("group_ids")
+        if isinstance(raw, list):
+            for g in raw:
+                try:
+                    gids.append(int(g))
+                except (TypeError, ValueError):
+                    continue
+        if not gids and args.get("group_id") is not None:
+            gids = [int(args["group_id"])]
+        if not gids:
+            return {"error": "需要 group_id（单群）或 group_ids（多群联查）"}
+        if len(gids) > 10:
+            return {"error": f"一次最多联查 10 个群（收到 {len(gids)}），请分批"}
+        limit = max(1, min(int(limit or 100), 200))
+        name_q = str(args.get("name", "")).strip().lower()
+        uin_q = args.get("uin")
+
+        def match(m) -> bool:
+            if uin_q is not None and int(uin_q) != m.user_id:
+                return False
+            if name_q:
+                hay = f"{m.card_name or ''}\n{m.user_name or ''}\n{m.user_id}".lower()
+                if name_q not in hay:
+                    return False
+            return True
+
+        rosters: dict[int, list] = {}
+        errors: dict[int, str] = {}
+        for gid in gids:
+            try:
+                rosters[gid] = await self.adapter.get_group_member_list(gid)
+            except Exception as e:
+                errors[gid] = str(e)[:120]
+
+        if len(gids) == 1:
+            gid = gids[0]
+            if gid not in rosters:
+                return {"error": f"群 {gid} 成员列表拉取失败: {errors.get(gid, '?')}"}
+            members = rosters[gid]
+            hits = [m for m in members if match(m)]
+            out = {
+                "group_id": gid,
+                "member_count": len(members),
+                "returned": min(len(hits), limit),
+                "members": [
+                    {"uin": m.user_id, "name": m.user_name or "", "card": m.card_name or ""}
+                    for m in hits[:limit]
+                ],
+            }
+            if len(hits) > limit:
+                out["truncated"] = True
+                out["hint"] = "超出 limit 已截断；加 name/uin 过滤可精确定位"
+            return out
+
+        out: dict = {"groups": []}
+        for gid in gids:
+            e: dict = {"group_id": gid}
+            if gid in rosters:
+                e["member_count"] = len(rosters[gid])
+                if name_q or uin_q is not None:
+                    hit = next((m for m in rosters[gid] if match(m)), None)
+                    e["found"] = hit is not None
+                    if hit is not None:
+                        e["uin"] = hit.user_id
+                        e["display"] = hit.display
+            else:
+                e["error"] = errors.get(gid, "拉取失败")
+            out["groups"].append(e)
+
+        if name_q or uin_q is not None:
+            out["mode"] = "lookup"  # "此人在哪些群"
+            return out
+
+        # no filter over multiple groups -> intersection (common members)
+        good = [g for g in gids if g in rosters]
+        if good:
+            common: set[int] | None = None
+            for gid in good:
+                ids = {m.user_id for m in rosters[gid]}
+                common = ids if common is None else (common & ids)
+            common = common or set()
+            by_uin: dict[int, Any] = {}
+            for gid in good:
+                for m in rosters[gid]:
+                    by_uin.setdefault(m.user_id, m)
+            out["mode"] = "intersection"
+            out["common_count"] = len(common)
+            out["common_members"] = [
+                {"uin": u, "display": by_uin[u].display} for u in sorted(common)[:limit]
+            ]
+            if len(common) > limit:
+                out["truncated"] = True
+        return out
 
     async def t_describe_image(self, args: dict) -> dict:
         medias = await self.repo.media_for_message(
@@ -875,7 +994,7 @@ class ToolRunner:
         try:
             task = await scheduler.create(
                 prompt=prompt, ctx=self.ctx, created_by="agent",
-                note=str(args.get("note", ""))[:200],
+                note=str(args.get("note", ""))[:200], **kwargs,
             )
         except ValueError as e:
             return {"error": str(e)}

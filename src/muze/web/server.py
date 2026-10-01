@@ -164,6 +164,40 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
             return web.json_response({"error": str(e)}, status=500)
         return web.json_response({"memories": rows})
 
+    # ---------------- data tab (read-only DB views) ----------------
+    async def api_tasks(request: web.Request) -> web.Response:
+        _, repo, _ = pick(request)
+        rows = await repo.list_tasks(active_only=False)
+        return web.json_response({"tasks": rows})
+
+    async def api_digests(request: web.Request) -> web.Response:
+        _, repo, _ = pick(request)
+        date = request.query.get("date", "").strip()
+        if date:
+            row = await repo.get_digest(date)
+            if not row:
+                return web.json_response({"error": "not found"}, status=404)
+            return web.json_response({"digest": row})
+        period = request.query.get("period", "").strip() or None
+        rows = await repo.list_digests(limit=90, period=period)
+        return web.json_response({"digests": rows})
+
+    async def api_profiles(request: web.Request) -> web.Response:
+        _, repo, _ = pick(request)
+        rows = await repo.list_profiles()
+        return web.json_response({"profiles": rows})
+
+    async def api_media(request: web.Request) -> web.Response:
+        _, repo, _ = pick(request)
+        kind = request.query.get("kind", "").strip() or None
+        scene = request.query.get("scene", "").strip() or None
+        peer = request.query.get("peer", "").strip()
+        limit = int(request.query.get("limit", 60))
+        rows = await repo.list_media(
+            kind=kind, scene=scene, peer_id=int(peer) if peer else None, limit=limit
+        )
+        return web.json_response({"media": rows})
+
     async def api_rag(request: web.Request) -> web.Response:
         _, _, runtime = pick(request)
         rag = getattr(runtime, "rag", None)
@@ -593,6 +627,10 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
     app.router.add_get("/api/pending", api_pending)
     app.router.add_post("/api/pending/{action_id}/{op}", api_pending_op)
     app.router.add_get("/api/memories", api_memories)
+    app.router.add_get("/api/tasks", api_tasks)
+    app.router.add_get("/api/digests", api_digests)
+    app.router.add_get("/api/profiles", api_profiles)
+    app.router.add_get("/api/media", api_media)
     app.router.add_get("/api/rag", api_rag)
     app.router.add_get("/api/rag/search", api_rag_search)
     app.router.add_get("/api/logs/tail", api_logs_tail)
