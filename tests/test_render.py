@@ -80,3 +80,13 @@ def test_unknown_seg_with_known_type_does_not_crash():
     line = render_segment(bad)
     assert "转发" in line
     assert "[转发:]" in plain_text([bad])
+
+
+def test_render_message_sanitizes_junk_nickname():
+    """A nickname containing raw newlines / control bytes must not break the
+    single-line CHAT recv layout."""
+    m = parse_and_build()
+    line = render_message(m, "$ÿĀ\n\x07玛卡巴卡")
+    assert "\n" not in line
+    assert "\\n" in line and "\\x07" in line
+    assert "玛卡巴卡(10001)" in line

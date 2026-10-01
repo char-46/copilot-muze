@@ -140,7 +140,14 @@ def render_segment(seg: Segment) -> str:
 
 
 def render_message(msg: IncomingMessage, sender_display: str = "") -> str:
-    who = f"{sender_display}({msg.sender_id})" if sender_display else str(msg.sender_id)
+    # nicknames are arbitrary user-controlled bytes: they can contain raw
+    # newlines / control chars (saw "\$ÿĀ\n" in the wild) that would break
+    # the single-line layout — sanitize the display name like the body.
+    who = (
+        f"{_one_line(sender_display)}({msg.sender_id})"
+        if sender_display
+        else str(msg.sender_id)
+    )
     parts = [render_segment(s) for s in msg.segments]
     body = " ".join(p for p in parts if p) or "(空消息)"
     ts = epoch_iso(msg.time) or "?"
