@@ -104,6 +104,65 @@ function fmtTime(t) {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
+/* ---------------- tiny markdown ----------------
+ * Renders model output in the AI tab and session details. Safe: everything
+ * is escaped first, then a small subset is transformed (headings, lists,
+ * blockquote, fenced/inline code, bold/italic/strike, http(s) links). */
+function mdInline(s) {
+  return s
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<i>$2</i>")
+    .replace(/~~([^~\n]+)~~/g, "<s>$1</s>")
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function mdRender(text) {
+  const src = esc((text ?? "").toString()).replace(/\r\n/g, "\n");
+  const codes = [];
+  let body = src.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    codes.push(`<pre><code>${code.replace(/\n$/, "")}</code></pre>`);
+    return "\x00CODE" + (codes.length - 1) + "\x00";
+  });
+  const out = [];
+  let list = null; // "ul" | "ol"
+  const flushList = () => {
+    if (list) { out.push(`</${list}>`); list = null; }
+  };
+  for (const block of body.split(/\n{2,}/)) {
+    const lines = block.split("\n");
+    const first = lines[0] || "";
+    if (/^\x00CODE\d+\x00$/.test(first) && lines.length === 1) {
+      flushList(); out.push(first); continue;
+    }
+    const h = first.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { flushList(); out.push(`<h${h[1].length + 1}>${mdInline(h[2])}</h${h[1].length + 1}>`); continue; }
+    if (/^(-{3,}|\*{3,})$/.test(first)) { flushList(); out.push("<hr>"); continue; }
+    if (lines.every((l) => l.startsWith(">"))) {
+      flushList();
+      out.push("<blockquote>" + mdInline(lines.map((l) => l.replace(/^>\s?/, "")).join("\n"))
+        .replace(/\n/g, "<br>") + "</blockquote>");
+      continue;
+    }
+    const li = lines.map((l) => l.match(/^\s*[-*]\s+(.*)$/));
+    if (li.length && li.every(Boolean)) {
+      if (list !== "ul") { flushList(); out.push("<ul>"); list = "ul"; }
+      li.forEach((m) => out.push(`<li>${mdInline(m[1])}</li>`));
+      continue;
+    }
+    const oi = lines.map((l) => l.match(/^\s*\d+[.)]\s+(.*)$/));
+    if (oi.length && oi.every(Boolean)) {
+      if (list !== "ol") { flushList(); out.push("<ol>"); list = "ol"; }
+      oi.forEach((m) => out.push(`<li>${mdInline(m[1])}</li>`));
+      continue;
+    }
+    flushList();
+    out.push("<p>" + mdInline(lines.join("\n")).replace(/\n/g, "<br>") + "</p>");
+  }
+  flushList();
+  return out.join("\n").replace(/\x00CODE(\d+)\x00/g, (_, i) => codes[+i]);
+}
+
 /* ---------------- tabs ---------------- */
 $$("nav button").forEach((b) => b.addEventListener("click", () => {
   $$("nav button").forEach((x) => x.classList.remove("active"));
@@ -114,6 +173,7 @@ $$("nav button").forEach((b) => b.addEventListener("click", () => {
   if (b.dataset.tab === "logs") loadLogs();
   if (b.dataset.tab === "status") loadStatus();
   if (b.dataset.tab === "chats") loadConversations();
+  if (b.dataset.tab === "sess") loadSess();
   if (b.dataset.tab === "settings") loadSettings();
   if (b.dataset.tab === "memories") loadMemories();
   if (b.dataset.tab === "rag") loadRag();
@@ -319,11 +379,15 @@ async function runSearch() {
 }
 
 /* ---------------- ai ---------------- */
+const SESS_ICON = { running: "⏳", done: "✔", error: "✖", suspend: "⏸" };
+const SESS_CN = { running: "运行中", done: "完成", error: "出错", suspend: "已暂停" };
+
 function aiBubble(who, text, err) {
   const div = document.createElement("div");
   div.className = "msgrow " + who + (err ? " err" : "");
+  const body = who === "user" ? esc(text) : mdRender(text);
   div.innerHTML = `<div class="who">${who === "user" ? "你" : "muze"}</div>` +
-    `<div class="bubble">${esc(text)}</div>`;
+    `<div class="bubble md">${body}</div>`;
   $("#aichat").appendChild(div);
   $("#aichat").scrollTop = 1e9;
   return div;
@@ -337,7 +401,7 @@ async function aiSend() {
   const holder = aiBubble("bot", "…");
   try {
     const d = await api("/api/agent", { method: "POST", body: { text } });
-    holder.querySelector(".bubble").textContent = d.text || "(空)";
+    holder.querySelector(".bubble").innerHTML = mdRender(d.text || "(空)");
     pendingBadgeReload();
   } catch (e) {
     holder.querySelector(".bubble").textContent = "调用失败: " + e.message;
@@ -442,6 +506,85 @@ async function runRagSearch() {
 }
 $("#ragBtn").addEventListener("click", runRagSearch);
 $("#ragq").addEventListener("keydown", (e) => { if (e.key === "Enter") runRagSearch(); });
+
+/* ---------------- sess (agent sessions) ---------------- */
+async function loadSess() {
+  const box = $("#sesslist");
+  box.innerHTML = '<div class="dim pad">加载中…</div>';
+  try {
+    const d = await api("/api/sess");
+    if (!d.sessions || !d.sessions.length) {
+      box.innerHTML = '<div class="dim pad">暂无 AI 会话（在 AI 标签页或 QQ 里 :: 提问后出现）</div>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const s of d.sessions) {
+      const div = document.createElement("div");
+      div.className = "conv";
+      div.innerHTML =
+        `<div class="t"><span class="name">${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</span>` +
+        `<span class="cnt">${esc(SESS_CN[s.status] || s.status)}</span></div>` +
+        `<div class="prev dim">${esc(s.chat_key)} · ${esc(fmtTime(s.updated))}</div>`;
+      div.addEventListener("click", () => loadSessDetail(s.id, div));
+      box.appendChild(div);
+    }
+  } catch (e) {
+    box.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+async function loadSessDetail(sid, div) {
+  $$("#sesslist .conv").forEach((x) => x.classList.remove("sel"));
+  if (div) div.classList.add("sel");
+  const pane = $("#sessdetail");
+  pane.innerHTML = '<div class="dim pad">加载中…</div>';
+  try {
+    const s = await api("/api/sess/" + encodeURIComponent(sid));
+    let html =
+      `<div class="panehead"><b>${SESS_ICON[s.status] || "?"} #${esc(s.id)} ${esc(s.title || "")}</b>` +
+      ` <span class="dim">${esc(s.chat_key)} · ${esc(SESS_CN[s.status] || s.status)}` +
+      ` · ${esc(fmtTime(s.created))} · ${s.step}轮 · ${s.total_chars}字` +
+      (s.status === "running" ? ` · 空闲${s.idle}s` : "") + "</span></div>";
+    /* prompt */
+    html += `<div class="card"><div class="head"><b>问</b></div>` +
+      `<div class="md">${mdRender(s.prompt)}</div></div>`;
+    /* tool-loop messages, replies rendered as markdown */
+    const msgs = s.messages || [];
+    if (msgs.length) {
+      html += '<div class="sessmsgs">';
+      for (const m of msgs) {
+        if (m.role === "user") {
+          html += `<div class="msgrow user"><div class="who">你</div>` +
+            `<div class="bubble">${esc(m.content || "")}</div></div>`;
+        } else if (m.role === "assistant") {
+          const calls = (m.tool_calls || []).map((c) =>
+            `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
+            `<code>${esc((c.function?.arguments || "").slice(0, 300))}</code>)</summary></details>`).join("");
+          html += `<div class="msgrow bot"><div class="who">muze</div>` +
+            `<div class="bubble md">${m.content ? mdRender(m.content) : ""}${calls}</div></div>`;
+        } else if (m.role === "tool") {
+          const txt = (m.content || "").slice(0, 1500);
+          html += `<details class="tool"><summary>📤 工具结果 ${esc(m.name || m.tool_call_id || "")}</summary>` +
+            `<pre>${esc(txt)}</pre></details>`;
+        }
+      }
+      html += "</div>";
+    }
+    /* event timeline (collapsed) */
+    const ev = (s.events || []).filter((e) => e.kind !== "prompt");
+    if (ev.length) {
+      html += `<details class="tool tl"><summary>⏱ 过程时间线（${ev.length} 项）</summary>` +
+        ev.map((e) =>
+          `<div><span class="dim">${e.t}s</span> ${esc(e.kind)}: ${esc(e.detail || "")}</div>`).join("") +
+        "</details>";
+    }
+    pane.innerHTML = html;
+  } catch (e) {
+    pane.innerHTML = e.unauthorized ? authHint()
+      : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
+  }
+}
 
 /* ---------------- pending ---------------- */
 async function loadPending() {

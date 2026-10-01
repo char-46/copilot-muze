@@ -125,3 +125,23 @@ main { flex: 1; overflow: hidden; }
   font: 12px/1.45 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap;
 }
 .logview .hl { color: var(--acc); }
+
+/* markdown + sessions */
+.md p { margin: .3em 0; }
+.md h2,.md h3,.md h4,.md h5 { margin: .6em 0 .3em; }
+.md h2 { font-size: 1.15em; } .md h3 { font-size: 1.05em; }
+.md code { background: rgba(127,127,127,.18); border-radius: 3px; padding: 0 .35em; font-family: Consolas, monospace; font-size: .92em; }
+.md pre { background: rgba(127,127,127,.12); border: 1px solid rgba(127,127,127,.25); border-radius: 6px; padding: .6em .8em; overflow-x: auto; margin: .4em 0; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { border-left: 3px solid rgba(127,127,127,.4); margin: .4em 0; padding: .1em .8em; color: var(--dim, #888); }
+.md ul,.md ol { margin: .4em 0; padding-left: 1.5em; }
+.md hr { border: 0; border-top: 1px solid rgba(127,127,127,.3); margin: .6em 0; }
+.md a { color: inherit; }
+.sessmsgs { display: flex; flex-direction: column; gap: .5em; padding: .5em; overflow-y: auto; }
+.sessmsgs .msgrow .bubble { max-width: 100%; }
+details.tool { margin: .25em 0; font-size: .9em; }
+details.tool summary { cursor: pointer; color: #888; }
+details.tool pre { background: rgba(127,127,127,.1); border-radius: 6px; padding: .5em .7em; white-space: pre-wrap; margin: .3em 0; max-height: 20em; overflow-y: auto; }
+details.tl { margin: .5em; }
+#sessdetail { display: flex; flex-direction: column; overflow-y: auto; }
+

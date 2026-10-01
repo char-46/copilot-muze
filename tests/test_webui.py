@@ -70,6 +70,16 @@ async def client(tmp_path):
     n = await rag.run_once()
     assert n >= 2  # two memories indexed
 
+    from muze.ai.sessions import Session
+
+    sess = Session(id="ab12cd", chat_key="web:default", prompt="**markdown** 会话测试")
+    sess.finish(True, "答案预览")
+    sess.messages = [
+        {"role": "user", "content": "问点啥"},
+        {"role": "assistant", "content": "**答**：`code`"},
+    ]
+    await repo.upsert_ai_session(sess.to_row())
+
     app = create_app({"main": WebAccount(svc, repo, svc.runtime)}, "test-token")
     server = TestServer(app)
     cl = TestClient(server)
@@ -131,3 +141,21 @@ async def test_info_includes_rag_and_memories(client):
 async def test_rag_endpoints_require_token(client):
     r = await client.get("/api/rag", headers={"Authorization": "Bearer wrong"})
     assert r.status == 401
+
+
+async def test_sess_list_and_detail(client):
+    r = await client.get("/api/sess")
+    assert r.status == 200
+    d = await r.json()
+    row = next((x for x in d["sessions"] if x["id"] == "ab12cd"), None)
+    assert row and row["status"] == "done" and "markdown" in row["title"]
+
+    r = await client.get("/api/sess/ab12cd")
+    assert r.status == 200
+    d = await r.json()
+    assert d["id"] == "ab12cd" and d["status"] == "done"
+    assert d["messages"] and d["messages"][1]["content"].startswith("**答**")
+    assert any(e["kind"] == "done" for e in d["events"])
+
+    r = await client.get("/api/sess/deadbe")
+    assert r.status == 404

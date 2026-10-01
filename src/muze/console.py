@@ -147,31 +147,61 @@ def print_outcome(outcome: CommandOutcome) -> None:
 # ===========================================================================
 # key readers (blocking-free polling so stop/shutdown stays responsive)
 # ===========================================================================
-def make_key_reader():
+_WIN_SPECIAL = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT", "S": "DEL", "G": "HOME", "O": "END"}
+_CSI_SPECIAL = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT", "H": "HOME", "F": "END"}
+_CSI_TILDE = {"1": "HOME", "3": "DEL", "4": "END"}
+
+
+def make_key_reader(msvcrt_mod=None, platform: str | None = None):
     """A poll_key(timeout) -> str|None callable, or None when unavailable.
 
     Returned tokens: single characters ("a", "你", "\\r", "\\x03" for Ctrl-C,
-    "\\x08"/"\\x7f" backspace, "\\x1b" bare Esc) or "UP" / "DOWN" / "IGN".
+    "\\x08"/"\\x7f" backspace, "ESC" for a bare Esc) or "UP"/"DOWN"/"LEFT"/
+    "RIGHT"/"HOME"/"END"/"DEL"/"IGN".
+
+    Arrow keys arrive in TWO encodings on Windows: the legacy console sends
+    \\x00/\\xe0 + a code byte, while terminals in VT input mode (Windows
+    Terminal / ConPTY hosts) send ANSI CSI sequences (\\x1b[A ...). Both are
+    decoded. `msvcrt_mod`/`platform` exist for tests.
     """
-    if os.name == "nt":
+    if (platform or os.name) == "nt":
         try:
-            import msvcrt
+            msvcrt = msvcrt_mod or __import__("msvcrt")
 
-            special = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT", "S": "DEL", "G": "HOME", "O": "END"}
-
-            def poll_key(timeout: float = 0.05):
-                deadline = time.monotonic() + timeout
+            def _next(deadline: float) -> str | None:
                 while True:
                     if msvcrt.kbhit():
-                        ch = msvcrt.getwch()
-                        if ch in ("\x00", "\xe0"):
-                            if msvcrt.kbhit():
-                                return special.get(msvcrt.getwch(), "IGN")
-                            return "IGN"
-                        return ch
+                        return msvcrt.getwch()
                     if time.monotonic() >= deadline:
                         return None
-                    time.sleep(0.01)
+                    time.sleep(0.002)
+
+            pending: list[str] = []  # char read ahead during ESC disambiguation
+
+            def poll_key(timeout: float = 0.05):
+                if pending:
+                    return pending.pop(0)
+                ch = _next(time.monotonic() + timeout)
+                if ch is None:
+                    return None
+                if ch in ("\x00", "\xe0"):  # legacy enhanced-key prefix
+                    nxt = _next(deadline=time.monotonic() + 0.03)
+                    return _WIN_SPECIAL.get(nxt, "IGN") if nxt else "IGN"
+                if ch == "\x1b":  # VT input mode: CSI sequence or bare Esc
+                    nxt = _next(time.monotonic() + 0.03)
+                    if nxt is None:
+                        return "ESC"
+                    if nxt != "[":  # e.g. ESC+x alt-style: keep the x
+                        pending.append(nxt)
+                        return "ESC"
+                    fin = _next(time.monotonic() + 0.03)
+                    if fin in _CSI_SPECIAL:
+                        return _CSI_SPECIAL[fin]
+                    if fin in _CSI_TILDE:
+                        _next(time.monotonic() + 0.02)  # consume the '~'
+                        return _CSI_TILDE[fin]
+                    return "IGN"
+                return ch
 
             return poll_key
 
@@ -262,7 +292,7 @@ class LineEditor:
                     buf = ""
                 else:
                     return None  # empty line Ctrl-C = quit/stop
-            elif key in ("\x1b", "\x15"):  # Esc / Ctrl-U: clear the line
+            elif key in ("\x1b", "ESC", "\x15"):  # Esc / Ctrl-U: clear the line
                 buf = ""
             elif key in ("IGN", "LEFT", "RIGHT", "DEL", "HOME", "END", "\t"):
                 continue
@@ -295,6 +325,8 @@ def save_history(path, history: list[str]) -> None:
 async def handle_line(service: ControlService, ctx: ControlContext, line: str) -> str:
     """Execute one console line. Returns 'continue' | 'close' | 'shutdown'."""
     line = (line or "").strip()
+    if line.startswith(".") and len(line) > 1:  # "." is an alias for "/"
+        line = "/" + line[1:]
     if not line:
         return "continue"
     if line in ("/exit", "/quit", "/q"):

@@ -868,6 +868,34 @@ class Repository:
         ) as cur:
             return {r["kind"]: int(r["n"]) for r in await cur.fetchall()}
 
+    async def rag_chat_progress(self, limit: int = 8) -> dict:
+        """Chat-indexing progress: per-conversation cursor vs newest archived
+        seq (recent conversations), plus totals across ALL conversations.
+        The cursor lags the archive between passes; cursor==last_seq means
+        that conversation is fully windowed."""
+        async with self.conn.execute(
+            "SELECT c.scene, c.peer_id, c.last_seq, c.last_active_at, "
+            " CAST(COALESCE((SELECT value FROM rag_state "
+            "  WHERE key='chat:'||c.scene||':'||c.peer_id), '0') AS INTEGER) AS cursor "
+            "FROM conversations c WHERE c.last_seq > 0 "
+            "ORDER BY c.last_active_at DESC LIMIT ?",
+            (max(1, min(int(limit), 50)),),
+        ) as cur:
+            convs = [dict(r) for r in await cur.fetchall()]
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(c.last_seq), 0) AS tseq, "
+            " COALESCE(SUM(CAST(COALESCE((SELECT value FROM rag_state "
+            "  WHERE key='chat:'||c.scene||':'||c.peer_id), '0') AS INTEGER)), 0) AS tcur "
+            "FROM conversations c WHERE c.last_seq > 0"
+        ) as cur:
+            agg = dict(await cur.fetchone())
+        return {
+            "conversations": convs,
+            "total_conversations": int(agg["n"] or 0),
+            "total_seq": int(agg["tseq"] or 0),
+            "total_cursor": int(agg["tcur"] or 0),
+        }
+
     async def list_rag_docs(self, kind: str | None = None, limit: int = 1000) -> list[dict]:
         sql = "SELECT * FROM rag_docs"
         args: list = []

@@ -276,6 +276,169 @@ async def test_query_context_retrieves_and_never_raises(repo):
     assert await off.query_context("钓鱼") == []
 
 
+# ------------------------------------------------------ forced indexing
+class _BlockingGovernor:
+    def idle(self, last_activity=0.0):
+        return False, "always busy"
+
+    def snapshot(self):
+        return {"power": True, "cpu_pct": 5.0, "gpu_util": 2.0, "gpu_free_gb": 8.0}
+
+
+async def test_run_once_force_bypasses_governor(repo):
+    await repo.add_memory("fact", "owner", "主人喜欢喝乌龙茶", source="t")
+    cfg = MuzeConfig()
+    cfg.rag.enabled = True
+    vec = VecStore(repo)
+    await vec.setup()
+    indexer = RagIndexer(repo, vec, FakeEmbedder(), cfg, governor=_BlockingGovernor())
+    assert await indexer.run_once() == 0  # gated off
+    assert await indexer.run_once(force=True) >= 1  # forced through
+
+
+async def test_run_forced_runs_until_stopped(repo):
+    import asyncio as _a
+
+    cfg = MuzeConfig()
+    cfg.rag.enabled = True
+    vec = VecStore(repo)
+    await vec.setup()
+    indexer = RagIndexer(repo, vec, FakeEmbedder(), cfg)
+
+    stop = _a.Event()
+    stop.set()  # already stopping -> returns immediately, flag restored
+    await indexer.run_forced(stop)
+    assert indexer.forced is False
+
+
+async def test_rag_chat_progress(repo):
+    from muze.provider.milky.models import IncomingMessage
+
+    def mk(seq, text):
+        return IncomingMessage.from_raw(
+            {
+                "message_scene": "group", "peer_id": 7, "message_seq": seq,
+                "sender_id": 42, "time": 1790000000 + seq,
+                "segments": [{"type": "text", "data": {"text": text}}],
+            }
+        )
+
+    for seq in (1, 2, 3, 4, 5):
+        await repo.upsert_message(mk(seq, f"msg{seq}"), f"msg{seq}", "event")
+    await repo.rag_set_state("chat:group:7", "2")
+    prog = await repo.rag_chat_progress()
+    assert prog["total_conversations"] == 1
+    assert prog["total_seq"] == 5 and prog["total_cursor"] == 2
+    conv = prog["conversations"][0]
+    assert conv["scene"] == "group" and conv["peer_id"] == 7
+    assert conv["cursor"] == 2 and conv["last_seq"] == 5
+
+
+# ------------------------------------------------------ /rag command
+class _CmdRag:
+    enabled = True
+
+    def __init__(self):
+        self.forced = False
+        self.governor = None  # None -> the /rag report skips the resource line
+
+    async def status(self):
+        return {
+            "enabled": True, "chat_enabled": False, "running": self.forced,
+            "forced": self.forced, "docs": 3, "docs_by_kind": {"memory": 3},
+            "vec_model": "fake", "vec_dims": 8, "embedding_model": "fake",
+            "embedding_available": True, "embedding_healthy": True,
+            "last_index_at": 0.0, "last_count": 3,
+        }
+
+    async def run_forced(self, stop):
+        self.forced = True
+        try:
+            await stop.wait()
+        finally:
+            self.forced = False
+
+
+async def test_rag_command_status_run_stop(repo):
+    import asyncio as _a
+
+    from muze.chatlog import ChatLog
+    from muze.core.service import ControlContext, ControlService, Runtime
+    from test_permissions import Recorder
+
+    svc = ControlService(MuzeConfig(), Recorder(), repo, ChatLog(), Runtime())
+    fake = _CmdRag()
+    svc.runtime.rag = fake
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+
+    out = await svc.run_command("rag", ctx)
+    assert "文档3篇" in out.text and "memory:3" in out.text
+
+    out = await svc.run_command("rag run", ctx)
+    assert "已启动强制索引" in out.text
+    await _a.sleep(0.01)
+    assert fake.forced is True
+    assert "强制索引中" in (await svc.run_command("rag", ctx)).text
+
+    out = await svc.run_command("rag stop", ctx)
+    assert "已停止" in out.text
+    for _ in range(50):
+        if not fake.forced:
+            break
+        await _a.sleep(0.01)
+    assert fake.forced is False
+    out = await svc.run_command("rag stop", ctx)
+    assert "未在运行" in out.text
+
+
+# ------------------------------------------------------ "." command prefix
+async def test_dot_prefix_commands(repo):
+    from muze.chatlog import ChatLog
+    from muze.core.service import ControlContext, ControlService, Runtime
+    from test_permissions import Recorder
+
+    svc = ControlService(MuzeConfig(), Recorder(), repo, ChatLog(), Runtime())
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+
+    v = await svc.execute(".version", ctx)
+    assert not v.is_error and "0.1.0" in v.text
+    v = await svc.execute("/version", ctx)
+    assert not v.is_error  # "/" still works
+    v = await svc.execute(".不存在的命令", ctx)
+    assert v.is_error and "未知命令" in v.text
+
+
+# ------------------------------------------------------ embedder stickiness
+class _StickyEmbedder(Embedder):
+    def __init__(self):
+        cfg = MuzeConfig().rag.embedding
+        cfg.provider = "local"
+        cfg.model = "local-model"
+        super().__init__(cfg)
+        self.loads: list[str] = []
+
+    async def _load_local(self, device, governor=None):
+        self.loads.append(device)
+        self._device = device
+        self._local = object()
+
+
+class _CudaGovernor:
+    def choose_device(self):
+        return "cuda"
+
+
+async def test_embedder_device_sticky_no_reload_thrash():
+    emb = _StickyEmbedder()
+    emb._local = object()
+    emb._device = "cpu"
+    await emb.prepare(_CudaGovernor())  # loaded already -> stays on cpu
+    assert emb.loads == []
+    emb._local = None  # idle-unloaded -> next prepare re-picks the device
+    await emb.prepare(_CudaGovernor())
+    assert emb.loads == ["cuda"]
+
+
 # ------------------------------------------------------ auto-inject
 class FakeRag:
     enabled = True

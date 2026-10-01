@@ -278,36 +278,80 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
         )
 
     async def api_sess(request: web.Request) -> web.Response:
-        """Live agent-turn progress: /api/sess lists, /api/sess/<id> details."""
-        service, _, _ = pick(request)
+        """Agent-turn sessions: /api/sess lists (persisted + live merged),
+        /api/sess/<id> full detail incl. the tool-loop messages."""
+        service, repo, _ = pick(request)
         if service.agent is None:
             return web.json_response({"error": "LLM 未配置"}, status=503)
-        store = service.agent.sessions
         sid = request.match_info.get("sid", "")
         if not sid:
-            return web.json_response(
-                {
-                    "sessions": [
-                        {
-                            "id": s.id,
-                            "status": s.status,
-                            "chat_key": s.chat_key,
-                            "elapsed": round(s.elapsed(), 1),
-                            "prompt": s.prompt[:80],
-                        }
-                        for s in reversed(store.recent(20))
-                    ]
+            try:
+                rows = await repo.list_ai_sessions(limit=30)
+            except Exception:
+                rows = []
+            merged: dict[str, dict] = {}
+            for r in rows:
+                merged[r["id"]] = {
+                    "id": r["id"],
+                    "title": r.get("title", ""),
+                    "status": r.get("status", "done"),
+                    "chat_key": r.get("chat_key", ""),
+                    "step": int(r.get("step", 0) or 0),
+                    "created": float(r.get("created", 0) or 0),
+                    "updated": float(r.get("updated", 0) or 0),
+                    "prompt": (r.get("prompt") or "")[:120],
+                    "result_preview": (r.get("result_preview") or "")[:200],
                 }
+            # live sessions win: fresher status/round counters (incl. running)
+            store = getattr(service.agent, "sessions", None)
+            for s in (store.recent(50) if store is not None else []):
+                merged[s.id] = {
+                    "id": s.id,
+                    "title": s.title,
+                    "status": s.status,
+                    "chat_key": s.chat_key,
+                    "step": s.step,
+                    "created": s.created,
+                    "updated": s.updated,
+                    "prompt": s.prompt[:120],
+                    "result_preview": s.result_preview[:200],
+                }
+            sessions = sorted(
+                merged.values(), key=lambda x: x["updated"], reverse=True
             )
-        s = store.get(sid)
+            return web.json_response({"sessions": sessions})
+
+        s = None
+        gs = getattr(service.agent, "get_session", None)
+        if gs is not None:
+            try:
+                s = await gs(sid)
+            except Exception:
+                s = None
+        if s is None:  # persisted-only sessions (e.g. after a restart)
+            from muze.ai.sessions import Session
+
+            try:
+                row = await repo.get_ai_session(sid)
+            except Exception:
+                row = None
+            if row is not None:
+                try:
+                    s = Session.from_row(row)
+                except Exception:
+                    s = None
         if s is None:
             return web.json_response({"error": "no such session"}, status=404)
         return web.json_response(
             {
                 "id": s.id,
+                "title": s.title,
                 "status": s.status,
                 "chat_key": s.chat_key,
                 "prompt": s.prompt,
+                "step": s.step,
+                "created": s.created,
+                "updated": s.updated,
                 "elapsed": round(s.elapsed(), 1),
                 "idle": round(s.idle(), 1),
                 "round_chars": s.round_chars,
@@ -316,6 +360,7 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                 "events": [
                     {"t": round(t, 1), "kind": k, "detail": d} for t, k, d in s.events
                 ],
+                "messages": s.messages,
             }
         )
 

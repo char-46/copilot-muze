@@ -84,17 +84,22 @@ class Embedder:
 
     # ------------------------------------------------------------ prepare
     async def prepare(self, governor=None) -> None:
-        """Pick the device (GPU if it fits & is idle, else CPU) and load the
-        local model. Best-effort: failures are surfaced on the next embed()."""
+        """Load the local model if it isn't loaded yet (device chosen via the
+        governor when auto). STICKY: an already-loaded model is never
+        reloaded onto another device — the probe reads instantaneous
+        utilisation, and the embedder's own bursts would otherwise flip the
+        device back and forth (load thrash). Re-evaluation happens after an
+        idle unload, or via an explicit reload."""
         if not self._local_enabled:
+            return
+        if self._local is not None:
             return
         device = self.cfg.device
         if device == "auto":
             device = governor.choose_device() if governor is not None else "cpu"
-        if self._local is not None and device == self._device:
-            return
         try:
-            await self._load_local(device, governor)
+            async with self._lock:
+                await self._load_local(device, governor)
         except Exception as e:  # surfaced again by embed(); keep it non-fatal
             self._device = ""
             log.warning("local embedding model load failed (%s): %s", device, e)

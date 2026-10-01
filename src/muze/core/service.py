@@ -227,6 +227,8 @@ class ControlService:
         line = (text or "").strip()
         if not line:
             return CommandOutcome.err("空命令")
+        if line.startswith("."):  # "." is an accepted alias for "/"
+            line = "/" + line[1:]
         if not line.startswith("/"):
             line = "/" + line
         if not ctx:
@@ -283,7 +285,7 @@ class ControlService:
             return CommandOutcome.err("空输入")
         self.chatlog.ctrl(ctx.source, ctx.user_label or ctx.chat_key, text)
 
-        if text.startswith("/"):
+        if text.startswith("/") or (text.startswith(".") and len(text) > 1):
             return await self.run_command(text, ctx)
 
         # `::` (two colons, half/full width) -> the ONLY way to reach the LLM;
@@ -301,7 +303,7 @@ class ControlService:
                 return await self.cmd_sess(["go"], ctx)
             return await self.agent.converse(prompt, ctx)
 
-        return CommandOutcome.err("未响应：命令以 / 开头；发给 AI 的内容以 :: 开头（两个冒号）")
+        return CommandOutcome.err("未响应：命令以 / 或 . 开头；发给 AI 的内容以 :: 开头（两个冒号）")
 
     # ------------------------------------------------------------- sending
     async def deliver(self, ctx: ControlContext, outcome: CommandOutcome) -> None:
@@ -817,6 +819,97 @@ class ControlService:
             f"最新: {epoch_iso(st['max_time'])}  (seq {st['max_seq']})"
         )
 
+    @slash(
+        "rag",
+        "/rag [run|stop]",
+        "RAG 状态与聊天索引进度；run=强制连续索引（忽略闲时门控，日志滚动），stop=停止",
+    )
+    async def cmd_rag(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        import asyncio as _a
+
+        rag = getattr(self.runtime, "rag", None)
+        if rag is None:
+            return CommandOutcome.err("RAG 未初始化（rag.enabled 未开）")
+        sub = (args[0].lower() if args else "").strip()
+
+        if sub == "run":
+            if not rag.enabled:
+                return CommandOutcome.err("rag.enabled 未开或 embedding/vec 不可用")
+            t = getattr(self.runtime, "rag_force", None)
+            if t is not None and not t.done():
+                return CommandOutcome("强制索引已在运行（/rag stop 停止）")
+            stop = _a.Event()
+            self.runtime.rag_stop = stop
+            self.runtime.rag_force = _a.create_task(rag.run_forced(stop))
+            return CommandOutcome(
+                "已启动强制索引：忽略闲时门控连续跑，进度看滚动日志；追平后每15s复查新消息，/rag stop 停止"
+            )
+
+        if sub == "stop":
+            t = getattr(self.runtime, "rag_force", None)
+            if t is None or t.done():
+                return CommandOutcome("强制索引未在运行")
+            ev = getattr(self.runtime, "rag_stop", None)
+            if ev is not None:
+                ev.set()
+            try:
+                await _a.wait_for(_a.shield(t), 10)
+            except (_a.TimeoutError, _a.CancelledError):
+                t.cancel()
+            self.runtime.rag_force = None
+            return CommandOutcome("强制索引已停止（后台闲时索引不受影响）")
+
+        if sub:
+            return CommandOutcome.err("用法: /rag [run|stop]")
+        return CommandOutcome(await self._rag_report(rag))
+
+    async def _rag_report(self, rag) -> str:
+        rs = await rag.status()
+        lines = []
+        state = "on" if rs["enabled"] else "off（rag.enabled 未开或 embedding/vec 不可用）"
+        if rs.get("forced"):
+            state += " [强制索引中，/rag stop 停止]"
+        elif rs.get("running"):
+            state += " [索引中]"
+        kinds = " ".join(f"{k}:{v}" for k, v in sorted(rs["docs_by_kind"].items()))
+        lines.append(f"rag: {state} 文档{rs['docs']}篇（{kinds or '空'}）")
+        lines.append(
+            f"模型: vec={rs['vec_model'] or '-'} dims={rs['vec_dims']}"
+            f" embedding={rs['embedding_model'] or '-'}"
+            + ("" if rs["embedding_healthy"] else " [异常]")
+        )
+        lines.append(f"上次索引: {epoch_iso(rs['last_index_at']) or '-'} 新增{rs['last_count']}篇")
+        gov = rag.governor
+        if gov is not None:
+            snap = gov.snapshot()
+            if any(v is not None for v in snap.values()):
+                lines.append(
+                    f"资源: power={snap['power']} cpu={snap['cpu_pct']:.0f}%"
+                    f" gpu={snap['gpu_util']:.0f}% free={snap['gpu_free_gb']:.1f}G"
+                    if snap["cpu_pct"] is not None and snap["gpu_util"] is not None
+                    else f"资源: {snap}"
+                )
+        if rs["chat_enabled"]:
+            try:
+                prog = await self.repo.rag_chat_progress(limit=8)
+            except Exception:
+                prog = None
+            if prog and prog["total_seq"]:
+                pct = min(100, round(prog["total_cursor"] / max(1, prog["total_seq"]) * 100))
+                lines.append(
+                    f"聊天索引进度: {pct}%（{prog['total_conversations']}个会话，"
+                    f"游标 {prog['total_cursor']}/{prog['total_seq']} 条消息）"
+                )
+                for c in prog["conversations"]:
+                    if c["cursor"] < c["last_seq"]:
+                        lines.append(
+                            f"  追赶中 {conv_id(c['scene'], c['peer_id'])}: "
+                            f"{c['cursor']}/{c['last_seq']}"
+                        )
+            elif prog:
+                lines.append(f"聊天索引: {prog['total_conversations']}个会话已追平")
+        return "\n".join(lines)
+
     @slash("help", "/help", "命令列表（自动扫描生成）", scope="app")
     async def cmd_help(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(COMMANDS.help_text())
@@ -856,6 +949,7 @@ class ControlService:
                         f" 模型={rs['vec_model'] or '-'}"
                         f" 上次索引={epoch_iso(rs['last_index_at']) or '-'}"
                         + (" [含聊天窗口]" if rs["chat_enabled"] else "")
+                        + (" [强制索引中]" if rs.get("forced") else "")
                         + ("" if rs["embedding_healthy"] else " [embedding异常]")
                     )
                 else:
@@ -1422,7 +1516,7 @@ class ControlService:
             return False
         if not self.is_controller(scene, peer_id, sender_id):
             return False
-        is_cmd = text.startswith("/")
+        is_cmd = text.startswith("/") or (text.startswith(".") and len(text) > 1)
         is_llm = is_llm_invocation(text)
         if not (is_cmd or is_llm):
             return False
@@ -1446,6 +1540,8 @@ class Runtime:
         self.llm = None  # LLMClient, injected by main
         self.backfiller = None  # Backfiller, injected by main
         self.rag = None  # RagIndexer, injected by main
+        self.rag_force = None  # forced indexing task (/rag run)
+        self.rag_stop = None  # its stop event
         self.log_path = ""
         self.skills = None  # SkillStore, injected by main
         self.reloader = None  # Reloader, injected by main

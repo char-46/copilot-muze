@@ -16,6 +16,7 @@ vector space, so changing the model rebuilds the index.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -117,6 +118,7 @@ class RagIndexer:
         self.governor = governor
         self.activity_fn = activity_fn or (lambda: 0.0)
         self.running = False
+        self.forced = False  # a run_forced() loop is active
         self.last_index_at = 0.0
         self.last_count = 0
 
@@ -141,22 +143,27 @@ class RagIndexer:
         self.embedder.unload_if_idle()
 
     # ----------------------------------------------------------- indexing
-    async def run_once(self) -> int:
+    async def run_once(self, force: bool = False, stop: asyncio.Event | None = None) -> int:
+        """One indexing pass. `force` bypasses the idle gates (explicit user
+        request — the resource governor still picks the device); `stop`
+        interrupts between batches."""
         if not self.enabled or self.running:
             return 0
         if not self.embedder.healthy:
             log.info("RAG index skipped: embedder unavailable")
             return 0
-        if not self._idle():
+        if not force and not self._idle():
             log.debug("RAG index skipped: not idle")
             return 0
         self.running = True
         total = 0
         try:
             await self._prepare()
-            total += await self._index_docs(await self._collect_summaries())
-            if self.cfg.rag.chat and self._idle():
-                total += await self._index_chat()
+            total += await self._index_docs(
+                await self._collect_summaries(), force=force, stop=stop
+            )
+            if self.cfg.rag.chat and (force or self._idle()):
+                total += await self._index_chat(force=force, stop=stop)
             self.last_index_at = time.time()
             self.last_count = total
             if total:
@@ -168,7 +175,28 @@ class RagIndexer:
         finally:
             self.running = False
 
-    async def _index_docs(self, docs: list[dict]) -> int:
+    async def run_forced(self, stop: asyncio.Event) -> None:
+        """Continuous forced indexing until `stop`: ignores idle gates,
+        stays device-aware and batch-interruptible. When a pass yields
+        nothing new it idles 15s before re-checking, so it doubles as a
+        catch-up monitor until the user stops it."""
+        self.forced = True
+        try:
+            while not stop.is_set():
+                n = await self.run_once(force=True, stop=stop)
+                if stop.is_set() or not self.enabled:
+                    break
+                if not n:
+                    try:
+                        await asyncio.wait_for(stop.wait(), 15)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            self.forced = False
+
+    async def _index_docs(
+        self, docs: list[dict], force: bool = False, stop: asyncio.Event | None = None
+    ) -> int:
         if not docs:
             return 0
         cap = int(self.cfg.rag.max_doc_chars)
@@ -176,7 +204,10 @@ class RagIndexer:
         ensured = False
         done = 0
         for i in range(0, len(docs), batch):
-            if not self._idle():
+            if stop is not None and stop.is_set():
+                log.info("RAG index stopped after %s docs", done)
+                break
+            if not force and not self._idle():
                 log.info("RAG index interrupted after %s docs (busy)", done)
                 break
             chunk = docs[i : i + batch]
@@ -224,12 +255,16 @@ class RagIndexer:
                 docs.append({"kind": "digest", "ref": f"digest:{d['date']}", "text": text})
         return docs
 
-    async def _index_chat(self) -> int:
+    async def _index_chat(
+        self, force: bool = False, stop: asyncio.Event | None = None
+    ) -> int:
         wm = int(self.cfg.rag.window_messages)
         wc = int(self.cfg.rag.window_chars)
         done = 0
         for conv in await self.repo.list_conversations(limit=300):
-            if not self._idle():
+            if stop is not None and stop.is_set():
+                break
+            if not force and not self._idle():
                 break
             scene, peer = conv["scene"], conv["peer_id"]
             key = f"chat:{scene}:{peer}"
@@ -251,7 +286,7 @@ class RagIndexer:
                     window, size = [], 0
             if window:
                 docs.append(self._chat_window(scene, peer, window))
-            n = await self._index_docs(docs)
+            n = await self._index_docs(docs, force=force, stop=stop)
             done += n
             if n < len(docs):
                 break  # interrupted mid-conversation: leave cursor for retry
@@ -284,6 +319,7 @@ class RagIndexer:
             "enabled": self.enabled,
             "chat_enabled": bool(self.cfg.rag.chat),
             "running": self.running,
+            "forced": self.forced,
             "docs": sum(counts.values()),
             "docs_by_kind": counts,
             "vec_model": await self.repo.rag_get_state("vec_model") or "",

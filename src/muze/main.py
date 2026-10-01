@@ -539,6 +539,12 @@ class App:
             self._enrich_task.cancel()
         if getattr(self, "_rag_task", None) is not None:
             self._rag_task.cancel()
+        rf = getattr(self.runtime, "rag_force", None)
+        if rf is not None and not rf.done():
+            rf.cancel()
+        rs = getattr(self.runtime, "rag_stop", None)
+        if rs is not None:
+            rs.set()
         scheduler = getattr(self, "scheduler", None)
         if scheduler is not None:
             await _safe("scheduler.stop", scheduler.stop(), 5)
