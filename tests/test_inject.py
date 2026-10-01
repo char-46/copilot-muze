@@ -75,6 +75,89 @@ def make_agent(repo, cfg=None):
     return agent, service
 
 
+class FakeLLM:
+    """Minimal llm seam: pops scripted assistant replies."""
+
+    configured = True
+
+    class _Cfg:
+        progress = False
+        auto_title = False
+        turn_timeout_sec = 0
+        max_concurrent_turns = 4
+        max_queued_turns = 8
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.cfg = self._Cfg()
+
+    async def chat(self, messages, tools=None, on_chunk=None):
+        return {"role": "assistant", "content": self.replies.pop(0)}
+
+
+async def _drain(agent):
+    import asyncio
+
+    tasks = [t for t in agent._tasks if not t.done()]
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+async def test_resume_persists_terminal_state(repo):
+    """Regression: _run_resume's happy path never persisted the terminal
+    state, so a resumed session's DB row stayed "running" forever and every
+    restart resurrected the finished turn as crash debris and re-ran it."""
+    import asyncio
+
+    service = ControlService(MuzeConfig(), StubAdapter(), repo, ChatLog(), Runtime())
+    agent = Agent(service, repo, llm=FakeLLM(["第一轮回答", "续跑回答"]), chatlog=ChatLog())
+    service.agent = agent
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+
+    await agent.ask("原问题", ctx)
+    sid = next(iter(agent.sessions._sessions))
+    assert (await repo.get_ai_session(sid))["status"] == "done"
+
+    s = agent.sessions.get(sid)
+    agent.resume(s, ctx, extra_text="继续")
+    await _drain(agent)
+
+    row = await repo.get_ai_session(sid)
+    assert row["status"] == "done"  # was stuck "running" before the fix
+    assert "续跑回答" in row["result_preview"]
+
+
+async def test_resume_interrupted_ignores_post_boot_sessions(repo):
+    """The 20s-delayed startup sweep must not pick up live turns that were
+    created AFTER boot — only rows last touched before the process started
+    are crash debris."""
+    import time
+
+    from muze.ai.sessions import RUNNING, Session
+
+    service = ControlService(MuzeConfig(), StubAdapter(), repo, ChatLog(), Runtime())
+    agent = Agent(service, repo, llm=FakeLLM(["僵尸复活回答"]), chatlog=ChatLog())
+    service.agent = agent
+
+    t0 = time.time()
+    zombie = Session(id="zz01", chat_key="cli", prompt="旧问题")
+    zombie.updated = t0 - 3600  # pre-boot crash debris
+    agent.sessions.add(zombie)
+    live = Session(id="live9", chat_key="cli", prompt="刚启动的新回合")
+    live.updated = t0 + 10  # strictly after boot (clock ticks can collide)
+    agent.sessions.add(live)  # created post-boot, legitimately RUNNING
+    agent._boot = t0
+
+    n = await agent.resume_interrupted()
+    assert n == 1
+    await _drain(agent)
+
+    assert agent.sessions.get("zz01").status == "done"  # resumed + finalized
+    fresh = agent.sessions.get("live9")
+    assert fresh.status == RUNNING  # untouched: no double-run
+    assert not any(k == "interrupted" for _, k, _ in fresh.events)
+
+
 async def test_prompt_injects_dream_background_and_orders_memories(repo):
     await repo.upsert_digest("2026-09-28", "昨天:和张三对齐了周报格式", 24, {}, period="day")
     await repo.upsert_digest("2026-W39", "本周主线:项目A联调", 24, {}, period="week")
@@ -179,6 +262,7 @@ async def test_resume_interrupted_picks_crash_and_recent_error(repo):
         return s
 
     now = _t.time()
+    agent._boot = _t.time() + 10_000  # everything below counts as pre-boot debris
     agent.sessions.add(mk("run1", "running", now))          # crash-interrupted
     agent.sessions.add(mk("err1", "error", now - 60))       # recent error
     agent.sessions.add(mk("old1", "error", now - 99_999))   # stale error

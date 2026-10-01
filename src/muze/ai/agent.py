@@ -102,6 +102,10 @@ class Agent:
         self._running = 0
         self._waiting = 0
         self._tasks: set[asyncio.Task] = set()
+        # process boot time: resume_interrupted() runs ~20s after start and
+        # must only pick up crash debris from BEFORE this boot — a session
+        # created after boot that is "running" is live traffic, not debris
+        self._boot = time.time()
 
     # ------------------------------------------------------------- history
     def _history(self, chat_key: str) -> list[dict]:
@@ -277,8 +281,13 @@ class Agent:
         now = time.time()
         picked = [
             s for s in self.sessions.latest(self.sessions.cap)
-            if s.status == RUNNING
-            or (s.status == ERROR and now - s.updated <= error_grace_sec)
+            # only crash debris: rows last touched BEFORE this process booted
+            # (a "running" row created after boot is a live in-flight turn)
+            if s.updated <= self._boot
+            and (
+                s.status == RUNNING
+                or (s.status == ERROR and now - s.updated <= error_grace_sec)
+            )
         ]
         for s in picked:
             if s.status == RUNNING:
@@ -303,6 +312,12 @@ class Agent:
             log.exception("agent resume crashed")
             await self._finalize(session)
             outcome = CommandOutcome(f"AI 调用失败: {e}", is_error=True)
+        else:
+            # HAPPY PATH TOO: _resume_inner persisted status=running at its
+            # start; without this final persist the row stays "running"
+            # forever and every restart resurrects the finished turn as
+            # "crash-interrupted" and re-runs it (zombie re-delivery loop).
+            await self._finalize(session)
         if ctx.qq_reachable:
             await self._notify(ctx, f"#{session.id} " + outcome.text, error=outcome.is_error)
 
