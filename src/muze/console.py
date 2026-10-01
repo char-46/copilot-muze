@@ -5,8 +5,9 @@ Layout: the input line is PINNED to the last terminal line. Log lines and
 command output are always inserted ABOVE it (second-to-last and up): before
 writing we wipe the input line, print the text, then redraw
 ``muze> <half-typed buffer>`` on the fresh last line. Implemented with a tiny
-key-level line editor (chars / backspace / Ctrl-U / Esc / Up-Down history)
-talking to the console API directly — no ``input()`` from a secondary thread
+key-level line editor (chars / backspace / cursor keys / Del / Ctrl-U / Esc /
+Up-Down history) talking to the console API directly — no ``input()`` from a
+secondary thread
 (a known Windows CRT failure, which is what made the console unresponsive
 after a daemon relaunch) and no prompt_toolkit dependency.
 
@@ -22,6 +23,7 @@ import os
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from muze.core.service import CommandOutcome, ControlContext, ControlService
@@ -30,7 +32,7 @@ log = logging.getLogger("muze.console")
 
 BANNER = (
     "muze console: /help 命令列表 · /shutdown 停止服务 · /exit 关闭控制台 · "
-    "↑/↓ 历史 · Esc/Ctrl-U 清行 · Ctrl-C 空行=停服"
+    "↑/↓ 历史 · ←/→/Home/End 移动 · Del 右删 · Esc/Ctrl-U 清行 · Ctrl-C 空行=停服"
 )
 
 
@@ -41,11 +43,17 @@ _io_lock = threading.Lock()
 _active = False          # an input line is currently sitting on the last line
 _prompt = "muze> "
 _buffer = ""
+_pos = 0                 # cursor position (chars into _buffer)
 _vt = False              # terminal understands ANSI clear-line
 
 
 def io_lock() -> threading.Lock:
     return _io_lock
+
+
+def _disp_width(s: str) -> int:
+    """Display columns of `s` (CJK counts 2) — cursor moves are in columns."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
 
 
 def _clr() -> str:
@@ -93,11 +101,12 @@ def current_prompt() -> str:
 
 def show_input(prompt: str | None = None, buffer: str = "") -> None:
     """Draw the input line on the current (fresh, empty) last line."""
-    global _active, _prompt, _buffer
+    global _active, _prompt, _buffer, _pos
     with _io_lock:
         if prompt is not None:
             _prompt = prompt
         _buffer = buffer
+        _pos = len(buffer)
         _active = True
         sys.stdout.write(_prompt + _buffer)
         sys.stdout.flush()
@@ -109,14 +118,38 @@ def hide_input() -> None:
         _active = False
 
 
-def update_buffer(buf: str) -> None:
-    """Redraw the input line with a new buffer (cursor stays at the end)."""
-    global _buffer
+def _draw_prompt_locked() -> None:
+    """Prompt + buffer + cursor at _pos, NO clear (assumes lock held)."""
+    out = sys.stdout
+    out.write(_prompt + _buffer)
+    if _vt and _pos < len(_buffer):
+        out.write(f"\x1b[{_disp_width(_buffer[_pos:])}D")
+    out.flush()
+
+
+def update_buffer(buf: str, pos: int | None = None) -> None:
+    """Redraw the input line; cursor at `pos` (default: end of buffer)."""
+    global _buffer, _pos
     with _io_lock:
         _buffer = buf
+        _pos = len(buf) if pos is None else pos
         if _active:
-            sys.stdout.write(_clr() + _prompt + _buffer)
-            sys.stdout.flush()
+            sys.stdout.write(_clr())
+            _draw_prompt_locked()
+
+
+def settle(text: str) -> None:
+    """Replace the on-screen input line (prompt + half-typed buffer) with
+    `text` in the scrollback and leave the cursor on a fresh last line.
+
+    The submit path MUST go through this: without the clear, the echoed
+    prompt+line lands right after the still-displayed input line, producing
+    `muze[x]> /ragmuze[x]> /rag` style duplication."""
+    with _io_lock:
+        out = sys.stdout
+        out.write(_clr())
+        out.write(text.rstrip("\n") + "\n")
+        out.flush()
 
 
 def write_above(text: str) -> None:
@@ -136,8 +169,9 @@ def write_above(text: str) -> None:
             text += "\n"
         out.write(text)
         if _active:
-            out.write(_prompt + _buffer)
-        out.flush()
+            _draw_prompt_locked()
+        else:
+            out.flush()
 
 
 def print_outcome(outcome: CommandOutcome) -> None:
@@ -263,9 +297,12 @@ class LineEditor:
         self.history = history
 
     def readline(self, stop_check) -> str | None:
-        """Read one line. Returns the submitted text, or None when the user
-        quit (Ctrl-C on an empty line) or stop_check() became true."""
+        """Read one line with full cursor editing: chars insert at the
+        cursor, Backspace deletes left of it, Del right of it, ←/→/Home/End
+        move. Returns the submitted text, or None when the user quit
+        (Ctrl-C on an empty line) or stop_check() became true."""
         buf = ""
+        pos = 0
         saved = ""
         idx = len(self.history)  # history cursor; == len -> "live" buffer
         while not stop_check():
@@ -280,28 +317,54 @@ class LineEditor:
                         saved = buf
                     idx -= 1
                     buf = self.history[idx]
-                    update_buffer(buf)
+                    pos = len(buf)
                 continue
             if key == "DOWN":
                 if idx < len(self.history):
                     idx += 1
                     buf = self.history[idx] if idx < len(self.history) else saved
-                    update_buffer(buf)
+                    pos = len(buf)
                 continue
-            if key in ("\x08", "\x7f"):
-                buf = buf[:-1]
+            if key == "LEFT":
+                if pos > 0:
+                    pos -= 1
+                    update_buffer(buf, pos)
+                continue
+            if key == "RIGHT":
+                if pos < len(buf):
+                    pos += 1
+                    update_buffer(buf, pos)
+                continue
+            if key == "HOME":
+                pos = 0
+                update_buffer(buf, pos)
+                continue
+            if key == "END":
+                pos = len(buf)
+                update_buffer(buf, pos)
+                continue
+            if key == "DEL":  # delete right of the cursor
+                if pos < len(buf):
+                    buf = buf[:pos] + buf[pos + 1 :]
+            elif key in ("\x08", "\x7f"):  # backspace: delete left of it
+                if pos > 0:
+                    buf = buf[: pos - 1] + buf[pos:]
+                    pos -= 1
             elif key == "\x03":  # Ctrl-C
                 if buf:
                     buf = ""
+                    pos = 0
                 else:
                     return None  # empty line Ctrl-C = quit/stop
             elif key in ("\x1b", "ESC", "\x15"):  # Esc / Ctrl-U: clear the line
                 buf = ""
-            elif key in ("IGN", "LEFT", "RIGHT", "DEL", "HOME", "END", "\t"):
+                pos = 0
+            elif key in ("IGN", "\t"):
                 continue
             else:
-                buf += key
-            update_buffer(buf)
+                buf = buf[:pos] + key + buf[pos:]
+                pos += len(key)
+            update_buffer(buf, pos)
         return None
 
 
@@ -414,7 +477,7 @@ def _console_line(loop, switcher, ctx, line) -> str:
 
 def _submit_and_run(loop, switcher, ctx, stop_event, line: str, prompt: str) -> str | None:
     """Settle the command line into the scrollback, run it, handle actions."""
-    write_above(prompt + line)
+    settle(prompt + line)
     action = _console_line(loop, switcher, ctx, line)
     if action == "shutdown":
         if stop_event is not None:
@@ -460,6 +523,9 @@ def repl_thread(
                     write_above("shutting down...")
                     return
                 if not line.strip():
+                    # settle the abandoned prompt onto its own line (like a
+                    # shell) instead of gluing the next prompt after it
+                    settle(switcher.prompt())
                     continue
                 if history and history[-1] != line:
                     history.append(line)
@@ -532,10 +598,12 @@ async def repl_async(
                 write_above("bye")
                 break
             if not line.strip():
+                settle("muze> ")
                 continue
             if not history or history[-1] != line:
                 history.append(line)
             save_history(history_path, history)
+            settle("muze> " + line)
             action = await handle_line(service, ctx, line)
             if action == "shutdown":
                 if on_shutdown is not None:

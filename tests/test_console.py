@@ -47,6 +47,52 @@ def test_editor_ctrl_c_quits_only_on_empty_line():
     assert run_keys(["a", "\x03", "\r"]) == "" # clear then submit empty
 
 
+# ------------------------------------------------------- cursor editing
+def test_editor_left_right_insert_and_delete():
+    assert run_keys(["ab", "LEFT", "X", "\r"]) == "aXb"          # insert at cursor
+    assert run_keys(["abc", "LEFT", "DEL", "\r"]) == "ab"        # Del: right of cursor
+    assert run_keys(["abc", "LEFT", "\x08", "\r"]) == "ac"       # Backspace: left of it
+    assert run_keys(["abc", "HOME", "X", "\r"]) == "Xabc"
+    assert run_keys(["abc", "HOME", "END", "X", "\r"]) == "abcX"
+    # cursor clamps at both ends
+    assert run_keys(["a", "LEFT", "LEFT", "RIGHT", "RIGHT", "X", "\r"]) == "aX"
+    # Del at end of line and Backspace at column 0 are no-ops
+    assert run_keys(["a", "DEL", "\r"]) == "a"
+    assert run_keys(["a", "HOME", "\x08", "\r"]) == "a"
+
+
+def test_editor_history_reset_cursor_to_end():
+    hist = ["hello world"]
+    assert run_keys(["z", "UP", "LEFT", "X", "\r"], history=hist) == "hello worlXd"
+
+
+def test_update_buffer_positions_cursor(monkeypatch):
+    monkeypatch.setattr(console, "_vt", True)
+    fake = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", fake)
+    console.show_input("muze> ", "abc")
+    fake.seek(0)
+    fake.truncate()
+    console.update_buffer("abc", 1)  # cursor after 'a': tail "bc" = 2 cols
+    assert fake.getvalue() == "\r\x1b[2Kmuze> abc\x1b[2D"
+    fake.seek(0)
+    fake.truncate()
+    console.update_buffer("你好", 0)  # CJK tail counts double columns
+    assert fake.getvalue() == "\r\x1b[2Kmuze> 你好\x1b[4D"
+    console.hide_input()
+
+
+def test_settle_replaces_input_line(monkeypatch):
+    monkeypatch.setattr(console, "_vt", True)
+    fake = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", fake)
+    console.show_input("muze[x]> ", "/rag")
+    fake.seek(0)
+    fake.truncate()
+    console.settle("muze[x]> /rag")
+    assert fake.getvalue() == "\r\x1b[2Kmuze[x]> /rag\n"  # no glued duplicate
+
+
 def test_editor_stop_check_interrupts():
     assert run_keys(["a", "b"], stop=lambda: True) is None
 
