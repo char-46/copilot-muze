@@ -83,29 +83,37 @@ class Embedder:
         return self.cfg.model if self._local_enabled else self.cfg.remote_model
 
     # ------------------------------------------------------------ prepare
-    async def prepare(self, governor=None) -> None:
+    async def prepare(self, governor=None, force: bool = False) -> None:
         """Load the local model if it isn't loaded yet (device chosen via the
         governor when auto). STICKY: an already-loaded model is never
         reloaded onto another device — the probe reads instantaneous
         utilisation, and the embedder's own bursts would otherwise flip the
-        device back and forth (load thrash). Re-evaluation happens after an
-        idle unload, or via an explicit reload."""
+        device back and forth (load thrash). `force` (an explicit user-run
+        indexing pass) re-picks the device right now: unload and reload on
+        the governor's current best. Re-evaluation otherwise happens after
+        an idle unload."""
         if not self._local_enabled:
             return
-        if self._local is not None:
+        if self._local is not None and not force:
             return
         device = self.cfg.device
         if device == "auto":
             device = governor.choose_device() if governor is not None else "cpu"
         try:
             async with self._lock:
-                await self._load_local(device, governor)
+                if force:  # drop the old instance: reload on the new device
+                    self._local = None
+                    self._device = ""
+                await self._load_local(device, governor, full_threads=force)
         except Exception as e:  # surfaced again by embed(); keep it non-fatal
             self._device = ""
             log.warning("local embedding model load failed (%s): %s", device, e)
 
-    async def _load_local(self, device: str, governor=None) -> None:
-        threads = governor.cpu_threads() if governor is not None else int(self.cfg.cpu_max_threads)
+    async def _load_local(self, device: str, governor=None, full_threads: bool = False) -> None:
+        if governor is not None:
+            threads = governor.cpu_threads(force=full_threads)
+        else:
+            threads = int(self.cfg.cpu_max_threads)
         if self.cfg.backend == "fastembed":
             providers = ["CPUExecutionProvider"]
             if device == "cuda":

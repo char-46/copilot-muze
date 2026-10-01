@@ -146,11 +146,16 @@ class ResourceGovernor:
         log.debug("RAG device=cpu (vram free %.1fG < %.1fG)", free, weight)
         return "cpu"
 
-    def cpu_threads(self) -> int:
+    def cpu_threads(self, force: bool = False) -> int:
+        """Thread budget for CPU inference: normally scaled down by how busy
+        the machine is; a forced (user-requested) pass uses the full cap —
+        the user explicitly asked for progress now."""
+        cap = max(1, int(self.cfg.embedding.cpu_max_threads))
+        if force:
+            return cap
         cores = os.cpu_count() or 2
         busy = self.cpu_busy() or 0.0
         free = max(0.0, 1.0 - busy / 100.0)
-        cap = max(1, int(self.cfg.embedding.cpu_max_threads))
         return max(1, min(cap, int(round(cores * free))))
 
     def snapshot(self) -> dict:

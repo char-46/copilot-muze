@@ -135,9 +135,9 @@ class RagIndexer:
         except Exception:
             return True
 
-    async def _prepare(self) -> None:
+    async def _prepare(self, force: bool = False) -> None:
         try:
-            await self.embedder.prepare(self.governor)
+            await self.embedder.prepare(self.governor, force=force)
         except Exception:
             log.exception("embedder prepare failed")
         self.embedder.unload_if_idle()
@@ -177,11 +177,15 @@ class RagIndexer:
 
     async def run_forced(self, stop: asyncio.Event) -> None:
         """Continuous forced indexing until `stop`: ignores idle gates,
-        stays device-aware and batch-interruptible. When a pass yields
-        nothing new it idles 15s before re-checking, so it doubles as a
-        catch-up monitor until the user stops it."""
+        stays device-aware and batch-interruptible. The device is RE-PICKED
+        at the start (a sticky CPU instance from an earlier busy period
+        would otherwise crawl through an explicit user run). When a pass
+        yields nothing new it idles 15s before re-checking, so it doubles
+        as a catch-up monitor until the user stops it."""
         self.forced = True
         try:
+            if not stop.is_set():
+                await self._prepare(force=True)
             while not stop.is_set():
                 n = await self.run_once(force=True, stop=stop)
                 if stop.is_set() or not self.enabled:
@@ -233,6 +237,8 @@ class RagIndexer:
                 await self.vec.upsert(rid, v)
             await self.repo.conn.commit()
             done += len(chunk)
+            if done // 160 != (done - len(chunk)) // 160:
+                log.info("RAG index progress: %s/%s docs", done, len(docs))
             await _sleep(self.cfg.rag.embedding.min_interval_sec)
         return done
 
@@ -327,6 +333,8 @@ class RagIndexer:
             "embedding_model": getattr(emb, "model_id", ""),
             "embedding_available": bool(getattr(emb, "available", False)),
             "embedding_healthy": bool(getattr(emb, "healthy", True)),
+            "device": getattr(emb, "_device", "") or "",
+            "loaded": bool(getattr(emb, "_local", None)),
             "last_index_at": self.last_index_at,
             "last_count": self.last_count,
         }

@@ -123,8 +123,11 @@ def write_above(text: str) -> None:
     """Print (multi-line) text ABOVE the input line; the input line stays last.
 
     This is the ONE function every background writer (logging handler,
-    command output) must go through while the console is active.
-    """
+    command output) must go through while the console is active. A stray BEL
+    (\\x07, e.g. from raw control chars in chat text) is stripped here as a
+    final guard so the terminal never beeps."""
+    if "\x07" in text:
+        text = text.replace("\x07", "")
     with _io_lock:
         out = sys.stdout
         if _active:

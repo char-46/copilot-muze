@@ -34,7 +34,7 @@ class FakeEmbedder:
     def dims(self) -> int:
         return self._dims
 
-    async def prepare(self, governor=None) -> None:
+    async def prepare(self, governor=None, force: bool = False) -> None:
         return None
 
     def unload_if_idle(self, now=None) -> bool:

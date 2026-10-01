@@ -32,7 +32,7 @@ class FakeEmbedder:
     def dims(self) -> int:
         return self._dims
 
-    async def prepare(self, governor=None) -> None:
+    async def prepare(self, governor=None, force: bool = False) -> None:
         return None
 
     def unload_if_idle(self, now=None) -> bool:
@@ -417,7 +417,7 @@ class _StickyEmbedder(Embedder):
         super().__init__(cfg)
         self.loads: list[str] = []
 
-    async def _load_local(self, device, governor=None):
+    async def _load_local(self, device, governor=None, full_threads=False):
         self.loads.append(device)
         self._device = device
         self._local = object()
@@ -437,6 +437,42 @@ async def test_embedder_device_sticky_no_reload_thrash():
     emb._local = None  # idle-unloaded -> next prepare re-picks the device
     await emb.prepare(_CudaGovernor())
     assert emb.loads == ["cuda"]
+
+
+async def test_embedder_force_prepare_repicks_device():
+    emb = _StickyEmbedder()
+    emb._local = object()
+    emb._device = "cpu"
+    await emb.prepare(_CudaGovernor(), force=True)  # explicit run re-picks
+    assert emb.loads == ["cuda"]
+
+
+async def test_run_forced_repicks_device_before_first_pass(repo):
+    import asyncio as _a
+
+    class _Forced(RagIndexer):
+        prepared = []
+
+        async def _prepare(self, force: bool = False) -> None:
+            self.prepared.append(force)
+
+        async def run_once(self, force: bool = False, stop=None) -> int:
+            if stop is not None:
+                stop.set()
+            return 0
+
+    cfg = MuzeConfig()
+    vec = VecStore(repo)
+    await vec.setup()
+    idx = _Forced(repo, vec, FakeEmbedder(), cfg)
+    stop = _a.Event()
+    await idx.run_forced(stop)
+    assert _Forced.prepared == [True]  # device re-picked once, forced
+
+
+def test_governor_force_uses_full_thread_cap():
+    assert _gov(power=True, cpu=90, gpu=0, free=8).cpu_threads(force=True) == 4
+    assert _gov(power=True, cpu=100, gpu=0, free=8).cpu_threads() == 1  # busy-scaled
 
 
 # ------------------------------------------------------ auto-inject

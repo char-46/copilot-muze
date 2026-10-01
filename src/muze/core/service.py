@@ -876,6 +876,8 @@ class ControlService:
         lines.append(
             f"模型: vec={rs['vec_model'] or '-'} dims={rs['vec_dims']}"
             f" embedding={rs['embedding_model'] or '-'}"
+            + (f" [{rs.get('device') or 'cpu'}{' 已加载' if rs.get('loaded') else ' 未加载'}]"
+               if rs.get("device") else "")
             + ("" if rs["embedding_healthy"] else " [异常]")
         )
         lines.append(f"上次索引: {epoch_iso(rs['last_index_at']) or '-'} 新增{rs['last_count']}篇")

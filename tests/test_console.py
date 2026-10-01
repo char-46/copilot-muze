@@ -72,6 +72,15 @@ def test_write_above_plain_when_no_input_line(monkeypatch):
     assert fake.getvalue() == "LOG LINE\n"
 
 
+def test_write_above_strips_bell(monkeypatch):
+    monkeypatch.setattr(console, "_vt", True)
+    fake = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", fake)
+    console.hide_input()
+    console.write_above("beep\x07!")
+    assert fake.getvalue() == "beep!\n"  # BEL never reaches the terminal
+
+
 def test_update_buffer_redraws(monkeypatch):
     monkeypatch.setattr(console, "_vt", True)
     fake = io.StringIO()

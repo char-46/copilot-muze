@@ -1,5 +1,5 @@
 from muze.chatlog import plain_text, render_message, render_segment, size_fmt, _one_line
-from muze.provider.milky.models import parse_segments
+from muze.provider.milky.models import UnknownSeg, parse_segments
 
 
 def segs(items):
@@ -62,3 +62,21 @@ def test_size_fmt():
 def test_one_line_escapes():
     assert _one_line("a\r\nb") == "a\\r\\nb"
     assert _one_line("x\ny") == "x\\ny"
+
+
+def test_one_line_escapes_control_chars_no_bell():
+    # chat text with raw C0 bytes (BEL etc.) must never reach a terminal
+    out = _one_line("beep\x07\x0b\x01!")
+    assert "\x07" not in out and "\\x07" in out
+    assert "\\x0b" in out and "\\x01" in out
+    assert out.endswith("!")
+
+
+def test_unknown_seg_with_known_type_does_not_crash():
+    """parse_segments degrades a KNOWN type with invalid fields to
+    UnknownSeg(type='forward') — render/plain_text must not assume the
+    ForwardSeg class shape (was: AttributeError 'title')."""
+    bad = UnknownSeg(type="forward", raw={"whatever": 1})
+    line = render_segment(bad)
+    assert "转发" in line
+    assert "[转发:]" in plain_text([bad])

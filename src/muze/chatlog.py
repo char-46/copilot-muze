@@ -68,7 +68,13 @@ def setup_logging(log_cfg: LogConfig, storage_cfg: StorageConfig) -> Path:
 
 
 def _one_line(s: str) -> str:
-    return (s or "").replace("\r", "\\r").replace("\n", "\\n")
+    """Single display line: break newlines and ESCAPE C0 control characters.
+    Chat text can contain raw control bytes (BEL makes the console beep,
+    others scramble the layout) — they must never reach a terminal raw."""
+    s = (s or "").replace("\r", "\\r").replace("\n", "\\n")
+    return "".join(
+        ch if ch >= " " or ch == "\t" else f"\\x{ord(ch):02x}" for ch in s
+    )
 
 
 def size_fmt(n: int | None) -> str:
@@ -112,8 +118,13 @@ def render_segment(seg: Segment) -> str:
         s = seg
         return f"[文件:{s.file_name} {size_fmt(s.file_size)}]"
     if t == "forward":
-        s = seg
-        title = s.title or s.summary or ";".join(s.preview or [])
+        # UnknownSeg may carry a KNOWN type string (malformed segment that
+        # failed field validation): never trust the class shape here.
+        title = (
+            getattr(seg, "title", "")
+            or getattr(seg, "summary", "")
+            or ";".join(getattr(seg, "preview", None) or [])
+        )
         return f"[转发:{_one_line(title)}]"
     if t == "market_face":
         return f"[表情包:{getattr(seg, 'summary', '')}]"
@@ -202,8 +213,9 @@ def plain_text(segments: list[Segment]) -> str:
         elif t == "file":
             out.append(f"[文件:{getattr(seg, 'file_name', '')}]")
         elif t == "forward":
-            s = seg
-            out.append(f"[转发:{s.title or s.summary}]")
+            out.append(
+                f"[转发:{getattr(seg, 'title', '') or getattr(seg, 'summary', '')}]"
+            )
         elif t == "market_face":
             out.append(f"[表情包:{getattr(seg, 'summary', '')}]")
         elif t == "light_app":
