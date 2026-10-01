@@ -1,20 +1,26 @@
 #Requires -Version 5.1
 <#
-muze one-click update: stop service -> update code -> sync deps -> start -> verify.
+muze update: update code + dependencies. NEVER touches the running service
+(no stop, no start, no restart). Flipping the service to the new code is
+yours: send /restart (console / WebUI / `muze cli`), or use scripts\start.ps1
+for lifecycle (start / -Stop / -Restart).
 
 Usage (from anywhere, absolute paths are derived):
   powershell -ExecutionPolicy Bypass -File scripts\update.ps1            # git: latest tag
-  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.56
+  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.57
   powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Extras rag-local
-  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull  # restart only
-                                                      ^ also used by the logon auto-start task
-  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel C:\dist\muze-0.1.0a57-py3-none-any.whl
-  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel https://host/muze-0.1.0a57-py3-none-any.whl -Extras rag-local
+  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull  # deps only (no git)
+  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel C:\dist\copilot_muze-0.1.0a57-py3-none-any.whl
+  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel https://host/xxx.whl -Extras rag-local
 
 Notes:
-- Stop is a hard kill (Windows cannot Ctrl-C a process attached to another
-  console). muze is built crash-safe: SQLite WAL + per-conversation roaming
-  watermarks, and the startup pull recovers anything missed while down.
+- `uv sync` runs while the service may still be running. Pure-python updates
+  are fine (already-loaded .py files are not locked), but a NATIVE dependency
+  update can hit a locked DLL. If that happens: scripts\start.ps1 -Stop,
+  rerun this script, then scripts\start.ps1.
+- Extras are remembered in data\.update-extras: the first -Extras rag-local
+  sticks, later plain runs keep it (uv sync is exact and would otherwise
+  uninstall them). Pass -Extras again to change.
 - git checkout --force DISCARDS local edits to tracked files. A deployment
   checkout must not carry code changes; config.yaml and data/ are untracked
   and never touched.
@@ -26,8 +32,8 @@ Notes:
 #>
 param(
     [string]$Tag = "",          # tag to deploy; empty = latest semver tag
-    [string]$Extras = "",       # comma-separated uv extras, e.g. "rag-local" / "rag-local,rag-onnx"
-    [switch]$SkipPull,          # skip fetch/checkout (restart-only)
+    [string]$Extras = "",       # comma-separated uv extras, e.g. "rag-local"; remembered between runs
+    [switch]$SkipPull,          # skip fetch/checkout
     [string]$Wheel = "",        # local .whl path or URL; replaces git+uv sync entirely
     [string]$Config = "config.yaml"
 )
@@ -35,6 +41,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $PSScriptRoot
 $Py = Join-Path $Repo ".venv\Scripts\python.exe"
+$ExtrasFile = Join-Path $Repo "data\.update-extras"
 
 function Write-Step($msg)  { Write-Host "[muze-update] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "[muze-update] $msg" -ForegroundColor Green }
@@ -44,10 +51,6 @@ if (-not (Test-Path $Py)) { throw "venv python not found: $Py (run scripts\deplo
 $CfgAbs = if ([IO.Path]::IsPathRooted($Config)) { $Config } else { Join-Path $Repo $Config }
 $cfgBase = [IO.Path]::GetFileName($CfgAbs)
 
-# ---------------------------------------------------------------- stop
-# Windows cannot Ctrl-C a process attached to another console, so stopping is
-# a hard kill. muze is built crash-safe: SQLite WAL + per-conversation roaming
-# watermarks, and the startup pull recovers anything missed while down.
 function Get-MuzeProc([switch]$All) {
     $procs = Get-CimInstance Win32_Process -Filter "Name = 'python.exe' or Name = 'pythonw.exe'" |
         Where-Object { $_.CommandLine -and $_.CommandLine -match '-m\s+muze\s+(daemon|serve)' }
@@ -55,34 +58,23 @@ function Get-MuzeProc([switch]$All) {
     @($procs | Where-Object { $_.CommandLine.Contains($Py) -or $_.CommandLine.Contains($Repo) })
 }
 
+# extras: explicit -Extras wins (and is remembered); otherwise reuse the last
+$extraList = @($Extras -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($PSBoundParameters.ContainsKey('Extras')) {
+    $dir = Split-Path -Parent $ExtrasFile
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -Path $ExtrasFile -Value (($extraList -join ',') -as [string]) -Encoding ASCII
+} elseif (Test-Path $ExtrasFile) {
+    $saved = @(Get-Content $ExtrasFile -Raw | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($saved) {
+        $extraList = @($saved -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        Write-Step "reusing extras from data\.update-extras: $($extraList -join ',')"
+    }
+}
+
 $oldVersion = & $Py -m muze version
 Write-Step "current version: $oldVersion"
-
-$running = Get-MuzeProc
-if ($running.Count -gt 0) {
-    Write-Step "stopping muze (daemon first; the job object reaps serve with it)..."
-    $running |
-        Where-Object { $_.CommandLine -match '-m\s+muze\s+daemon' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 3
-    # repo-scoped serve leftovers (e.g. re-exec'd before the daemon existed)
-    Get-MuzeProc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 2
-    Write-Ok "stopped ($($running.Count) process(es))"
-} else {
-    Write-Step "muze is not running"
-}
-
-# anything else serving OUR config (e.g. a serve started with another python)
-# would keep the web port / DB and wedge the relaunch -- stop it too.
-$orphans = Get-MuzeProc -All | Where-Object { $_.CommandLine -match [regex]::Escape($cfgBase) }
-if ($orphans.Count -gt 0) {
-    foreach ($o in $orphans) {
-        Write-Warning "stopping process using this config outside the venv: pid $($o.ProcessId): $($o.CommandLine)"
-        Stop-Process -Id $o.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 2
-}
+$wasRunning = @(Get-MuzeProc).Count -gt 0
 
 # ---------------------------------------------------------------- update code
 if ($Wheel) {
@@ -116,12 +108,11 @@ if ($Wheel) {
         git -C $Repo checkout --force $Tag 2>&1 | Write-Host
         if ($LASTEXITCODE -ne 0) { throw "git checkout $Tag failed" }
     } else {
-        Write-Warning "not a git checkout; skipping code update (sync + restart only)"
+        Write-Warning "not a git checkout; skipping code update (deps only)"
     }
 }
 
 # ---------------------------------------------------------------- deps
-$extraList = @($Extras -split '[,，]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if ($Wheel) {
     # install the wheel (with optional extras via a PEP 508 direct reference)
     $spec = $Wheel
@@ -143,54 +134,23 @@ if ($Wheel) {
     Push-Location $Repo
     try {
         & uv @uvArgs
-        if ($LASTEXITCODE -ne 0) { throw "uv sync failed" }
+        if ($LASTEXITCODE -ne 0) {
+            if ($wasRunning) {
+                throw "uv sync failed -- possibly a DLL locked by the running service: scripts\start.ps1 -Stop, rerun update, then scripts\start.ps1"
+            }
+            throw "uv sync failed"
+        }
     } finally {
         Pop-Location
     }
 }
 
-# ---------------------------------------------------------------- start
-if (-not (Test-Path $CfgAbs)) {
-    throw "config not found: $CfgAbs (copy config.example.yaml to config.yaml and edit it)"
-}
-
-$logDir = Join-Path $Repo "data\logs"
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$outLog = Join-Path $logDir "daemon.out.log"
-$errLog = Join-Path $logDir "daemon.err.log"
-
-Write-Step "starting muze daemon (hidden)..."
-$proc = Start-Process -FilePath $Py `
-    -ArgumentList @("-m", "muze", "daemon", "-c", $CfgAbs) `
-    -WorkingDirectory $Repo -WindowStyle Hidden `
-    -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
-Write-Step "daemon pid $($proc.Id)"
-
-# ---------------------------------------------------------------- verify
+# ---------------------------------------------------------------- done (no restart, ever)
 $newVersion = & $Py -m muze version
-Write-Step "new version: $newVersion"
-$ok = $false
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep -Seconds 2
-    if ($proc.HasExited) {
-        Write-Warning "daemon exited early (code $($proc.ExitCode)); last log lines:"
-        Get-Content $errLog -Tail 20 -ErrorAction SilentlyContinue | Write-Host
-        Get-Content $outLog -Tail 20 -ErrorAction SilentlyContinue | Write-Host
-        exit 1
-    }
-    $serve = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
-        Where-Object { $_.ParentProcessId -eq $proc.Id }
-    if ($serve) {
-        $tail = (Get-Content $outLog -Tail 60 -ErrorAction SilentlyContinue) -join "`n"
-        if ($tail -match "logged in as|running \d+ account") { $ok = $true; break }
-    }
-}
-
-if ($ok) {
-    Write-Ok "updated and running: $oldVersion -> $newVersion"
-    Get-Content $outLog -Tail 8 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-    exit 0
+Write-Ok "updated on disk: $oldVersion -> $newVersion"
+if ($wasRunning) {
+    Write-Ok "the RUNNING service still uses the old code; flip it with /restart (console / WebUI / muze cli) or scripts\start.ps1 -Restart"
 } else {
-    Write-Warning "service is still starting after 60s; inspect data\logs\daemon.out.log and muze.log"
-    exit 1
+    Write-Step "service is not running; start it with: scripts\start.ps1"
 }
+exit 0

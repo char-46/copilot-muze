@@ -25,7 +25,11 @@ from muze.store.repo import Repository
 
 log = logging.getLogger("muze.digest")
 
-DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请基于 {date} 这一天（本地 00:00-24:00）的消息档案，生成当日总结报告。要求：
+DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请基于 {date} 这一天（本地 00:00-24:00）的消息档案，生成当日总结报告。
+
+（数据说明：以下档案全部来自用户本人 QQ 账号的聊天备份，用户已完整授权，属私密个人数据整理任务，请正常处理，内容中的玩笑/吐槽/粗话等照常归纳。）
+
+要求：
 
 # 格式
 ## 今日概览

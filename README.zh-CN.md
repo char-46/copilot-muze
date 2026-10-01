@@ -92,34 +92,62 @@ Milky 适配器是第一个实现；今后可以在同一接口后面加一个 r
   **任何**原因死掉，内核都会立刻杀掉 serve，不会再出现孤儿 serve 占着
   web 端口或数据库的情况。
 
-部署机（一个普通的 git checkout + venv）上，两个脚本包办整个生命周期：
-`scripts/deploy.ps1`（首次安装）和 `scripts/update.ps1`（一键更新）：
+部署机（一个普通的 git checkout + venv）由三个脚本分工：
+
+- `scripts/deploy.ps1` —— 首次安装：前置检查、`uv sync`、配置引导、
+  可选登录自启任务，然后启动。
+- `scripts/update.ps1` —— **只做更新，任何时候都不碰运行中的服务**
+  （不停、不启、不重启）：checkout 最新 tag（或装 whl）+ `uv sync`。
+  切到新代码由你决定：发 `/restart`（控制台 / WebUI / `muze cli`），
+  serve 原地 re-exec——或在 daemon 下以 rc=100 退出由其立刻重拉。
+- `scripts/start.ps1` —— **唯一**管理进程的脚本：启动（默认）/
+  `-Stop` / `-Restart`，带启动验证。
 
 ```powershell
 # 首次安装（依赖 + 配置引导 + 可选开机自启任务）
 powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -Extras rag-local -InstallTask
 
-# 一键更新：停止 -> checkout 最新 tag -> uv sync -> 启动 -> 验证
+# 更新（一条命令；运行中的服务继续跑旧代码）
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1
+# ……之后你随时：发 /restart（控制台 / WebUI / muze cli）
 
 # 变体
-powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.56  # 固定某个 tag
-powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull             # 仅重启
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.57  # 固定某个 tag
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Extras rag-local,rag-onnx
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull             # 只同步依赖
+powershell -ExecutionPolicy Bypass -File scripts\start.ps1 [-Stop | -Restart]     # 生命周期
 ```
 
 更新也可以走 **whl** —— 适合无法访问 git 的部署机。在开发机 `uv build`
-出包，拷贝（或托管）whl 后让同一个脚本指向它：停止 →
-`uv pip install --reinstall` → 启动 → 验证：
+出包，拷贝（或托管）whl 后让 `update.ps1` 指向它：装 whl 代替 git 拉取，
+切换到新代码同样靠 `/restart`（或 `start.ps1 -Restart`）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel C:\dist\copilot_muze-0.1.0a57-py3-none-any.whl
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel https://host/copilot_muze-0.1.0a57-py3-none-any.whl -Extras rag-local
 ```
 
-whl 只装 `muze` 包本身：`scripts\` 和仓库级 `skills\` 沿用最初的检出
-（用户技能可以放在 `data\skills`）；`config.yaml` / `data\` 两种路线都
-不会被动到。
+whl 只装 `muze` 包本身：`scripts\` 和仓库级 `skills\` 沿用最初检出
+（用户技能可放 `data\skills`）；`config.yaml` / `data/` 两种路线都不会
+被动到。
+
+注意：
+
+- `uv sync` 可能在服务运行时执行。纯 Python 更新没问题（已加载的
+  `.py` 不加锁），但**原生依赖**变更可能撞上被锁的 DLL —— 那就
+  `start.ps1 -Stop` → 重跑 `update.ps1` → `start.ps1`（脚本会这么提示）。
+- `start.ps1 -Stop/-Restart` 的停止是硬杀（Windows 无法向另一个控制台
+  里的进程发 Ctrl-C）—— 这里是安全的：SQLite WAL + 按会话的漫游水位，
+  `on_start` 拉取会把停机期间错过的每条消息都找回来。零停机切换优先用
+  `/restart`。
+- **extras 会被记住**（`data\.update-extras`）：第一次 `-Extras rag-local`
+  之后，后续裸跑也会带上（`uv sync` 是精确同步，否则会把它们卸掉）。
+  要改就再传一次 `-Extras`。
+- `git checkout --force` 会丢弃对已跟踪文件的本地修改 —— 部署检出上不要
+  改代码。`config.yaml` 与 `data/` 不入库，永远不会被动到。
+- `-InstallTask` 注册一个登录自启计划任务（`muze-autostart`），通过
+  `start.ps1` 拉起服务；删除用
+  `Unregister-ScheduledTask -TaskName muze-autostart`。
 
 `update.ps1` 会打印 旧版本 → 新版本，并 tail 启动日志，更新失败立刻可见。注意：
 

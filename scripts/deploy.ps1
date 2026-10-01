@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 muze first-time deployment (Windows): dependencies, config bootstrap, optional
-logon auto-start, then start the service via scripts\update.ps1.
+logon auto-start, then start the service via scripts\start.ps1.
 
 Usage:
   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
@@ -9,8 +9,9 @@ Usage:
   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -InstallTask    # + auto-start at logon
   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -NoStart       # install only
 
-One-click update afterwards:
+Update (never touches the running service) / lifecycle:
   powershell -ExecutionPolicy Bypass -File scripts\update.ps1
+  powershell -ExecutionPolicy Bypass -File scripts\start.ps1 [-Stop | -Restart]
 #>
 param(
     [string]$Config = "config.yaml",
@@ -37,7 +38,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 Write-Step "prerequisites ok (git: $((Get-Command git).Source), uv: $((Get-Command uv).Source))"
 
 # ---------------------------------------------------------------- dependencies
-$extraList = @($Extras -split '[,，]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$extraList = @($Extras -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $uvArgs = @("sync")
 foreach ($e in $extraList) { $uvArgs += @("--extra", $e) }
 Write-Step "uv $($uvArgs -join ' ')"
@@ -61,28 +62,34 @@ if (-not (Test-Path $CfgAbs)) {
 
 # ---------------------------------------------------------------- auto-start task
 if ($InstallTask) {
-    $updateScript = Join-Path $PSScriptRoot "update.ps1"
+    $startScript = Join-Path $PSScriptRoot "start.ps1"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$updateScript`" -SkipPull"
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Settings $settings -Force | Out-Null
-    Write-Ok "scheduled task '$TaskName' registered: muze starts at logon (update.ps1 -SkipPull)"
+    Write-Ok "scheduled task '$TaskName' registered: muze starts at logon (start.ps1)"
     Write-Step "remove it later with: Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
+}
+
+# remember the extras for future update.ps1 runs (uv sync is exact)
+if ($extraList) {
+    $extrasFile = Join-Path $Repo "data\.update-extras"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $extrasFile) | Out-Null
+    Set-Content -Path $extrasFile -Value ($extraList -join ',') -Encoding ASCII
 }
 
 # ---------------------------------------------------------------- start
 if ($NoStart) {
-    Write-Ok "install complete; start with: powershell -ExecutionPolicy Bypass -File scripts\update.ps1"
+    Write-Ok "install complete; start with: powershell -ExecutionPolicy Bypass -File scripts\start.ps1"
     exit 0
 }
 
-Write-Step "starting the service via update.ps1 -SkipPull ..."
-$updateScript = Join-Path $PSScriptRoot "update.ps1"
-$startArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $updateScript, "-SkipPull", "-Config", $CfgAbs)
-foreach ($e in $extraList) { $startArgs += @("-Extras", $e) }
+Write-Step "starting the service via start.ps1 ..."
+$startScript = Join-Path $PSScriptRoot "start.ps1"
+$startArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $startScript, "-Config", $CfgAbs)
 & powershell.exe @startArgs
 exit $LASTEXITCODE

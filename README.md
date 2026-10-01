@@ -105,26 +105,37 @@ Day-to-day the service runs under **`muze daemon`**, a tiny supervisor:
   daemon dies for *any* reason the kernel kills serve instantly, so an
   orphaned serve can never hold the web port or the database.
 
-For the deployment box (a plain git checkout + venv) two scripts wrap the
-whole lifecycle — `scripts/deploy.ps1` (first install) and
-`scripts/update.ps1` (one-click update):
+The deployment box (a plain git checkout + venv) is wrapped by three scripts:
+
+- `scripts/deploy.ps1` — first install: prerequisites, `uv sync`, config
+  bootstrap, optional logon auto-start task, then start.
+- `scripts/update.ps1` — **update only, never touches the running service**
+  (no stop, no start, no restart): checkout latest tag (or install a wheel)
+  + `uv sync`. Flipping the live service to the new code is yours: `/restart`
+  (console / WebUI / `muze cli`) re-execs serve in place — or exits rc=100
+  and the daemon relaunches it.
+- `scripts/start.ps1` — the ONLY script that manages processes:
+  start (default) / `-Stop` / `-Restart`, with startup verification.
 
 ```powershell
 # first install (dependencies + config bootstrap + optional logon auto-start)
 powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -Extras rag-local -InstallTask
 
-# ONE-CLICK UPDATE: stop -> checkout latest tag -> uv sync -> start -> verify
+# UPDATE (one command; the running service keeps serving the old code)
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1
+# ...then whenever you like:  /restart   (console / WebUI / muze cli)
 
 # variants
-powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.56  # pin a tag
-powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull             # just restart
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Tag v0.1.0-alpha.57  # pin a tag
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Extras rag-local,rag-onnx
+powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull             # deps only
+powershell -ExecutionPolicy Bypass -File scripts\start.ps1 [-Stop | -Restart]     # lifecycle
 ```
 
 Updates can also ship as a **wheel** — for boxes without git access. Build
-with `uv build` on the dev machine, copy (or host) the wheel, and point the
-same script at it: stop → `uv pip install --reinstall` → start → verify:
+with `uv build` on the dev machine, copy (or host) the wheel, and point
+`update.ps1` at it: it installs the wheel instead of git pulling; the same
+`/restart` (or `start.ps1 -Restart`) flips the running service:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel C:\dist\copilot_muze-0.1.0a57-py3-none-any.whl
@@ -135,18 +146,24 @@ The wheel carries only the `muze` package: `scripts\` and the repo-level
 `skills\` stay from the original checkout (user skills can live in
 `data\skills`), and `config.yaml` / `data\` are never touched by either route.
 
-`update.ps1` prints the old → new version and tails the startup log so a
-failed update is visible immediately. Notes:
+Notes:
 
-- **Stop is a hard kill** (Windows cannot Ctrl-C a process attached to
-  another console). This is safe here: SQLite WAL plus per-conversation
-  roaming watermarks, and the `on_start` pull recovers every message missed
-  while down.
+- `uv sync` may run while the service is up. Pure-python updates are fine
+  (loaded `.py` files are not locked), but a **native dependency** update can
+  hit a locked DLL — then: `start.ps1 -Stop`, rerun `update.ps1`,
+  `start.ps1` (the script tells you the same).
+- `start.ps1 -Stop/-Restart` stops with a hard kill (Windows cannot Ctrl-C a
+  process attached to another console) — safe here: SQLite WAL plus
+  per-conversation roaming watermarks, and the `on_start` pull recovers every
+  message missed while down. For zero-downtime flips prefer `/restart`.
+- **Extras are remembered** in `data\.update-extras`: the first
+  `-Extras rag-local` sticks and later plain runs keep it (`uv sync` is exact
+  and would otherwise uninstall them). Pass `-Extras` again to change.
 - `git checkout --force` discards local edits to tracked files — a deployment
   checkout must not carry code changes. `config.yaml` and `data/` are
   untracked and never touched.
 - `-InstallTask` registers a logon scheduled task (`muze-autostart`) that
-  starts the service via `update.ps1 -SkipPull`; remove it with
+  starts the service via `start.ps1`; remove it with
   `Unregister-ScheduledTask -TaskName muze-autostart`.
 
 ## Commands (QQ / Web / CLI share one implementation)
