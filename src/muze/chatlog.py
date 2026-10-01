@@ -20,11 +20,12 @@ CHAT_LOGGER = "muze.chat"
 
 
 class ConsoleStreamHandler(logging.StreamHandler):
-    """stdout handler that cooperates with the embedded console prompt.
+    """stdout handler that cooperates with the embedded console.
 
-    When a fallback-mode ``muze> `` prompt is sitting on the current line,
-    clear that line back to column 0 before emitting the log record, then
-    redraw a bare prompt so the terminal stays usable.
+    The console pins the input line to the LAST terminal line; every log
+    record must be inserted ABOVE it (wipe input line -> emit -> redraw
+    prompt + half-typed buffer). ``console.write_above`` does exactly that
+    and is a no-op coordination when no input line is active.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -32,13 +33,7 @@ class ConsoleStreamHandler(logging.StreamHandler):
             from muze import console as _console
 
             msg = self.format(record)
-            with _console.io_lock():
-                if _console.prompt_shown():
-                    self.stream.write(_console.clear_line_seq())
-                self.stream.write(msg + self.terminator)
-                if _console.prompt_shown():
-                    self.stream.write(_console.current_prompt())
-                self.flush()
+            _console.write_above(msg + self.terminator)
         except RecursionError:
             raise
         except Exception:
