@@ -7,7 +7,7 @@ license = { text = "MIT" }
 authors = [{ name = "muze" }]
 # Pre-release is bumped per feature commit; build metadata (git sha, build time)
 # is appended at runtime by muze.version.get_version().
-version = "0.1.0a67"
+version = "0.1.0a68"
 dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
@@ -34,6 +34,17 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+
+# Windows torch comes from the PyTorch CUDA index (the PyPI default is a
+# CPU-only build — GPU embedding never engages with it). The +cu130 wheels
+# still run fine on CPU-only machines, they are just a bigger download.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
 
 [build-system]
 requires = ["hatchling"]

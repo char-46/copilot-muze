@@ -12,6 +12,11 @@ Python 3.11+, dependencies managed with `uv`.
 
 - Windows. Shell is PowerShell; interpreter: `A:\copilot-muze\.venv\Scripts\python.exe`;
   package manager: `uv` (`uv sync`, `uv lock`, `uv build`).
+- torch on Windows comes from the PyTorch CUDA index (`tool.uv.sources` in
+  pyproject.toml, currently cu130) — the PyPI default is CPU-only and GPU
+  embedding silently never engages. Swapping torch requires the service to
+  be STOPPED first (a running instance locks `.venv/Scripts/muze.exe` and
+  `uv sync` dies with os error 5).
 - `rg` is NOT available — use the Grep tool, not `rg`.
 - `config.yaml` is gitignored and holds REAL secrets (LLM keys, controller QQ).
   Never commit, paste or log its values.

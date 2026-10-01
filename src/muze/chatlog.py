@@ -64,6 +64,11 @@ def setup_logging(log_cfg: LogConfig, storage_cfg: StorageConfig) -> Path:
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("aiosqlite").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
+    # model loads / hub checks spray DEBUG per HTTP hop (httpcore -> httpx ->
+    # urllib3) and sentence-transformers logs every module init; at DEBUG
+    # level they bury the actual chat log in the console
+    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "sentence_transformers"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
     return log_path
 
 
