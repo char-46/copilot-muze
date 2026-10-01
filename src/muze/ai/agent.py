@@ -674,9 +674,26 @@ class Agent:
         """Continue a session: a suspended/errored turn resumes from its saved
         messages; a finished session takes a new user message as a new turn."""
         added: dict | None = None
+        loop = [dict(m) for m in session.messages]
+        if not loop:
+            # The turn died before its first user entry was persisted
+            # (sessions persist an EMPTY list while the first model call is
+            # in flight). Rebuild from the prompt — a system-only message
+            # list is rejected by the API ("messages 参数非法").
+            loop = [{"role": "user", "content": session.prompt}]
+        elif loop[-1].get("role") == "assistant" and loop[-1].get("tool_calls"):
+            # Stopped right after an assistant tool-call message: the API
+            # requires every tool_call to be answered before the next model
+            # call, so synthesize an "[interrupted]" result for each.
+            for call in loop[-1]["tool_calls"]:
+                loop.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": "[因进程重启中断，工具未执行]",
+                })
         if extra_text is not None:
             added = {"role": "user", "content": extra_text}
-            session.messages = [*session.messages, added]
+            loop.append(added)
             start = 1
             self.chatlog.agent(
                 ctx.source, ctx.user_label or ctx.chat_key, "in", extra_text
@@ -684,6 +701,7 @@ class Agent:
         else:
             # resume from where it stopped, granting a fresh round budget
             start = 1
+        session.messages = loop
         session.status = "running"
         await self._persist(session)
         messages: list[dict] = [

@@ -199,3 +199,67 @@ async def test_resume_interrupted_picks_crash_and_recent_error(repo):
     # no LLM configured -> nothing happens
     agent.llm = None
     assert await agent.resume_interrupted() == 0
+
+
+# --------------------------------------- resume message-list sanitization
+async def test_resume_rebuilds_empty_message_list(repo):
+    """A turn that crashed during its FIRST model call persisted an empty
+    message list; resuming must rebuild [system, user(prompt)] instead of
+    sending a system-only list (API 400 'messages 参数非法')."""
+    from muze.ai.sessions import Session
+
+    agent, _ = make_agent(repo)
+    s = Session(id="zz1", chat_key="k", prompt="天阳的xp是什么")
+    s.status = "suspend"
+    s.messages = []
+    agent.sessions.add(s)
+
+    captured = {}
+
+    async def fake_chat(messages, ctx, session):
+        captured["messages"] = [dict(m) for m in messages]
+        return {"content": "答了"}
+
+    agent._chat = fake_chat
+    ctx = ControlContext(source="cli", chat_key="k", scene="", peer_id=0)
+    outcome = await agent._resume_inner(s, ctx, None)
+    assert not outcome.is_error
+    roles = [m["role"] for m in captured["messages"]]
+    assert roles == ["system", "user"]
+    assert captured["messages"][1]["content"] == "天阳的xp是什么"
+    assert s.status == "done"  # completed after the rebuild
+
+
+async def test_resume_answers_dangling_tool_calls(repo):
+    """A persisted list ending on an assistant tool_calls message must get
+    synthetic tool results before re-sending (API requires every call
+    answered)."""
+    from muze.ai.sessions import Session
+
+    agent, _ = make_agent(repo)
+    s = Session(id="zz2", chat_key="k", prompt="查一下")
+    s.status = "suspend"
+    s.messages = [
+        {"role": "user", "content": "查一下"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "function": {"name": "search", "arguments": "{}"}},
+            {"id": "t2", "function": {"name": "profile_get", "arguments": "{}"}},
+        ]},
+    ]
+    agent.sessions.add(s)
+
+    captured = {}
+
+    async def fake_chat(messages, ctx, session):
+        captured["messages"] = [dict(m) for m in messages]
+        return {"content": "查完了"}
+
+    agent._chat = fake_chat
+    ctx = ControlContext(source="cli", chat_key="k", scene="", peer_id=0)
+    outcome = await agent._resume_inner(s, ctx, None)
+    assert not outcome.is_error
+    msgs = captured["messages"]
+    tail = msgs[-2:]
+    assert [m["role"] for m in tail] == ["tool", "tool"]
+    assert {m["tool_call_id"] for m in tail} == {"t1", "t2"}
+    assert all("重启" in m["content"] for m in tail)
