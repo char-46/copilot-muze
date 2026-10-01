@@ -869,10 +869,15 @@ class Repository:
             return {r["kind"]: int(r["n"]) for r in await cur.fetchall()}
 
     async def rag_chat_progress(self, limit: int = 8) -> dict:
-        """Chat-indexing progress: per-conversation cursor vs newest archived
-        seq (recent conversations), plus totals across ALL conversations.
-        The cursor lags the archive between passes; cursor==last_seq means
-        that conversation is fully windowed."""
+        """Chat-indexing progress.
+
+        Seq cursors are POSITIONS, not counts: a conversation holding a
+        sparse slice of its seq space (backfill pulled recent pages only)
+        jumps its cursor by millions while covering few messages. So the
+        authoritative metric is message COVERAGE — archived messages whose
+        seq is <= the conversation's cursor (i.e. already folded into
+        windows); the per-conversation cursor/last_seq lines are just a
+        catch-up view against the newest known seq."""
         async with self.conn.execute(
             "SELECT c.scene, c.peer_id, c.last_seq, c.last_active_at, "
             " CAST(COALESCE((SELECT value FROM rag_state "
@@ -883,17 +888,21 @@ class Repository:
         ) as cur:
             convs = [dict(r) for r in await cur.fetchall()]
         async with self.conn.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(c.last_seq), 0) AS tseq, "
-            " COALESCE(SUM(CAST(COALESCE((SELECT value FROM rag_state "
-            "  WHERE key='chat:'||c.scene||':'||c.peer_id), '0') AS INTEGER)), 0) AS tcur "
-            "FROM conversations c WHERE c.last_seq > 0"
+            "SELECT COUNT(*) AS covered, (SELECT COUNT(*) FROM messages) AS total "
+            "FROM messages m WHERE m.message_seq <= CAST(COALESCE("
+            " (SELECT value FROM rag_state "
+            "  WHERE key='chat:'||m.scene||':'||m.peer_id), '0') AS INTEGER)"
         ) as cur:
-            agg = dict(await cur.fetchone())
+            cov = dict(await cur.fetchone())
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM conversations WHERE last_seq > 0"
+        ) as cur:
+            n = int((await cur.fetchone())[0])
         return {
             "conversations": convs,
-            "total_conversations": int(agg["n"] or 0),
-            "total_seq": int(agg["tseq"] or 0),
-            "total_cursor": int(agg["tcur"] or 0),
+            "total_conversations": n,
+            "messages_covered": int(cov["covered"] or 0),
+            "messages_total": int(cov["total"] or 0),
         }
 
     async def list_rag_docs(self, kind: str | None = None, limit: int = 1000) -> list[dict]:

@@ -328,7 +328,8 @@ async def test_rag_chat_progress(repo):
     await repo.rag_set_state("chat:group:7", "2")
     prog = await repo.rag_chat_progress()
     assert prog["total_conversations"] == 1
-    assert prog["total_seq"] == 5 and prog["total_cursor"] == 2
+    # true coverage: messages with seq <= cursor (2 of 5), NOT seq arithmetic
+    assert prog["messages_covered"] == 2 and prog["messages_total"] == 5
     conv = prog["conversations"][0]
     assert conv["scene"] == "group" and conv["peer_id"] == 7
     assert conv["cursor"] == 2 and conv["last_seq"] == 5

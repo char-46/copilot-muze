@@ -896,17 +896,20 @@ class ControlService:
                 prog = await self.repo.rag_chat_progress(limit=8)
             except Exception:
                 prog = None
-            if prog and prog["total_seq"]:
-                pct = min(100, round(prog["total_cursor"] / max(1, prog["total_seq"]) * 100))
+            if prog and prog["messages_total"]:
+                pct = min(
+                    100, round(prog["messages_covered"] / prog["messages_total"] * 100)
+                )
                 lines.append(
-                    f"聊天索引进度: {pct}%（{prog['total_conversations']}个会话，"
-                    f"游标 {prog['total_cursor']}/{prog['total_seq']} 条消息）"
+                    f"聊天索引: 已窗口化 {prog['messages_covered']}/"
+                    f"{prog['messages_total']} 条消息（{pct}%）· "
+                    f"{prog['total_conversations']}个会话"
                 )
                 for c in prog["conversations"]:
                     if c["cursor"] < c["last_seq"]:
                         lines.append(
                             f"  追赶中 {conv_id(c['scene'], c['peer_id'])}: "
-                            f"{c['cursor']}/{c['last_seq']}"
+                            f"seq {c['cursor']}/{c['last_seq']}"
                         )
             elif prog:
                 lines.append(f"聊天索引: {prog['total_conversations']}个会话已追平")
