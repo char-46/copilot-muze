@@ -31,19 +31,26 @@ DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请�
 
 要求：
 
+# 排序原则（最重要）
+报告必须有倾向性：按轻重缓急排序，最要紧的放最前面——
+- 紧急：在等被控号回应、约定了临近时限、涉及承诺/金钱/风险/冲突；
+- 重要：关键结论、新信息、约定达成的过程、关系或立场变化；
+- 一般：普通闲聊、无关紧要的插曲。
+紧急事项必须具体（谁、什么事、什么时限），一般内容可归并带过。
+
 # 格式
-## 今日概览
-（2-3 句：这一天整体在聊什么、最重要的事）
-## 各会话要点
-（每个会话一小节 `### <会话>`：谁说了什么关键信息、结论/约定/分歧，每节不超过 5 条）
-## 待办与需回复
-（明确列出哪条消息在等被控号回应、有哪些约定的时间点）
+## 概览
+（当天整体在聊什么、最重要的事）
+## 需要处理
+（按紧急程度排列：等回复的、有时限的、承诺/风险类；每条注明 会话/seq；没有则写"无"）
+## 会话要点
+（每个会话一小节 `### <会话>`，同样按重要性排序：关键信息、结论/约定/分歧；每节只保留值得保留的信息，不凑条数）
 ## 值得记住的
-（人名-关系、偏好、账号、截止日等沉淀信息）
+（人名-关系、偏好、账号、截止日等沉淀信息；没有则写"无"）
 
 # 原则
 - 只依据给出的档案，不要编造；引用关键消息时带 会话/seq。
-- 语气克制、信息密度高，总长控制在 600 字内。
+- 语气克制、信息密度高：完整性优先于长度，总长控制在 1000 字内。
 - 如果当天几乎没有消息，直接说明"当日无显著活动"并列出仅有的会话。
 
 # 档案
@@ -64,7 +71,7 @@ MEMORY_PROMPT = """你是个人 QQ copilot 的"记忆提炼"模块。基于做�
 {report}
 
 # 输出（严格 JSON 数组，不要其他文字；最多 {maxn} 条）
-[{{"action":"add","subject":"...","kind":"identity|preference|relation|fact","content":"一句话中文事实"}}, ...]"""
+[{{"action":"add","subject":"...","kind":"identity|preference|relation|fact","content":"简明完整的中文事实（时间/对象/范围等要素齐全，不刻意压缩成一句话）"}}, ...]"""
 
 ROLLUP_PROMPT = """你是个人 QQ copilot 的"层级做梦"模块。以下是 {scope}（{key}）的下一级做梦报告，请压缩提炼成一份{scope}报告，供长期上下文压缩使用。
 
@@ -73,7 +80,7 @@ ROLLUP_PROMPT = """你是个人 QQ copilot 的"层级做梦"模块。以下是 {
 
 # 要求
 ## 结构
-- 概览：这段时间的主线是什么（2-3 句）
+- 概览：这段时间的主线、关键结论与当前状态
 - 主题脉络：按话题归并（不是按天罗列），每个话题：涉及谁、来龙去脉、当前状态
 - 待办跟进：上期提出的事项哪些已完成/仍悬置
 - 值得记住的：新沉淀的人物关系/偏好/关键节点
@@ -124,6 +131,66 @@ def day_range(date: str) -> tuple[int, int]:
 
 def yesterday_date() -> str:
     return local_date((datetime.now().astimezone() - timedelta(days=1)).timestamp())
+
+
+def resolve_morning_targets(cfg: MuzeConfig) -> list[tuple[str, int]]:
+    """Where the morning briefing goes.
+
+    Explicit ``digest.morning_targets`` entries win: "friend/123",
+    "group/456" or a bare number (treated as a friend). Empty list falls
+    back to the default audience — every controller privately plus the
+    control group when one is configured. Invalid entries are skipped
+    with a warning; the result is deduplicated in order.
+    """
+    raw: list[str] = [str(x) for x in (cfg.digest.morning_targets or []) if str(x).strip()]
+    if not raw:
+        for u in cfg.control.controller:
+            raw.append(f"friend/{u}")
+        if cfg.control.control_group:
+            raw.append(f"group/{cfg.control.control_group}")
+    out: list[tuple[str, int]] = []
+    for ent in raw:
+        s = ent.strip()
+        if "/" in s:
+            scene, _, num = s.partition("/")
+            scene = scene.strip().lower()
+            num = num.strip()
+        else:
+            scene, num = "friend", s
+        if scene not in ("friend", "group") or not num.isdigit() or int(num) <= 0:
+            log.warning("morning target ignored (expect friend/123 or group/456): %r", ent)
+            continue
+        pair = (scene, int(num))
+        if pair not in out:  # dedupe, keep order
+            out.append(pair)
+    return out
+
+
+async def morning_report(
+    repo: Repository,
+    llm,
+    cfg: MuzeConfig,
+    chatlog: ChatLog,
+    *,
+    adapter=None,
+) -> str:
+    """The dawn briefing body: yesterday's digest, catching it up on the
+    spot when the nightly run failed (best-effort), ready for a direct
+    push to the morning audience."""
+    date = yesterday_date()
+    row = await repo.get_digest(date)
+    if row is not None:
+        report = row["report"]
+    elif llm is None or not llm.configured:
+        log.warning("morning briefing: %s has no digest and LLM is not configured", date)
+        return f"（{date} 无做梦报告：昨晚生成失败且 LLM 未配置，晨报跳过；/dream {date} 可手动补做）"
+    else:
+        try:
+            report = await run_digest(repo, llm, cfg, chatlog, date=date, adapter=adapter)
+        except Exception as e:
+            log.exception("morning catch-up for %s failed", date)
+            return f"（{date} 无做梦报告且晨间补做失败: {e}；/dream {date} 可手动补做）"
+    return f"📰 {date} 昨日总结\n\n{report}"
 
 
 def next_run_for_hhmm(hhmm: str) -> int:

@@ -255,6 +255,7 @@ class App:
         self.runtime.scheduler = self.scheduler
         await self.scheduler.start()
         await self.scheduler.ensure_daily_digest()
+        await self.scheduler.ensure_morning_digest()
 
         self.reloader = Reloader(
             config_path=self.config_path,

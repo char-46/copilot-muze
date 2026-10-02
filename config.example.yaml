@@ -115,6 +115,12 @@ digest:
   top_conversations: 6      # busiest conversations per day
   messages_per_conversation: 40
   deliver: true             # send the report to the control conversation
+  # morning briefing: at dawn push yesterday's digest to the admins.
+  # Targets default to every controller (private) + the control group;
+  # override with explicit entries ("friend/123" | "group/456").
+  morning_enabled: true
+  morning_at: "06:00"
+  # morning_targets: ["friend/10000", "group/20002"]
   extract_memories: true    # second LLM pass: distill identity/preferences
   max_memories_per_night: 8
   weekly_enabled: true      # roll up completed weeks (2026-W40 style reports)

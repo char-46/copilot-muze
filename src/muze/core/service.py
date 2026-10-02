@@ -443,6 +443,28 @@ class ControlService:
             return "friend", self.cfg.control.controller[0]
         return None
 
+    def morning_targets(self) -> list[tuple[str, int]]:
+        """The dawn-briefing audience (see digest.resolve_morning_targets)."""
+        from muze.digest import resolve_morning_targets
+
+        return resolve_morning_targets(self.cfg)
+
+    async def morning_broadcast(self, text: str) -> tuple[int, int]:
+        """Push the dawn briefing to every target (admins privately + admin
+        groups). Per-target failures don't abort the rest."""
+        sent = failed = 0
+        for scene, peer in self.morning_targets():
+            try:
+                await self.send_as_bot(scene, peer, [out_text(text[:2900])], text[:80])
+                sent += 1
+            except ProtocolError as e:
+                failed += 1
+                log.warning("morning broadcast to %s failed: %s", conv_id(scene, peer), e)
+            except Exception:
+                failed += 1
+                log.exception("morning broadcast to %s crashed", conv_id(scene, peer))
+        return sent, failed
+
     async def notify_controller(self, text: str) -> None:
         target = self.control_conversation()
         if target is None:
@@ -578,11 +600,23 @@ class ControlService:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text[:3500])
 
-    @slash("dream", "/dream [night|now|日|周|月|list]", "层级做梦：night=补链(内置) now=今天 2026-W40=周 2026-09=月", write=True)
+    @slash("dream", "/dream [night|morning|now|日|周|月|list]", "层级做梦：night=补链(内置) morning=晨报(内置 06:00 推送) now=今天 2026-W40=周 2026-09=月", write=True)
     async def cmd_dream(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
 
         sub = (args[0].lower() if args else "").strip()
+
+        if sub == "morning":
+            from muze.digest import morning_report
+
+            llm = self.agent.llm if self.agent is not None else None
+            try:
+                text = await morning_report(
+                    self.repo, llm, self.cfg, self.chatlog, adapter=self.adapter,
+                )
+            except Exception as e:
+                return CommandOutcome.err(f"晨报生成失败: {e}")
+            return CommandOutcome(text[:3200])
 
         if sub == "list":
             rows = await self.repo.list_digests(limit=50)
@@ -975,6 +1009,14 @@ class ControlService:
             f"context: {'; '.join(bg) if bg else '无做梦背景'}"
             + (f" (inject={'on' if self.cfg.digest.inject_context else 'off'})" if bg else ""),
         ]
+        if self.cfg.digest.enabled and self.cfg.digest.morning_enabled:
+            tg = self.morning_targets()
+            lines.append(
+                f"morning: {self.cfg.digest.morning_at} -> {len(tg)} 目标"
+                + ("（默认：管理员+管理群）" if not self.cfg.digest.morning_targets and tg else "（配置指定）")
+                if tg
+                else f"morning: {self.cfg.digest.morning_at} -> 无推送目标"
+            )
         if rag_line:
             lines.append(rag_line)
         lines += [

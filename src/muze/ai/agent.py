@@ -872,7 +872,8 @@ class Agent:
                 for m in medias:
                     if m["kind"] == "image" and m["status"] == "done":
                         desc = await self.llm.vision_describe(
-                            m["file_path"], "一两句话概括这张图片"
+                            m["file_path"],
+                            "概括这张图片：出现的对象/人物、图中文字、与聊天相关的关键细节",
                         )
                         image_notes.append(f"seq={r['message_seq']} 图片: {desc}")
                         break

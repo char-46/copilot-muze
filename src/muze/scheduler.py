@@ -114,6 +114,7 @@ class Scheduler:
 
     # ------------------------------------------------------------- builtin
     DIGEST_NOTE = "builtin:daily-digest"
+    MORNING_NOTE = "builtin:morning-digest"
 
     async def ensure_daily_digest(self) -> int | None:
         """Idempotently create the nightly digest ("dream") task."""
@@ -144,6 +145,40 @@ class Scheduler:
         log.info("daily digest task #%s created, next run per cfg.digest.at", task_id)
         return task_id
 
+    async def ensure_morning_digest(self) -> int | None:
+        """Idempotently create the dawn briefing task. Delivery fans out to
+        the morning audience (digest.morning_targets, or all controllers +
+        the control group) instead of the task's single control row."""
+        cfg = self.service.cfg
+        if not (cfg.digest.enabled and cfg.digest.morning_enabled):
+            return None
+        rows = await self.repo.list_tasks()
+        if any(r.get("note") == self.MORNING_NOTE and r["status"] == "active" for r in rows):
+            return None
+        from muze.digest import next_run_for_hhmm, resolve_morning_targets
+
+        if not resolve_morning_targets(cfg):
+            log.warning("morning briefing task not created: no delivery target")
+            return None
+        next_at = next_run_for_hhmm(cfg.digest.morning_at)
+        ctx = ControlContext(source="system", chat_key="system", scene="", peer_id=0)
+        scene, peer = self.resolve_delivery(ctx)
+        task_id = await self.repo.create_task(
+            "interval",
+            "/dream morning",
+            scene or "friend",
+            peer,
+            next_at,
+            86400,
+            "builtin",
+            self.MORNING_NOTE,
+        )
+        log.info(
+            "morning briefing task #%s created (at %s, fan-out delivery)",
+            task_id, cfg.digest.morning_at,
+        )
+        return task_id
+
     # ------------------------------------------------------------- execute
     async def execute(self, row: dict) -> None:
         task_id = row["id"]
@@ -159,12 +194,22 @@ class Scheduler:
         try:
             outcome = await self.service.execute(row["prompt"], ctx)
             result_text = outcome.text or "(无输出)"
-            skip_deliver = (
-                row.get("note") == self.DIGEST_NOTE
-                and not self.service.cfg.digest.deliver
-            )
-            if not skip_deliver:
-                await self.service.deliver(ctx, outcome)
+            if row.get("note") == self.MORNING_NOTE:
+                # dawn briefing: fan out to the whole morning audience
+                # (admins + admin groups) instead of the single control row
+                sent, failed = await self.service.morning_broadcast(result_text)
+                log.info(
+                    "task #%s morning briefing delivered: %s ok, %s failed",
+                    task_id, sent, failed,
+                )
+                result_text = f"晨报已推送 {sent} 个目标" + (f"（{failed} 个失败）" if failed else "")
+            else:
+                skip_deliver = (
+                    row.get("note") == self.DIGEST_NOTE
+                    and not self.service.cfg.digest.deliver
+                )
+                if not skip_deliver:
+                    await self.service.deliver(ctx, outcome)
         except Exception as e:
             log.exception("task #%s execution failed", task_id)
             await self.repo.finish_task(task_id, "error", f"执行失败: {e}")

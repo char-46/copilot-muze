@@ -906,6 +906,9 @@ const CFG_FIELDS = [
   { group: "做梦 (digest)", items: [
     { path: "digest.enabled", label: "启用", type: "checkbox" },
     { path: "digest.at", label: "每日时间 HH:MM", type: "text" },
+    { path: "digest.morning_enabled", label: "晨报推送", type: "checkbox" },
+    { path: "digest.morning_at", label: "晨报时间 HH:MM", type: "text" },
+    { path: "digest.morning_targets", label: "晨报目标（逗号分隔，空=全部管理员+管理群）", type: "text" },
     { path: "digest.inject_context", label: "注入处理上下文", type: "checkbox" },
   ]},
 ];

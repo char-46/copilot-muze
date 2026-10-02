@@ -239,6 +239,12 @@ class DigestConfig(BaseModel):
     top_conversations: int = 6
     messages_per_conversation: int = 40
     deliver: bool = True
+    # --- morning briefing: push yesterday's digest to the admins at dawn ---
+    morning_enabled: bool = True
+    morning_at: str = "06:00"  # local HH:MM
+    # explicit targets ("friend/123" | "group/456" | bare number = friend);
+    # empty = every controller privately + the control group when configured
+    morning_targets: list[str] = Field(default_factory=list)
     extract_memories: bool = True
     max_memories_per_night: int = 8
     # hierarchical rollups for long-term context compression

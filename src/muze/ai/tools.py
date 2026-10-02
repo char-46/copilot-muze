@@ -345,7 +345,7 @@ SPEC = [
                 "type": "object",
                 "properties": {
                     "subject": {"type": "string"},
-                    "content": {"type": "string", "description": "一句话中文事实"},
+                    "content": {"type": "string", "description": "简明完整的中文事实（时间/对象/范围等要素齐全，不刻意压缩成一句话）"},
                     "kind": {"type": "string", "enum": ["identity", "preference", "relation", "fact"]},
                 },
                 "required": ["subject", "content"],
