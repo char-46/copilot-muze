@@ -188,6 +188,25 @@ async def test_digest_prior_walks_past_missing_days(repo):
     assert prompt.count("旧") <= 1601
 
 
+async def test_digest_default_prior_is_three_days(repo):
+    """Default prior_days=3: the last three reports are all carried in."""
+    llm = FakeLLM()
+    now = datetime.now().astimezone()
+    date = now.strftime("%Y-%m-%d")
+    for back in (1, 2, 3, 4):  # day-4 must NOT appear under the default
+        d = (now - timedelta(days=back)).strftime("%Y-%m-%d")
+        await repo.upsert_digest(d, f"第{back}天前的报告", 24.0, {})
+    await repo.upsert_message(
+        mk_msg("friend", 1, 1, local_midnight(0) + 100, "今天的消息"),
+        "今天的消息", "event",
+    )
+    await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date)
+    prompt = llm.calls[-1]
+    for back in (1, 2, 3):
+        assert f"第{back}天前的报告" in prompt
+    assert "第4天前的报告" not in prompt
+
+
 async def test_dream_night_catches_up_multiple_days(repo):
     llm = FakeLLM()
     cfg = MuzeConfig()

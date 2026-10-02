@@ -240,8 +240,9 @@ class DigestConfig(BaseModel):
     messages_per_conversation: int = 0  # 0 = unlimited (budget-sampled); N = per-conv cap
     transcript_chars: int = 48000  # global transcript budget fed to the LLM
     # continuity: feed the previous N day reports into each digest so the
-    # LLM follows up (pending items resolved? ongoing threads' progress)
-    prior_days: int = 1  # 0 = summarize each day in isolation
+    # LLM follows up (pending items resolved? ongoing threads' progress);
+    # 3 covers a single dropped-restatement in the chain and multi-day threads
+    prior_days: int = 3  # 0 = summarize each day in isolation
     prior_chars: int = 1600  # per prior report
     deliver: bool = True
     # --- morning briefing: push yesterday's digest to the admins at dawn ---
