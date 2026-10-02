@@ -5,6 +5,11 @@ Rows in each account's `media` table track per-message provenance and
 lifecycle (pending -> downloading -> done/failed); the bytes live in
 <data_dir>/blobs/<kind>/<sha[:2]>/<sha><ext>, deduped across messages,
 conversations AND accounts.
+
+Hook-based protocol sides (LLBot hooking the local QQ client) may answer
+the url APIs with the client's OWN cache file; those are adopted locally
+(hardlink, else copy) instead of downloaded — no expiring rkey, no network,
+and the bytes survive the client's cache cleanup.
 """
 
 from __future__ import annotations
@@ -12,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
+import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from muze.provider.base import ProtocolAdapter, ProtocolError
 from muze.provider.milky.models import (
@@ -59,6 +66,30 @@ def to_file_uri(path: Path | str) -> str:
     """Absolute filesystem path -> file:// URI (Windows-safe, three slashes)."""
     p = Path(path).resolve().as_posix()
     return f"file:///{p.lstrip('/')}"
+
+
+def _local_path(url: str) -> Path | None:
+    """Best-effort: hook-based protocol sides (LLBot & friends, running
+    inside the QQ client on this machine) sometimes answer the url APIs with
+    the client's OWN cache file (a local path / file:// URI) instead of an
+    expiring rkey HTTPS URL. Recognize exactly those; anything else is None
+    and the normal HTTP path applies."""
+    u = (url or "").strip()
+    if not u:
+        return None
+    if u.startswith("file://"):
+        p = urlparse(u)
+        if p.netloc not in ("", "localhost"):
+            return None  # UNC / remote host: skip
+        path = unquote(p.path or "")
+        if re.match(r"^/[A-Za-z]:[/\\]", path):
+            path = path[1:]  # file:///C:/... -> C:/...
+        return Path(path)
+    if u.startswith(("http://", "https://", "ws://", "wss://", "data:", "blob:")):
+        return None
+    if re.match(r"^[A-Za-z]:[\\/]", u) or u.startswith("\\\\"):
+        return Path(u)  # bare absolute Windows path / UNC
+    return None
 
 
 class MediaStore:
@@ -311,7 +342,13 @@ class MediaStore:
 
     async def _fetch_into_blob(self, url: str, row: dict) -> tuple[str, int, Path]:
         """Stream the url into a tmp file while hashing, then move it to its
-        content-addressed location (dedup: same bytes -> same path)."""
+        content-addressed location (dedup: same bytes -> same path).
+
+        Hook protocol sides may hand us the QQ client's own cache file —
+        adopt that locally instead of downloading (see _link_into_blob)."""
+        local = _local_path(url)
+        if local is not None:
+            return await self._link_into_blob(local, row)
         sess = await self.adapter.http.session()  # type: ignore[attr-defined]
         tmp = self.blobs.tmp_path()
         hasher = hashlib.sha256()
@@ -335,6 +372,54 @@ class MediaStore:
             log.info("MEDIA blob-hit %s (disk copy kept)", dest.name)
         else:
             tmp.replace(dest)
+        return content_hash, total, dest
+
+    async def _link_into_blob(self, src: Path, row: dict) -> tuple[str, int, Path]:
+        """Adopt a hook-side local file (the QQ client's own cache blob) into
+        the blob store: HARDLINK when the filesystem allows it — zero bytes
+        copied, and the content survives the client's cache eviction (a
+        hardlink keeps the data alive; deleting QQ's name doesn't free it).
+        Cross-volume / link-denied -> plain copy. We never keep a bare
+        pointer into the client's cache: it would break silently on cleanup."""
+        if not src.is_file():
+            raise RuntimeError(f"local source missing: {src}")
+
+        def _read() -> tuple[str, int, bytes]:
+            hasher = hashlib.sha256()
+            total = 0
+            head = b""
+            with open(src, "rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    if not head:
+                        head = chunk[:512]
+                    hasher.update(chunk)
+                    total += len(chunk)
+            return hasher.hexdigest(), total, head
+
+        content_hash, total, head = await asyncio.to_thread(_read)
+        dest = self.blobs.blob_path(row["kind"], content_hash, self._ext_for(row, "", head))
+        if dest.exists():
+            log.info("MEDIA blob-hit %s (disk copy kept)", dest.name)
+            return content_hash, total, dest
+
+        def _place() -> None:
+            try:
+                os.link(src, dest)
+                log.info(
+                    "MEDIA qq-cache-link %s -> %s (client blob adopted, no download)",
+                    src.name, dest.name,
+                )
+            except OSError:
+                shutil.copyfile(src, dest)
+                log.info(
+                    "MEDIA qq-cache-copy %s -> %s (hardlink unavailable)",
+                    src.name, dest.name,
+                )
+
+        await asyncio.to_thread(_place)
         return content_hash, total, dest
 
     # --------------------------------------------------------------- retry
