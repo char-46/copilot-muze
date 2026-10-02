@@ -85,7 +85,11 @@ def run_cli(argv: list[str]) -> int:
             runtime.endpoint = spec.endpoint
             chatlog = ChatLog()
             blobs = BlobStore(cfg.storage.data_dir / "blobs")
-            media = MediaStore(blobs, adapter, repo, transcode_silk=cfg.ingest.media_transcode_silk)
+            media = MediaStore(
+                blobs, adapter, repo,
+                transcode_silk=cfg.ingest.media_transcode_silk,
+                qq_cache_dir=cfg.ingest.qq_cache_dir,
+            )
             service = ControlService(cfg, adapter, repo, chatlog, runtime)
             llm = LLMClient(cfg.llm)
             service.agent = Agent(service, repo, llm, chatlog, cfg.llm.agent_max_steps)

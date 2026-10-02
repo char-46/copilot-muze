@@ -2,6 +2,7 @@
 
 Layout:
     <data_dir>/blobs/<kind>/<sha[:2]>/<sha256><ext>   deduped by content
+    <data_dir>/blobs/names/<original-filename>        hardlink -> content blob
     <data_dir>/blobs/index.db                          key -> blob mapping
     <data_dir>/blobs/tmp/                              in-flight downloads
 
@@ -19,6 +20,8 @@ image on two accounts — is stored (and fetched) exactly once.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +29,18 @@ from pathlib import Path
 import aiosqlite
 
 log = logging.getLogger("muze.blobs")
+
+_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def safe_name(name: str, fallback: str = "file") -> str:
+    """Sanitize an arbitrary original filename for the names/ directory
+    (CJK and unsafe chars collapse to underscores; leading/trailing dots
+    and spaces are dropped, but NOT underscores — an all-CJK stem must
+    keep its underscore so the extension survives)."""
+    n = _SAFE_RE.sub("_", (name or "").strip())[:80]
+    n = n.strip(" .")
+    return n or fallback
 
 _IDX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS dedup (
@@ -94,6 +109,34 @@ class BlobStore:
         d = self.root / kind / content_hash[:2]
         d.mkdir(parents=True, exist_ok=True)
         return d / (content_hash + ext)
+
+    def named_link(self, blob: Path, original: str) -> Path | None:
+        """A human-readable hardlink `names/<original filename>` pointing at
+        the content blob (same bytes, two names, one disk copy). A name
+        collision with DIFFERENT content gets a short sha suffix; same
+        content is a no-op. Returns None when no usable name / link failed."""
+        if not (original or "").strip():
+            return None
+        name = safe_name(original)
+        if not name or name in (".", ".."):
+            return None
+        d = self.root / "names"
+        target = d / name
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if target.samefile(blob):
+                    return target
+                stem = Path(name).stem
+                suffix = Path(name).suffix
+                target = d / f"{stem}-{blob.stem[:8]}{suffix}"
+                if target.exists():
+                    return target if target.samefile(blob) else None
+            os.link(blob, target)
+            return target
+        except OSError as e:
+            log.debug("named_link %s failed: %s", name, e)
+            return None
 
     def tmp_path(self) -> Path:
         self.root.joinpath("tmp").mkdir(parents=True, exist_ok=True)

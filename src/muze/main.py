@@ -202,6 +202,7 @@ class App:
         self.media = MediaStore(
             self.blobstore, self.adapter, self.repo,
             transcode_silk=cfg.ingest.media_transcode_silk,
+            qq_cache_dir=cfg.ingest.qq_cache_dir,
         )
         self.pipeline = IngestPipeline(
             self.adapter, self.repo, self.media, cfg, self.chatlog, uin

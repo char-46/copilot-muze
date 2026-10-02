@@ -117,3 +117,108 @@ async def test_download_row_full_path_with_local_url(tmp_path):
 
     assert _P(out["file_path"]).read_bytes() == JPEG
     await conn.close()
+
+
+# ------------------------------------------------- named links + qq cache
+def test_named_link_hardlink_and_collision(tmp_path):
+    from muze.store.blobs import safe_name
+
+    assert safe_name("报表 2026.xlsx", "f") != ""
+    blobs = BlobStore(tmp_path / "b")
+    a = tmp_path / "a.bin"
+    a.write_bytes(b"AAA")
+    n1 = blobs.named_link(a, "Report Final!.docx")
+    assert n1 is not None and n1.name == "Report_Final_.docx"
+    import os
+
+    assert os.path.samefile(a, n1)  # hardlink -> blob
+    assert blobs.named_link(a, "Report Final!.docx") == n1  # idempotent
+    b = tmp_path / "b.bin"
+    b.write_bytes(b"BBB-different")
+    n2 = blobs.named_link(b, "Report Final!.docx")  # collision -> sha suffix
+    assert n2 is not None and n2 != n1 and os.path.samefile(b, n2)
+    assert blobs.named_link(b, "") is None  # no name -> skip
+
+
+async def test_file_hash_adopts_from_qq_cache_no_network(tmp_path):
+    """File rows carry QQ's md5: a matching client-cache file is adopted
+    without any url resolution (adapter would fail if asked)."""
+    import hashlib
+
+    class NoUrlAdapter(Recorder):
+        async def get_group_file_url(self, group_id, file_id):
+            raise AssertionError("network must not be touched")
+
+        async def get_resource_url(self, resource_id):
+            raise AssertionError("network must not be touched")
+
+    data = "季度报表内容".encode("utf-8")
+    md5 = hashlib.md5(data).hexdigest()
+    qq = tmp_path / "nt_data"
+    (qq / "File").mkdir(parents=True)
+    cached = qq / "File" / f"{md5}.xlsx"
+    cached.write_bytes(data)
+
+    conn = await open_db(str(tmp_path / "d.db"))
+    repo = Repository(conn)
+    blobs = BlobStore(tmp_path / "blobs")
+    store = MediaStore(blobs, NoUrlAdapter(), repo, qq_cache_dir=str(qq))
+    now = 1758000000
+    mid = await repo.add_media(
+        {
+            "scene": "group", "peer_id": 2, "message_seq": 1, "seg_index": 0,
+            "kind": "file", "resource_id": "", "file_id": "fid1",
+            "file_name": "季度报表.xlsx", "file_hash": md5,
+            "width": None, "height": None, "duration": None, "summary": "",
+            "status": "pending", "time": now, "created_at": now, "updated_at": now,
+        }
+    )
+    out = await store.download_row(await repo.media_by_id(mid))
+    assert out["status"] == "done" and out["file_size"] == len(data)
+    from pathlib import Path as _P
+
+    blob = _P(out["file_path"])
+    assert blob.read_bytes() == data and blob.suffix == ".xlsx"
+    found = list((tmp_path / "blobs" / "names").glob("*.xlsx"))
+    assert len(found) == 1 and found[0].read_bytes() == data  # original name kept
+    await conn.close()
+
+
+async def test_post_download_swap_dedups_with_qq_cache(tmp_path):
+    """After an http download, an identical client-cache copy replaces ours:
+    one disk copy, content-addressed slot unchanged."""
+    import hashlib
+    import os
+
+    data = b"\xff\xd8\xff\xe0" + b"z" * 64
+    md5 = hashlib.md5(data).hexdigest()
+    qq = tmp_path / "nt_cache"
+    (qq / "Pic" / "2026-10").mkdir(parents=True)
+    cached = qq / "Pic" / "2026-10" / f"{md5}_Ori.jpg"
+    cached.write_bytes(data)
+
+    conn = await open_db(str(tmp_path / "e.db"))
+    repo = Repository(conn)
+    blobs = BlobStore(tmp_path / "blobs")
+    store = MediaStore(blobs, Recorder(), repo, qq_cache_dir=str(qq))
+
+    # simulate the already-downloaded blob sitting at its content path
+    sha = hashlib.sha256(data).hexdigest()
+    dest = blobs.blob_path("image", sha, ".jpg")
+    dest.write_bytes(data)
+    await store._swap_with_qq_cache(dest)
+    assert dest.read_bytes() == data
+    assert os.path.samefile(cached, dest)  # ours was replaced by a link to theirs
+    await conn.close()
+
+
+async def test_qq_cache_disabled_by_default(tmp_path):
+    store = MediaStore(BlobStore(tmp_path / "b"), Recorder(), _noop_repo())
+    assert store.qq_cache is None
+    row = {"id": 1, "kind": "file", "file_name": "x", "file_hash": "deadbeef" * 4}
+    assert await store._adopt_from_qq_cache(row) is None
+
+
+class _noop_repo:
+    def __getattr__(self, name):
+        raise AssertionError(f"repo must not be touched, got {name}")

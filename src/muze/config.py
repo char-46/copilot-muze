@@ -96,6 +96,10 @@ class IngestConfig(BaseModel):
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
     media_download_concurrency: int = 3
     media_transcode_silk: bool = True
+    # local QQ client cache dir (QQNT's nt_data etc.): best-effort media
+    # dedup/adoption — file rows match by QQ's md5 file_hash, images/videos
+    # by md5-embedded cache filenames; empty disables all of it
+    qq_cache_dir: str = ""
 
 
 class ControlConfig(BaseModel):
