@@ -166,6 +166,18 @@ class Embedder:
         log.info("RAG embedder unloaded after idle")
         return True
 
+    async def force_unload(self) -> bool:
+        """Controller-requested unload (/embed unload): drop the local model
+        immediately, freeing VRAM/RAM; it reloads on demand at the next
+        embedding (with fresh device selection)."""
+        async with self._lock:
+            if self._local is None:
+                return False
+            self._local = None
+            self._device = ""
+            log.info("RAG embedder force-unloaded by command")
+            return True
+
     # ------------------------------------------------- vram stewardship
     async def evict_if_vram_pressure(self, governor=None) -> str | None:
         """System-wide VRAM pressure (a game started, another app's model,

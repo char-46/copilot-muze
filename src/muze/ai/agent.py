@@ -841,6 +841,10 @@ class Agent:
 
         if not final_text:
             final_text = "(AI 未返回内容)"
+        # the final answer must live in the loop history too (webui session
+        # view renders exactly these messages; without it the complete output
+        # was invisible except as a 200-char preview)
+        messages.append({"role": "assistant", "content": final_text})
         session.messages = messages[1:]
         session.finish(True, final_text)
         await commit(final_text)

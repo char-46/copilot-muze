@@ -867,7 +867,11 @@ class ToolRunner:
         return {"descriptions": out}
 
     async def t_send_message(self, args: dict) -> dict:
+        from muze.reply import strip_markdown
+
         text = args["text"]
+        if getattr(self.service.cfg.reply, "strip_markdown", False):
+            text = strip_markdown(text)
         segments = [out_text(text)]
         if args.get("reply_seq"):
             segments.insert(0, out_reply(int(args["reply_seq"])))
@@ -917,6 +921,10 @@ class ToolRunner:
         segments = [seg]
         caption = str(args.get("caption", "") or "").strip()
         if caption:
+            if getattr(self.service.cfg.reply, "strip_markdown", False):
+                from muze.reply import strip_markdown
+
+                caption = strip_markdown(caption)
             segments.append(out_text(caption))
             preview += f" {caption}"
         outcome = await self.service.request_send(

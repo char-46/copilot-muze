@@ -20,6 +20,7 @@ from muze.provider.milky.models import (
     IncomingMessage,
     LoginInfo,
     SendMessageResult,
+    out_forward,
     parse_segments,
 )
 
@@ -99,6 +100,7 @@ class MilkyAdapter(ProtocolAdapter):
             # Known gaps in Lagrange.Milky at time of writing.
             caps.incoming_file_segment = False
             caps.forwarded_messages = False
+            caps.send_forward = False
             caps.mark_read = False
             caps.resource_temp_url = True
             caps.notes.append("Lagrange.Milky detected: file segment / forwarded / mark-read assumed missing")
@@ -106,6 +108,7 @@ class MilkyAdapter(ProtocolAdapter):
             # LLBot & friends implement the full spec; verified lazily at use.
             caps.incoming_file_segment = True
             caps.forwarded_messages = True
+            caps.send_forward = True
             caps.mark_read = True
             caps.resource_temp_url = True
             caps.notes.append("full-spec implementation assumed; degraded lazily on first failure")
@@ -292,6 +295,38 @@ class MilkyAdapter(ProtocolAdapter):
             "send_group_message", {"group_id": group_id, "message": segments}
         )
         return SendMessageResult.model_validate(data or {})
+
+    async def send_forward_message(
+        self,
+        scene: str,
+        peer_id: int,
+        nodes: list[list[dict]],
+        *,
+        title: str = "",
+        preview: list[str] | None = None,
+        summary: str = "",
+        prompt: str = "",
+    ) -> SendMessageResult:
+        """Merged-forward chain (Milky v1.2+ outbound forward segment)."""
+        if not self.caps.send_forward:
+            raise NotSupported("forward send marked unavailable on this protocol side")
+        seg = out_forward(
+            nodes,
+            user_id=self.self_id,
+            sender_name="muze",
+            title=title,
+            preview=preview,
+            summary=summary,
+            prompt=prompt,
+        )
+        try:
+            if scene == "group":
+                return await self.send_group_message(peer_id, [seg])
+            return await self.send_private_message(peer_id, [seg])
+        except ProtocolError as e:
+            self.caps.send_forward = False
+            self._degrade(f"forward send degraded: {e}")
+            raise NotSupported(str(e)) from e
 
     async def get_history_messages(
         self,

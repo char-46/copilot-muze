@@ -22,8 +22,9 @@ from typing import Awaitable, Callable
 
 from muze.chatlog import ChatLog, conv_id, render_segment, size_fmt
 from muze.config import MuzeConfig, is_control_conversation
-from muze.provider.base import ProtocolAdapter, ProtocolError
-from muze.provider.milky.models import out_image, out_reply, out_text
+from muze.provider.base import NotSupported, ProtocolAdapter, ProtocolError
+from muze.provider.milky.models import out_file, out_image, out_reply, out_text
+from muze.reply import has_markdown_structure, plain_chunks, split_forward_nodes, strip_markdown
 from muze.store.media import to_file_uri
 from muze.store.repo import Repository
 from muze.version import epoch_iso, get_version, uptime_since
@@ -144,6 +145,7 @@ class ControlContext:
     peer_id: int
     user_label: str = ""
     auto_confirm: bool = False  # CLI/local console sends immediately
+    reply_seq: int = 0  # quoted message (QQ reply segment), for /topdf etc.
 
     @property
     def is_local(self) -> bool:
@@ -309,38 +311,24 @@ class ControlService:
     async def deliver(self, ctx: ControlContext, outcome: CommandOutcome) -> None:
         """Send an outcome back into the QQ control conversation (if any).
 
-        The main reply (text + media images) goes first, then each
-        extra_chain is sent as its own message (multi-message replies).
+        The main reply goes first (full text: short/long/markdown handled by
+        send_text — never truncated), then media images, then each
+        extra_chain as its own message.
         """
         if not ctx.qq_reachable:
             return
-        messages: list[list[dict]] = []
-        if outcome.text or outcome.media_paths:
-            segments: list[dict] = []
-            if outcome.text:
-                segments.append(out_text(outcome.text[:3000]))
-            for p in outcome.media_paths[:9]:
-                segments.append(out_image(to_file_uri(p)))
-            messages.append(segments)
-        for chain in outcome.extra_chains[:9]:
-            if chain:
-                messages.append(chain)
-        if not messages:
-            return
-
-        async def _send(segments: list[dict]) -> None:
-            if ctx.scene == "group":
-                await self.adapter.send_group_message(ctx.peer_id, segments)
-            else:
-                await self.adapter.send_private_message(ctx.peer_id, segments)
-
         try:
-            for i, segs in enumerate(messages):
-                await _send(segs)
-                if i == 0:
-                    self.chatlog.ctrl_reply(
-                        ctx.source, ctx.user_label or ctx.chat_key, outcome.text
-                    )
+            if outcome.text:
+                await self.send_text(ctx.scene, ctx.peer_id, outcome.text)
+                self.chatlog.ctrl_reply(
+                    ctx.source, ctx.user_label or ctx.chat_key, outcome.text
+                )
+            if outcome.media_paths:
+                segs = [out_image(to_file_uri(p)) for p in outcome.media_paths[:9]]
+                await self._send_segments(ctx.scene, ctx.peer_id, segs)
+            for chain in outcome.extra_chains[:9]:
+                if chain:
+                    await self._send_segments(ctx.scene, ctx.peer_id, chain)
         except ProtocolError as e:
             log.warning("deliver to %s failed: %s", ctx.chat_key, e)
 
@@ -354,6 +342,112 @@ class ControlService:
             res = await self.adapter.send_private_message(peer_id, segments)
         self.chatlog.sent(scene, peer_id, res.message_seq, preview)
         return CommandOutcome(f"已发送到 {await self.target_label(scene, peer_id)} (seq={res.message_seq})")
+
+    # -------------------------------------------------- unified text send
+    def _render_dir(self) -> "Path":
+        from pathlib import Path
+
+        d = Path(self.cfg.storage.data_dir) / "render"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _font_dir(self) -> "Path | None":
+        from pathlib import Path
+
+        override = (getattr(self.cfg.reply, "render_font", "") or "").strip()
+        if override:
+            p = Path(override)
+            return p.parent if p.is_file() else Path(self.cfg.storage.data_dir) / "fonts"
+        d = Path(self.cfg.storage.data_dir) / "fonts"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    async def _render_png(self, text: str) -> "Path | None":
+        """Rendered markdown image of the FULL text; None = skip silently."""
+        from muze.render import png_cache_key, render_png
+
+        png = await asyncio.to_thread(render_png, text, self._font_dir())
+        if not png:
+            return None
+        p = self._render_dir() / f"{png_cache_key(text)}.png"
+        p.write_bytes(png)
+        self._prune_renders()
+        return p
+
+    def _prune_renders(self, keep: int = 40) -> None:
+        try:
+            files = sorted(self._render_dir().glob("*"), key=lambda p: p.stat().st_mtime)
+            for p in files[:-keep]:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    async def _send_segments(self, scene: str, peer_id: int, segments: list[dict]):
+        if scene == "group":
+            return await self.adapter.send_group_message(peer_id, segments)
+        return await self.adapter.send_private_message(peer_id, segments)
+
+    async def send_text(self, scene: str, peer_id: int, text: str, *, preview: str = "") -> None:
+        """Send a bot text reply with the full content, QQ-safely.
+
+        - plain text: markdown markers stripped (QQ renders none)
+        - markdown structure (or long text): the rendered formatted image of
+          the complete text rides along — 图文 in one message when it fits,
+          or as its own message after a forward chain
+        - longer than reply.forward_chars: a merged-forward chain carries the
+          complete plain text (protocol side without chains -> sequential
+          messages, still untruncated)
+        """
+        if not text or not text.strip():
+            return
+        rc = self.cfg.reply
+        plain = strip_markdown(text) if rc.strip_markdown else text
+        if not plain.strip():
+            plain = text
+        is_long = rc.forward_chars > 0 and len(plain) > rc.forward_chars
+        want_image = (
+            rc.image_markdown
+            and len(text) <= rc.image_max_chars
+            and (is_long or has_markdown_structure(text))
+        )
+        try:
+            if is_long:
+                await self._send_chain(scene, peer_id, plain)
+                if want_image:
+                    p = await self._render_png(text)
+                    if p:
+                        await self._send_segments(scene, peer_id, [out_image(to_file_uri(p))])
+            else:
+                segs: list[dict] = [out_text(plain)]
+                if want_image:
+                    p = await self._render_png(text)
+                    if p:
+                        segs.append(out_image(to_file_uri(p)))
+                res = await self._send_segments(scene, peer_id, segs)
+                self.chatlog.sent(scene, peer_id, res.message_seq, preview or plain[:80])
+        except ProtocolError as e:
+            log.warning("send_text to %s failed: %s", conv_id(scene, peer_id), e)
+
+    async def _send_chain(self, scene: str, peer_id: int, plain: str) -> None:
+        rc = self.cfg.reply
+        chunks = split_forward_nodes(plain, rc.node_chars)
+        nodes = [[out_text(c)] for c in chunks]
+        head = next((ln.strip() for ln in plain.splitlines() if ln.strip()), "")[:24]
+        preview = [ln.strip()[:40] for ln in plain.splitlines() if ln.strip()][:3]
+        try:
+            res = await self.adapter.send_forward_message(
+                scene, peer_id, nodes,
+                title=head or "长消息",
+                preview=preview,
+                summary=f"完整文本 {len(plain)} 字 · {len(nodes)} 节",
+            )
+            self.chatlog.sent(scene, peer_id, res.message_seq, f"[转发链] {head}")
+            return
+        except NotSupported as e:
+            log.warning("forward chain unavailable, sequential fallback: %s", e)
+        for chunk in plain_chunks(plain):
+            res = await self._send_segments(scene, peer_id, [out_text(chunk)])
+            self.chatlog.sent(scene, peer_id, res.message_seq, chunk[:80])
 
     async def request_send(
         self,
@@ -451,11 +545,12 @@ class ControlService:
 
     async def morning_broadcast(self, text: str) -> tuple[int, int]:
         """Push the dawn briefing to every target (admins privately + admin
-        groups). Per-target failures don't abort the rest."""
+        groups). Full text, send_text presentation (chain/image when long).
+        Per-target failures don't abort the rest."""
         sent = failed = 0
         for scene, peer in self.morning_targets():
             try:
-                await self.send_as_bot(scene, peer, [out_text(text[:2900])], text[:80])
+                await self.send_text(scene, peer, text)
                 sent += 1
             except ProtocolError as e:
                 failed += 1
@@ -471,11 +566,7 @@ class ControlService:
             return
         scene, peer = target
         try:
-            segs = [out_text(text[:1500])]
-            if scene == "group":
-                await self.adapter.send_group_message(peer, segs)
-            else:
-                await self.adapter.send_private_message(peer, segs)
+            await self.send_text(scene, peer, text)
         except ProtocolError as e:
             log.warning("notify controller failed: %s", e)
 
@@ -586,7 +677,7 @@ class ControlService:
             text = await asyncio.to_thread(read_document, path)
         except (FileNotFoundError, ValueError) as e:
             return CommandOutcome.err(str(e))
-        return CommandOutcome(text[:3500])
+        return CommandOutcome(text)
 
     @slash("fetch", "/fetch <URL>", "抓取网页/在线文档链接的文本内容", scope="app")
     async def cmd_fetch(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
@@ -598,7 +689,7 @@ class ControlService:
             text = await fetch_url(args[0])
         except Exception as e:
             return CommandOutcome.err(str(e))
-        return CommandOutcome(text[:3500])
+        return CommandOutcome(text)
 
     @slash("dream", "/dream [night|morning|now|日|周|月|list]", "层级做梦：night=补链(内置) morning=晨报(内置 06:00 推送) now=今天 2026-W40=周 2026-09=月", write=True)
     async def cmd_dream(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
@@ -617,7 +708,7 @@ class ControlService:
                 )
             except Exception as e:
                 return CommandOutcome.err(f"晨报生成失败: {e}")
-            return CommandOutcome(text[:3200])
+            return CommandOutcome(text)
 
         if sub == "list":
             rows = await self.repo.list_digests(limit=50)
@@ -649,10 +740,10 @@ class ControlService:
                         date=_local_date(), adapter=self.adapter,
                         rag=getattr(self.runtime, "rag", None),
                     )
-                    text = f"[{_local_date()} 做梦报告]\n\n{report[:2800]}"
+                    text = f"[{_local_date()} 做梦报告]\n\n{report}"
             except Exception as e:
                 return CommandOutcome.err(f"做梦失败: {e}")
-            return CommandOutcome(text[:3200])
+            return CommandOutcome(text)
 
         if sub:
             import re as _re
@@ -662,7 +753,7 @@ class ControlService:
             row = await self.repo.get_digest(sub)
             if not row:
                 return CommandOutcome.err(f"{sub} 没有做梦报告；/dream list 查看已有报告")
-            return CommandOutcome(f"[{sub} 做梦报告]\n\n{row['report'][:3000]}")
+            return CommandOutcome(f"[{sub} 做梦报告]\n\n{row['report']}")
 
         row = await self.repo.latest_digest()
         if not row:
@@ -671,7 +762,7 @@ class ControlService:
             )
         full = await self.repo.get_digest(row["date"])
         return CommandOutcome(
-            f"[{row['date']} 做梦报告（最新）]\n\n{full['report'][:3000]}\n\n"
+            f"[{row['date']} 做梦报告（最新）]\n\n{full['report']}\n\n"
             "/dream list 看全部（含周/月报告），/dream now 总结今天，/dream night 补链"
         )
 
@@ -1163,8 +1254,8 @@ class ControlService:
 
     @slash(
         "sess",
-        "/sess [list|go [id]|<id> [消息]]",
-        "AI 会话：list 列表 / go [id] 继续暂停或出错的会话（省略 id = 全部）/"
+        "/sess [list|go [id]|getpdf <id>|<id> [消息]]",
+        "AI 会话：list 列表 / go [id] 继续（省略 id = 全部）/ getpdf <id> 导出 PDF / "
         "<id> 看详情 / <id> 消息 在完成后继续追问",
     )
     async def cmd_sess(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
@@ -1206,6 +1297,14 @@ class ControlService:
                 self.agent.resume(s, ctx)
             ids = "、".join(f"#{s.id}" for s in pending)
             return CommandOutcome(f"已继续 {len(pending)} 个会话：{ids}，完成后回复")
+
+        if sub in ("getpdf", "pdf"):
+            if len(args) < 2:
+                return CommandOutcome.err("用法: /sess getpdf <id>")
+            session = await self.agent.get_session(args[1])
+            if session is None:
+                return CommandOutcome.err(f"会话 {args[1]} 不存在（/sess list 查看）")
+            return await self._session_pdf(session, ctx)
 
         session = await self.agent.get_session(sub)
         if session is None:
@@ -1402,6 +1501,8 @@ class ControlService:
             return CommandOutcome("用法: /send <scene/peer> <内容>", is_error=True)
         scene, peer = self.parse_target(args[0])
         body = " ".join(args[1:])
+        if self.cfg.reply.strip_markdown:
+            body = strip_markdown(body)
         return await self.request_send(scene, peer, [out_text(body)], body, ctx, "command")
 
     @slash("reply", "/reply <scene/peer> [seq] <内容>", "以被控号回复某条消息（需确认）", write=True)
@@ -1417,6 +1518,8 @@ class ControlService:
         if not rest:
             return CommandOutcome("缺少回复内容", is_error=True)
         body = " ".join(rest)
+        if self.cfg.reply.strip_markdown:
+            body = strip_markdown(body)
         segments = [out_reply(reply_seq), out_text(body)] if reply_seq else [out_text(body)]
         return await self.request_send(scene, peer, segments, body, ctx, "command")
 
@@ -1467,6 +1570,119 @@ class ControlService:
         ]
         return CommandOutcome(
             f"合并转发 seq={seq} 共 {len(msgs)} 条:\n" + "\n".join(lines[:80])
+        )
+
+    @slash("topdf", "/topdf（引用一条消息）", "把引用的消息（长文本/合并转发记录）渲染为 PDF 发回；自动识别 markdown", write=False)
+    async def cmd_topdf(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        from muze.render import render_pdf
+
+        if not ctx.reply_seq:
+            return CommandOutcome.err("请回复（引用）一条消息再发 /topdf")
+        row = await self.repo.get_message_row(ctx.scene, ctx.peer_id, ctx.reply_seq)
+        if not row:
+            return CommandOutcome.err("找不到引用的消息")
+        raw = json.loads(row["raw_json"] or "{}")
+
+        def seg_field(seg: dict, key: str):
+            # stored segments are flat pydantic dumps; live ones wrap in "data"
+            d = seg.get("data") or {}
+            return seg.get(key) or d.get(key) or ""
+
+        forward_id = next(
+            (seg_field(s, "forward_id") for s in raw.get("segments", [])
+             if s.get("type") == "forward"),
+            "",
+        )
+        if forward_id:
+            try:
+                msgs = await self.adapter.get_forwarded_messages(forward_id)
+            except ProtocolError as e:
+                return CommandOutcome.err(f"展开合并转发失败: {e}")
+            title = next(
+                (seg_field(s, "title") for s in raw.get("segments", [])
+                 if s.get("type") == "forward" and seg_field(s, "title")),
+                f"聊天记录 seq={ctx.reply_seq}",
+            )
+            lines = [
+                f"**{'我' if m.sender_id == self.runtime.self_id else m.sender_name or m.sender_id}**："
+                + "\n".join(
+                    "  " + (s.text if hasattr(s, "text") else "") for s in m.segments if hasattr(s, "text")
+                ).strip()
+                for m in msgs
+            ]
+            body = "\n\n".join(x for x in lines if x.strip())
+        else:
+            title = f"消息 seq={ctx.reply_seq}"
+            body = (row["text_content"] or "").strip()
+            if not body:
+                return CommandOutcome.err("引用的消息没有文本内容")
+        try:
+            pdf = await asyncio.to_thread(render_pdf, body, self._font_dir())
+        except Exception as e:
+            return CommandOutcome.err(f"渲染失败: {e}")
+        name = f"muze-{title[:16].strip() or 'doc'}-{ctx.reply_seq}.pdf"
+        path = self._render_dir() / name
+        path.write_bytes(pdf)
+        if ctx.qq_reachable:
+            try:
+                await self._send_segments(ctx.scene, ctx.peer_id, [out_file(to_file_uri(path), name)])
+            except ProtocolError as e:
+                return CommandOutcome.err(f"PDF 已生成但发送失败（{path}）: {e}")
+        return CommandOutcome(f"PDF 已生成并发送（{len(pdf) // 1024}KB）")
+
+    async def _session_pdf(self, session, ctx: ControlContext) -> CommandOutcome:
+        """Render an agent session transcript (full loop incl. tool rounds)
+        into a PDF file and send it back."""
+        from muze.render import render_pdf
+
+        parts = [f"# 会话 #{session.id} {session.title}", "", f"> {session.prompt}", ""]
+        for m in session.messages:
+            role = m.get("role", "")
+            if role == "user":
+                parts += ["**你**：", m.get("content", ""), ""]
+            elif role == "assistant":
+                content = m.get("content") or ""
+                calls = m.get("tool_calls") or []
+                head = "**muze**：" if content else "**muze**（工具轮）"
+                parts += [head, content, ""]
+                for c in calls:
+                    fn = c.get("function", {}) or {}
+                    parts.append(f"`🔧 {fn.get('name', '?')}({(fn.get('arguments') or '')[:200]})`")
+                if calls:
+                    parts.append("")
+            elif role == "tool":
+                parts += [f"<details-tool `{m.get('name', '')}`>", (m.get("content") or "")[:2000], ""]
+        body = "\n".join(parts)
+        try:
+            pdf = await asyncio.to_thread(render_pdf, body, self._font_dir())
+        except Exception as e:
+            return CommandOutcome.err(f"渲染失败: {e}")
+        name = f"muze-sess-{session.id}.pdf"
+        path = self._render_dir() / name
+        path.write_bytes(pdf)
+        if ctx.qq_reachable:
+            try:
+                await self._send_segments(ctx.scene, ctx.peer_id, [out_file(to_file_uri(path), name)])
+            except ProtocolError as e:
+                return CommandOutcome.err(f"PDF 已生成但发送失败（{path}）: {e}")
+        return CommandOutcome(f"会话 #{session.id} 的 PDF 已生成并发送")
+
+    @slash("embed", "/embed unload", "强制卸载本地 embedding 模型（释放显存/内存；下次使用自动重载）", write=True)
+    async def cmd_embed(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        sub = (args[0].lower() if args else "").strip()
+        if sub != "unload":
+            return CommandOutcome("用法: /embed unload", is_error=True)
+        rag = getattr(self.runtime, "rag", None)
+        emb = getattr(rag, "embedder", None) if rag is not None else None
+        if emb is None:
+            return CommandOutcome("RAG/embedding 未启用", is_error=True)
+        try:
+            ok = await emb.force_unload()
+        except Exception as e:
+            return CommandOutcome(f"卸载失败: {e}", is_error=True)
+        return CommandOutcome(
+            "已卸载本地 embedding 模型（下次使用自动重载）"
+            if ok else "当前没有已加载的本地模型"
         )
 
     # ------------------------------------------------- skills / lifecycle

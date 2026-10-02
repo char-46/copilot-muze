@@ -146,6 +146,22 @@ digest:
   inject_month_chars: 450
   inject_max_memories: 25
 
+reply:                          # outbound QQ replies: full text, QQ-safe form
+  # >5000 chars: merged-forward chain carries the COMPLETE text (no more
+  # truncation); 0 = off (then long replies send as sequential messages)
+  forward_chars: 5000
+  node_chars: 4200             # per-node cap inside the chain
+  strip_markdown: true         # QQ text is plain: strip md markers
+  image_markdown: true         # send the rendered (formatted) image along -
+                               # 图文 with the plain text; fonts: drop
+                               # MapleMono*.ttf or LxgwWenKai*.ttf into
+                               # data/fonts/ (auto-downloads LXGW WenKai
+                               # otherwise, system CJK font as last resort)
+  image_max_chars: 80000       # render at most this much source text
+  render_font: ""              # explicit font file path; empty = auto
+  # PDF export reuses the same renderer: /topdf (quote a message) and
+  # /sess getpdf <id>; markdown is auto-detected per document.
+
 profiles:                     # per-conversation identity docs ("who is who")
   auto: true                  # periodically (re)build them from recent chats
   interval_min: 360           # refresh cadence

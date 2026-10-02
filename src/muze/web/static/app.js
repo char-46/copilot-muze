@@ -480,7 +480,7 @@ function msgNode(m) {
     row.className = "msgrow bot";
     const calls = (m.tool_calls || []).map((c) =>
       `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
-      `<code>${esc((c.function?.arguments || "").slice(0, 240))}</code>)</summary></details>`).join("");
+      `<code>${esc(c.function?.arguments || "")}</code>)</summary></details>`).join("");
     row.innerHTML = `<div class="ava">M</div><div class="col">` +
       (m.content ? `<div class="bubble md">${mdRender(m.content)}</div>` : "") +
       calls + (m.content ? `<a class="copybtn">⧉ 复制</a>` : "") + `</div>`;
@@ -829,7 +829,7 @@ async function runRagSearch() {
       card.innerHTML =
         `<div class="head"><b>[${esc(r.kind)}] ${esc(r.ref || "")}</b>` +
         `<span class="dim">score ${r.score}${when ? " · " + when : ""}</span></div>` +
-        `<div class="dim pad" style="white-space:pre-wrap">${esc((r.text || "").slice(0, 500))}</div>`;
+        `<div class="md" style="padding:4px 2px">${mdRender(r.text || "")}</div>`;
       box.appendChild(card);
     }
   } catch (e) {
@@ -910,6 +910,12 @@ const CFG_FIELDS = [
     { path: "digest.morning_at", label: "晨报时间 HH:MM", type: "text" },
     { path: "digest.morning_targets", label: "晨报目标（逗号分隔，空=全部管理员+管理群）", type: "text" },
     { path: "digest.inject_context", label: "注入处理上下文", type: "checkbox" },
+  ]},
+  { group: "回复形式 (reply)", items: [
+    { path: "reply.forward_chars", label: "超长阈值（>此字数走合并转发链，0=关闭）", type: "text" },
+    { path: "reply.strip_markdown", label: "QQ 文本去 markdown 标记", type: "checkbox" },
+    { path: "reply.image_markdown", label: "附渲染图（图文，保留排版）", type: "checkbox" },
+    { path: "reply.render_font", label: "渲染字体文件（空=自动：data/fonts 或下载霞鹜文楷）", type: "text" },
   ]},
 ];
 
@@ -1056,7 +1062,7 @@ async function loadDigestsView() {
       view.classList.remove("hidden");
       view.innerHTML = `<div class="bar slim"><b>${esc(dd.digest.date)}</b>` +
         `<button class="mini" id="dgClose">关闭</button></div>` +
-        `<pre class="dpre">${esc(dd.digest.report)}</pre>`;
+        `<div class="dmd md">${mdRender(dd.digest.report || "")}</div>`;
       $("#dgClose").addEventListener("click", () => {
         view.classList.add("hidden");
         view.innerHTML = "";

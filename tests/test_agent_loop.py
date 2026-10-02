@@ -23,7 +23,9 @@ class ScriptLLM:
 
     async def chat(self, messages, tools=None, on_chunk=None):
         self.calls += 1
-        self.last_messages = messages
+        # copy: the agent mutates its request list in place (tool results,
+        # final answer) and we assert on the REQUEST as sent
+        self.last_messages = [dict(m) for m in messages]
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -127,6 +129,11 @@ async def test_converse_runs_tool_calls_in_parallel(env, monkeypatch):
     out = await agent.converse("do it", ctx())
     assert out.text == "done"
     assert ran == ["get_recent_messages", "describe_image"]
+    # the final answer lives in the session loop messages (the webui session
+    # view renders exactly those; without it the full output was invisible)
+    sess = agent.sessions.latest(1)[0]
+    assert sess.messages[-1] == {"role": "assistant", "content": "done"}
+    assert sess.messages[-2]["role"] == "tool"
 
 
 async def test_converse_uses_all_steps_then_notes(env, monkeypatch):

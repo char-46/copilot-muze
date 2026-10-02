@@ -240,6 +240,10 @@ button.mini {
   max-height: 300px; overflow: auto; background: var(--bg);
   padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
 }
+.dmd {
+  max-height: calc(100vh - 220px); overflow: auto; background: var(--bg);
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 6px;
+}
 .mthumb {
   width: 44px; height: 44px; object-fit: cover; border-radius: 4px;
   float: left; margin-right: 8px;

@@ -46,6 +46,7 @@ class Caps:
     history_start_seq: bool = False
     incoming_file_segment: bool = False
     forwarded_messages: bool = False
+    send_forward: bool = False
     mark_read: bool = False
     resource_temp_url: bool = False
     impl_name: str = ""
@@ -62,6 +63,7 @@ class Caps:
             f"history start_seq paging: {yn(self.history_start_seq)}",
             f"incoming file segment: {yn(self.incoming_file_segment)}",
             f"forwarded messages fetch: {yn(self.forwarded_messages)}",
+            f"send forward chain: {yn(self.send_forward)}",
             f"mark as read: {yn(self.mark_read)}",
             f"resource temp url: {yn(self.resource_temp_url)}",
             *self.notes,
@@ -141,6 +143,20 @@ class ProtocolAdapter(ABC):
     async def send_group_message(
         self, group_id: int, segments: list[dict]
     ) -> SendMessageResult: ...
+
+    async def send_forward_message(
+        self,
+        scene: str,
+        peer_id: int,
+        nodes: list[list[dict]],
+        *,
+        title: str = "",
+        preview: list[str] | None = None,
+        summary: str = "",
+        prompt: str = "",
+    ) -> SendMessageResult:
+        """Send a merged-forward chain (each node = a segment list)."""
+        raise NotSupported("forward send not supported by this protocol side")
 
     @abstractmethod
     async def get_history_messages(

@@ -42,6 +42,7 @@ from muze.provider.milky.models import (
     MentionSeg,
     MessageEventData,
     MessageRecallData,
+    ReplySeg,
     TextSeg,
 )
 from muze.store.blobs import BlobStore
@@ -548,6 +549,10 @@ class App:
             msg.message_scene, msg.peer_id, msg.sender_id, mention_self, text, is_self=is_self
         ):
             return
+        reply_seq = next(
+            (s.message_seq for s in msg.segments if isinstance(s, ReplySeg) and s.message_seq),
+            0,
+        )
         ctx = ControlContext(
             source="qq",
             chat_key=f"qq:{msg.message_scene}:{msg.peer_id}",
@@ -555,6 +560,7 @@ class App:
             peer_id=msg.peer_id,
             user_label=await self.pipeline.sender_display(msg),
             auto_confirm=False,
+            reply_seq=reply_seq,
         )
         # `::` turns run ASYNC: acknowledge with a session id right away and
         # let the background task deliver the answer, so one slow LLM reply

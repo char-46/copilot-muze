@@ -385,3 +385,39 @@ def out_file(file_uri: str, file_name: str = "") -> dict:
     if file_name:
         data["file_name"] = file_name
     return {"type": "file", "data": data}
+
+
+def out_forward(
+    nodes: list[list[dict]],
+    *,
+    user_id: int = 0,
+    sender_name: str = "muze",
+    title: str = "",
+    preview: list[str] | None = None,
+    summary: str = "",
+    prompt: str = "",
+) -> dict:
+    """Merged-forward segment (Milky v1.2+). ``nodes`` = segment lists, one
+    per chain message; optional title/preview/summary/prompt shape the chat
+    bubble (preview 1..4 lines)."""
+    import time as _time
+
+    messages = [
+        {
+            "user_id": user_id,
+            "sender_name": sender_name,
+            "time": int(_time.time()),
+            "segments": segs,
+        }
+        for segs in nodes
+    ]
+    data: dict = {"messages": messages}
+    if title:
+        data["title"] = title
+    if preview:
+        data["preview"] = [p for p in preview if p][:4]
+    if summary:
+        data["summary"] = summary
+    if prompt:
+        data["prompt"] = prompt
+    return {"type": "forward", "data": data}

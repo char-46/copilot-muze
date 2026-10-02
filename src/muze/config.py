@@ -273,6 +273,25 @@ class DigestConfig(BaseModel):
     inject_max_memories: int = 25
 
 
+class ReplyConfig(BaseModel):
+    """Outbound QQ replies: no truncation, QQ-safe formatting.
+
+    Plain text replies carry no markdown (QQ renders none) — markers are
+    stripped and the formatted original travels as a rendered image (图文).
+    Single messages over ``forward_chars`` become a merged-forward chain
+    carrying the complete text; the rendered image of the complete text is
+    sent alongside. PDF export reuses the same renderer (/topdf,
+    /sess getpdf)."""
+
+    # 0 disables chains: long replies then fall back to sequential messages
+    forward_chars: int = 5000
+    node_chars: int = 4200  # per-node cap inside a chain
+    strip_markdown: bool = True  # QQ text is plain: strip md markers
+    image_markdown: bool = True  # send the rendered formatted image along
+    image_max_chars: int = 80000  # render at most this much source text
+    render_font: str = ""  # explicit font file; empty = data/fonts/ or auto
+
+
 class MuzeConfig(BaseModel):
     accounts: AccountsConfig = Field(default_factory=AccountsConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -283,6 +302,7 @@ class MuzeConfig(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
+    reply: ReplyConfig = Field(default_factory=ReplyConfig)
     profiles: ProfilesConfig = Field(default_factory=ProfilesConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
 
