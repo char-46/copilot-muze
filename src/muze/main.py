@@ -115,31 +115,88 @@ class App:
         self.backfiller = None
         self.service = None
         self.account_dir: Path | None = None
+        self.degraded = False  # booted from a remembered uin; protocol side down
+        self._reconnect_task: asyncio.Task | None = None
+
+    # ------------------------------------------------ remembered identity
+    def _accounts_file(self) -> Path:
+        return self.cfg.storage.data_dir / "accounts.json"
+
+    def _remember_uin(self, uin: int) -> None:
+        """Persist name -> uin so a later boot whose protocol side is down
+        can still open THIS account's data dir and serve the console."""
+        import json
+
+        path = self._accounts_file()
+        data: dict = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if data.get(self.spec.name) == uin:
+            return
+        data[self.spec.name] = int(uin)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            log.exception("persist account uin failed")
+
+    def _remembered_uin(self) -> int | None:
+        import json
+
+        try:
+            data = json.loads(self._accounts_file().read_text(encoding="utf-8"))
+            uin = data.get(self.spec.name)
+            return int(uin) if uin else None
+        except Exception:
+            return None
 
     async def setup(self) -> None:
         cfg = self.cfg
         cfg.storage.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.adapter = MilkyAdapter(self.spec.endpoint)
-        login = await self.adapter.start()
-        self.runtime.self_id = login.user_id
-        log.info("[%s] logged in as %s (%s)", self.spec.name, login.user_name or "?", login.user_id)
+        login = None
+        try:
+            login = await self.adapter.start()
+        except ProtocolError as e:
+            uin = self._remembered_uin()
+            if uin is None:
+                raise  # first boot for this account: no local identity to fall back on
+            self.degraded = True
+            self.runtime.degraded = True
+            log.warning(
+                "[%s] 协议端暂不可达（%s）。以历史账号 %s 降级启动："
+                "控制台/WebUI/本地数据可用，QQ 收发在协议端恢复后自动接上",
+                self.spec.name, e, uin,
+            )
+        uin = login.user_id if login is not None else self._remembered_uin()
+        self.runtime.self_id = uin
+        if login is not None:
+            self._remember_uin(uin)
+            log.info("[%s] logged in as %s (%s)", self.spec.name, login.user_name or "?", uin)
 
         # per-account data dir is derived from the logged-in QQ number;
         # media bytes go to the shared app-level blob store (cross-account dedup)
-        acct = cfg.storage.account_dir(login.user_id)
+        acct = cfg.storage.account_dir(uin)
         self.account_dir = acct
         self.conn = await open_db(str(acct / "muze.db"))
         self.repo = Repository(self.conn)
 
         # multi-account isolation: one data dir belongs to exactly one account
-        conflict = await self.repo.bind_owner(login.user_id)
+        conflict = await self.repo.bind_owner(uin)
         if conflict is not None:
             raise RuntimeError(
                 f"数据目录 {acct} 已绑定账号 {conflict}，"
-                f"当前登录的是 {login.user_id}。请勿手工挪用账号数据目录。"
+                f"当前登录的是 {uin}。请勿手工挪用账号数据目录。"
             )
-        await self._record_login()
+        if login is not None:
+            await self._record_login()  # degraded boot records it on reconnect
 
         self.blobstore = BlobStore(cfg.storage.data_dir / "blobs")
         self.media = MediaStore(
@@ -147,7 +204,7 @@ class App:
             transcode_silk=cfg.ingest.media_transcode_silk,
         )
         self.pipeline = IngestPipeline(
-            self.adapter, self.repo, self.media, cfg, self.chatlog, login.user_id
+            self.adapter, self.repo, self.media, cfg, self.chatlog, uin
         )
         self.backfiller = Backfiller(self.adapter, self.repo, cfg, self.pipeline, self.chatlog)
         self.runtime.backfiller = self.backfiller
@@ -255,6 +312,8 @@ class App:
     # ---------------------------------------------------- online / offline
     async def _on_bot_offline(self, reason: str) -> None:
         """The account was kicked / the socket dropped: record the gap start."""
+        if self.degraded:
+            return  # already known offline since boot; reconnect loop owns it
         now = time.time()
         self._offline_since = now
         try:
@@ -327,7 +386,12 @@ class App:
         self._loop = asyncio.get_running_loop()
         if getattr(self, "agent", None) is not None:
             await self.agent.load_sessions()  # restore suspended/continued turns
-        await self.backfiller.start_background()
+        if not self.degraded:
+            await self.backfiller.start_background()
+        else:
+            # protocol side down at boot: roaming pulls would only error out;
+            # the reconnect loop starts them once the login succeeds
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
         self._mt_task = asyncio.create_task(self._maintenance_loop())
         self._enrich_task = asyncio.create_task(self._startup_enrich())
         self._rag_task = asyncio.create_task(self._rag_loop())
@@ -352,6 +416,44 @@ class App:
     async def _consume_events(self) -> None:
         async for ev in self.adapter.events():
             await self.dispatch(ev)
+
+    RECONNECT_DELAY_START = 10.0
+    RECONNECT_DELAY_MAX = 60.0
+
+    async def _reconnect_loop(self) -> None:
+        """Degraded boot: keep retrying the protocol side (console and webui
+        stay alive meanwhile — that's the point). On success, finish the
+        startup steps that need a live connection: caps probe + login record
+        (inside adapter.start/_record_login) and the roaming backfill."""
+        delay = self.RECONNECT_DELAY_START
+        while not self._stop.is_set():
+            try:
+                login = await self.adapter.start()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.info(
+                    "[%s] 协议端仍不可达（%s）；%.0fs 后重试", self.spec.name, e, delay
+                )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                    return  # stop set
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(delay * 2, self.RECONNECT_DELAY_MAX)
+                continue
+            self.runtime.self_id = login.user_id
+            self.degraded = False
+            self.runtime.degraded = False
+            self._remember_uin(login.user_id)
+            log.info(
+                "[%s] 协议端恢复，已登录 %s (%s)", self.spec.name,
+                login.user_name or "?", login.user_id,
+            )
+            await self._record_login()
+            await self.backfiller.start_background()
+            await self._notify("✅ 协议端已恢复连接，漫游补拉已启动。")
+            return
 
     async def _supervisor_watch(self) -> None:
         """When launched by `muze daemon`, exit if the daemon dies so we never
@@ -586,6 +688,8 @@ class App:
 
         if self._mt_task is not None:
             self._mt_task.cancel()
+        if getattr(self, "_reconnect_task", None) is not None:
+            self._reconnect_task.cancel()
         if getattr(self, "_enrich_task", None) is not None:
             self._enrich_task.cancel()
         if getattr(self, "_rag_task", None) is not None:

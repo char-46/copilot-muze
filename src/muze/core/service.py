@@ -966,6 +966,10 @@ class ControlService:
         lines = [
             f"muze {get_version()}",
             f"self={self.runtime.self_id} uptime={uptime_since(self.runtime.started_at)}",
+        ]
+        if getattr(self.runtime, "degraded", False):
+            lines.append("⚠ 降级模式：协议端未连接（后台重试中）；QQ 收发暂不可用，本地命令/数据正常")
+        lines += [
             f"backfill: running={bf.get('running')} last_new={bf.get('last_new_messages')} "
             f"last_run={epoch_iso(bf.get('last_run_at')) or '-'}",
             f"context: {'; '.join(bg) if bg else '无做梦背景'}"

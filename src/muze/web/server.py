@@ -133,6 +133,7 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                 {
                     "name": name,
                     "self_id": runtime.self_id,
+                    "degraded": bool(getattr(runtime, "degraded", False)),
                     "stats": stats,
                     "backfill": bf,
                     "agent": service.agent is not None,
