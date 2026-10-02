@@ -119,10 +119,16 @@ digest:
   transcript_chars: 48000   # global transcript budget fed to the LLM; over
                             # budget -> per-conversation even sampling that
                             # keeps first+last messages, never drops a conv
-  prior_days: 3             # feed the previous N day reports into each
-                            # digest for follow-ups (0 = isolated days);
-                            # 3 = redundancy against dropped restatements
+  prior_days: 7             # feed the previous N day reports into each
+                            # digest for follow-ups (0 = isolated days)
+  prior_week: true          # also feed the latest weekly rollup (threads
+                            # older than the day window live in there)
   prior_chars: 1600         # per prior-report truncation
+  rag_context: true         # per-conversation semantic recall over past
+                            # summaries (needs rag.enabled + embedding)
+  rag_conversations: 8      # busiest conversations getting a retrieval
+  rag_hits: 3               # hits per conversation
+  rag_chars: 200            # chars per hit
   deliver: true             # send the report to the control conversation
   # morning briefing: at dawn push yesterday's digest to the admins.
   # Targets default to every controller (private) + the control group;

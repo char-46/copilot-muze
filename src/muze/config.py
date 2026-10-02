@@ -241,9 +241,17 @@ class DigestConfig(BaseModel):
     transcript_chars: int = 48000  # global transcript budget fed to the LLM
     # continuity: feed the previous N day reports into each digest so the
     # LLM follows up (pending items resolved? ongoing threads' progress);
-    # 3 covers a single dropped-restatement in the chain and multi-day threads
-    prior_days: int = 3  # 0 = summarize each day in isolation
+    # 7 covers week-long threads with redundancy against dropped
+    # restatements; the latest weekly rollup extends context beyond it
+    prior_days: int = 7  # 0 = summarize each day in isolation
+    prior_week: bool = True  # also feed the latest weekly rollup
     prior_chars: int = 1600  # per prior report
+    # semantic recall: per-conversation retrieval over past summaries
+    # (memories / profiles / older digests); needs rag.enabled + embedding
+    rag_context: bool = True
+    rag_conversations: int = 8  # busiest conversations that get a retrieval
+    rag_hits: int = 3  # hits per conversation
+    rag_chars: int = 200  # chars per hit
     deliver: bool = True
     # --- morning briefing: push yesterday's digest to the admins at dawn ---
     morning_enabled: bool = True

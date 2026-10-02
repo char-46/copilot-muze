@@ -85,19 +85,19 @@ async def test_run_digest_uses_only_that_day(repo):
     # messages: yesterday and today (around local midnight)
     y0 = local_midnight(-1)
     t0 = local_midnight(0)
-    await repo.upsert_message(mk_msg("friend", 1, 1, y0 + 100, "昨天的消息"), "昨天的消息", "event")
-    await repo.upsert_message(mk_msg("friend", 1, 2, t0 + 100, "今天的消息"), "今天的消息", "event")
+    await repo.upsert_message(mk_msg("friend", 1, 1, y0 + 100, "昨天旧话题甲"), "昨天旧话题甲", "event")
+    await repo.upsert_message(mk_msg("friend", 1, 2, t0 + 100, "今天新话题乙"), "今天新话题乙", "event")
 
     llm = FakeLLM()
     date = datetime.now().astimezone().strftime("%Y-%m-%d")
     ydate = (datetime.now().astimezone() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     r_y = await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=ydate)
-    assert "昨天的消息" in llm.calls[-1] and "今天的消息" not in llm.calls[-1]
+    assert "昨天旧话题甲" in llm.calls[-1] and "今天新话题乙" not in llm.calls[-1]
     assert (await repo.get_digest(ydate))["report"] == r_y
 
     await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date)
-    assert "今天的消息" in llm.calls[-1]
+    assert "今天新话题乙" in llm.calls[-1]
 
 
 async def test_digest_covers_every_conversation(repo):
@@ -177,7 +177,7 @@ async def test_digest_prior_walks_past_missing_days(repo):
     now = datetime.now().astimezone()
     date = now.strftime("%Y-%m-%d")
     d2 = (now - timedelta(days=2)).strftime("%Y-%m-%d")
-    await repo.upsert_digest(d2, "旧" * 3000, 24.0, {})
+    await repo.upsert_digest(d2, "唳" * 3000, 24.0, {})
     await repo.upsert_message(
         mk_msg("friend", 1, 1, local_midnight(0) + 100, "今天的消息"),
         "今天的消息", "event",
@@ -185,15 +185,16 @@ async def test_digest_prior_walks_past_missing_days(repo):
     await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date)
     prompt = llm.calls[-1]
     assert f"[{d2}]" in prompt and "…(截断)" in prompt
-    assert prompt.count("旧") <= 1601
+    assert prompt.count("唳") <= 1600
 
 
-async def test_digest_default_prior_is_three_days(repo):
-    """Default prior_days=3: the last three reports are all carried in."""
+async def test_digest_default_prior_is_seven_days(repo):
+    """Default prior_days=7: the last seven reports are all carried in,
+    the 8th is not."""
     llm = FakeLLM()
     now = datetime.now().astimezone()
     date = now.strftime("%Y-%m-%d")
-    for back in (1, 2, 3, 4):  # day-4 must NOT appear under the default
+    for back in range(1, 9):  # day-8 must NOT appear under the default
         d = (now - timedelta(days=back)).strftime("%Y-%m-%d")
         await repo.upsert_digest(d, f"第{back}天前的报告", 24.0, {})
     await repo.upsert_message(
@@ -202,9 +203,89 @@ async def test_digest_default_prior_is_three_days(repo):
     )
     await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date)
     prompt = llm.calls[-1]
-    for back in (1, 2, 3):
+    for back in range(1, 8):
         assert f"第{back}天前的报告" in prompt
-    assert "第4天前的报告" not in prompt
+    assert "第8天前的报告" not in prompt
+
+
+async def test_digest_feeds_latest_weekly_rollup(repo):
+    """prior_week: the latest weekly report rides along as broad context."""
+    llm = FakeLLM()
+    now = datetime.now().astimezone()
+    date = now.strftime("%Y-%m-%d")
+    await repo.upsert_digest("2026-W40", "本周主线：周报测试。", 0.0, {}, period="week")
+    await repo.upsert_message(
+        mk_msg("friend", 1, 1, local_midnight(0) + 100, "今天的消息"),
+        "今天的消息", "event",
+    )
+    await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date)
+    assert "[周报 2026-W40]" in llm.calls[-1] and "本周主线" in llm.calls[-1]
+
+    cfg = MuzeConfig.model_validate({"digest": {"prior_week": False}})
+    llm2 = FakeLLM()
+    await run_digest(repo, llm2, cfg, ChatLog(), date=date)
+    assert "本周主线" not in llm2.calls[-1]
+
+
+class FakeRag:
+    enabled = True
+
+    def __init__(self, hits):
+        self.hits = hits
+        self.queries: list[str] = []
+
+    async def query_context(self, query, k=None):
+        self.queries.append(query)
+        return self.hits[:k or 3]
+
+
+async def test_digest_rag_notes_injected_and_deduped(repo):
+    """RAG hits land as > 往日相关: notes in the right section; digest hits
+    already inside the prior window are skipped."""
+    llm = FakeLLM()
+    now = datetime.now().astimezone()
+    date = now.strftime("%Y-%m-%d")
+    ydate = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    await repo.upsert_digest(ydate, "昨天的报告", 24.0, {})
+    t0 = local_midnight(0) + 100
+    for s in range(5):  # friend/1 busiest -> convs[0]
+        await repo.upsert_message(
+            mk_msg("friend", 1, s + 1, t0 + s, f"和张三聊交付{s}"),
+            f"和张三聊交付{s}", "event",
+        )
+    await repo.upsert_message(
+        mk_msg("friend", 2, 1, t0, "普通"), "普通", "event",
+    )
+    rag = FakeRag([
+        {"kind": "memory", "ref": "memory:1", "text": "张三是项目甲方", "score": 0.9},
+        {"kind": "digest", "ref": f"digest:{ydate}", "text": "昨天已全文给出", "score": 0.8},
+    ])
+    await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date, rag=rag)
+    prompt = llm.calls[-1]
+    assert "> 往日相关: 张三是项目甲方" in prompt
+    assert "昨天已全文给出" not in prompt  # prior-window digest deduped
+    sec = prompt.split("# 档案", 1)[1].split("\n### ", 2)[1]
+    assert "张三是项目甲方" in sec and "friend/1" in sec.split("\n", 1)[0]
+    assert len(rag.queries) >= 2  # both conversations queried
+    assert "张三" in rag.queries[0]  # query carries name + head texts
+
+
+async def test_digest_rag_disabled_or_none(repo):
+    """rag=None / enabled=False / rag_context=False -> no notes, no crash."""
+    llm = FakeLLM()
+    date = datetime.now().astimezone().strftime("%Y-%m-%d")
+    await repo.upsert_message(
+        mk_msg("friend", 1, 1, local_midnight(0) + 100, "今天的消息"),
+        "今天的消息", "event",
+    )
+    rag = FakeRag([{"kind": "memory", "ref": "m", "text": "某记忆", "score": 1}])
+    rag.enabled = False
+    await run_digest(repo, llm, MuzeConfig(), ChatLog(), date=date, rag=rag)
+    assert "某记忆" not in llm.calls[-1] and rag.queries == []
+    cfg = MuzeConfig.model_validate({"digest": {"rag_context": False}})
+    rag2 = FakeRag([{"kind": "memory", "ref": "m", "text": "另一条", "score": 1}])
+    await run_digest(repo, llm, cfg, ChatLog(), date=date, rag=rag2)
+    assert "另一条" not in llm.calls[-1] and rag2.queries == []
 
 
 async def test_dream_night_catches_up_multiple_days(repo):

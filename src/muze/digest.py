@@ -50,7 +50,8 @@ DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请�
 
 # 原则
 - 只依据给出的档案，不要编造；引用关键消息时带 会话/seq。
-- 结合「往日背景」做跟进：往日报告中的"需要处理/仍悬置"事项**逐条**在今天给出下落（已解决/有进展/仍悬置/已失效），不得静默丢弃；延续中的话题只写新进展，不重复已知背景；全新线程正常展开。
+- 结合「往日背景」做跟进：往日报告（含周报）中的"需要处理/仍悬置"事项**逐条**在今天给出下落（已解决/有进展/仍悬置/已失效），不得静默丢弃；延续中的话题只写新进展，不重复已知背景；全新线程正常展开。
+- 会话内以 `> 往日相关:` 开头的行是语义检索到的历史背景（记忆/档案/旧总结），不是今天的消息；用于关联旧线索，不当作当日事实。
 - 语气克制、信息密度高：完整性优先于长度，总长控制在 1000 字内。
 - 如果当天几乎没有消息，直接说明"当日无显著活动"并列出仅有的会话；有往日悬置事项时顺带说明其状态。
 
@@ -177,6 +178,7 @@ async def morning_report(
     chatlog: ChatLog,
     *,
     adapter=None,
+    rag=None,
 ) -> str:
     """The dawn briefing body: yesterday's digest, catching it up on the
     spot when the nightly run failed (best-effort), ready for a direct
@@ -190,7 +192,7 @@ async def morning_report(
         return f"（{date} 无做梦报告：昨晚生成失败且 LLM 未配置，晨报跳过；/dream {date} 可手动补做）"
     else:
         try:
-            report = await run_digest(repo, llm, cfg, chatlog, date=date, adapter=adapter)
+            report = await run_digest(repo, llm, cfg, chatlog, date=date, adapter=adapter, rag=rag)
         except Exception as e:
             log.exception("morning catch-up for %s failed", date)
             return f"（{date} 无做梦报告且晨间补做失败: {e}；/dream {date} 可手动补做）"
@@ -278,6 +280,7 @@ async def run_digest(
     *,
     date: str,
     adapter=None,
+    rag=None,
 ) -> str:
     """Generate (and store) the report for one calendar day."""
     dc = cfg.digest
@@ -315,10 +318,11 @@ async def run_digest(
     # prior-day reports for continuity (follow-ups, ongoing threads);
     # walks back past digest-less days, capped so a long gap stays bounded
     prior_blocks: list[str] = []
+    prior_dates: set[str] = set()
     if dc.prior_days > 0:
         d0 = datetime.strptime(date, "%Y-%m-%d")
         got = back = 0
-        while got < dc.prior_days and back < 7:
+        while got < dc.prior_days and back < dc.prior_days + 7:
             back += 1
             prev = (d0 - timedelta(days=back)).strftime("%Y-%m-%d")
             prow = await repo.get_digest(prev)
@@ -327,11 +331,49 @@ async def run_digest(
                 if len(txt) > dc.prior_chars:
                     txt = txt[: dc.prior_chars] + "…(截断)"
                 prior_blocks.append(f"[{prev}]\n{txt}")
+                prior_dates.add(prev)
                 got += 1
+    # the latest weekly rollup extends continuity beyond the day window
+    # (threads older than prior_days live compressed in there)
+    if dc.prior_week:
+        wkrow = await repo.latest_digest(period="week")
+        if wkrow:
+            wk = await repo.get_digest(wkrow["date"]) or {}
+            txt = (wk.get("report") or "").strip()
+            if txt:
+                if len(txt) > dc.prior_chars:
+                    txt = txt[: dc.prior_chars] + "…(截断)"
+                prior_blocks.append(f"[周报 {wkrow['date']}]\n{txt}")
     prior_txt = "\n\n".join(prior_blocks) or "(无)"
 
+    # semantic recall: per-conversation retrieval over past summaries
+    # (memories / profiles / older digests). Best-effort — a disabled or
+    # unhealthy rag just means no notes; hits already covered by the prior
+    # window are skipped to avoid duplication.
+    rag_notes: dict[int, list[str]] = {}
+    if rag is not None and dc.rag_context and getattr(rag, "enabled", False):
+        for i, c in enumerate(convs[: max(1, dc.rag_conversations)]):
+            name = c.get("name") or f"{c['scene']}/{c['peer_id']}"
+            texts = [ln.split("] ", 2)[-1] for ln in conv_lines[i][:6]]
+            query = " ".join([name] + texts)[:400]
+            try:
+                hits = await rag.query_context(query, k=dc.rag_hits)
+            except Exception:
+                hits = []
+            for h in hits or []:
+                ref = str(h.get("ref") or "")
+                if ref.startswith("digest:"):
+                    d = ref.split(":", 1)[1][:10]
+                    if d in prior_dates:
+                        continue  # already in 往日背景 verbatim
+                text = str(h.get("text") or "").strip().replace("\n", " ")
+                if text:
+                    rag_notes.setdefault(i, []).append(
+                        f"> 往日相关: {text[:dc.rag_chars]}"
+                    )
+
     blocks: list[str] = []
-    for c, lines in zip(convs, conv_lines):
+    for idx, (c, lines) in enumerate(zip(convs, conv_lines)):
         scene, peer = c["scene"], c["peer_id"]
         label = c.get("name") or f"{scene}/{peer}"
         name = label
@@ -347,7 +389,11 @@ async def run_digest(
         head = f"### {name} ({scene}/{peer}, 当日{c['cnt']}条, 摘{len(lines)}条"
         if sampled:
             head += ", 全天均匀采样"
-        blocks.append(head + ")\n" + "\n".join(lines))
+        body = "\n".join(lines)
+        notes = rag_notes.get(idx)
+        if notes:
+            body += "\n" + "\n".join(notes)
+        blocks.append(head + ")\n" + body)
         stats["sections"].append(
             {
                 "scene": scene, "peer": peer, "name": name,
@@ -382,6 +428,7 @@ async def dream_night(
     chatlog: ChatLog,
     *,
     adapter=None,
+    rag=None,
 ) -> str:
     """The nightly builtin:
     1. catch up every missing day up to yesterday (per-day windows);
@@ -396,7 +443,7 @@ async def dream_night(
     reports: list[tuple[str, str]] = []
     for d in todo:
         try:
-            reports.append((d, await run_digest(repo, llm, cfg, chatlog, date=d, adapter=adapter)))
+            reports.append((d, await run_digest(repo, llm, cfg, chatlog, date=d, adapter=adapter, rag=rag)))
         except Exception as e:
             log.exception("dream for %s failed", d)
             reports.append((d, f"(做梦失败: {e})"))

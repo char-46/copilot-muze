@@ -613,6 +613,7 @@ class ControlService:
             try:
                 text = await morning_report(
                     self.repo, llm, self.cfg, self.chatlog, adapter=self.adapter,
+                    rag=getattr(self.runtime, "rag", None),
                 )
             except Exception as e:
                 return CommandOutcome.err(f"晨报生成失败: {e}")
@@ -640,12 +641,13 @@ class ControlService:
                 if sub == "night":
                     text = await dream_night(
                         self.repo, self.agent.llm, self.cfg, self.chatlog,
-                        adapter=self.adapter,
+                        adapter=self.adapter, rag=getattr(self.runtime, "rag", None),
                     )
                 else:
                     report = await run_digest(
                         self.repo, self.agent.llm, self.cfg, self.chatlog,
                         date=_local_date(), adapter=self.adapter,
+                        rag=getattr(self.runtime, "rag", None),
                     )
                     text = f"[{_local_date()} 做梦报告]\n\n{report[:2800]}"
             except Exception as e:
