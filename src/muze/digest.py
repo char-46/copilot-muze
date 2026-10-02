@@ -44,14 +44,18 @@ DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请�
 ## 需要处理
 （按紧急程度排列：等回复的、有时限的、承诺/风险类；每条注明 会话/seq；没有则写"无"）
 ## 会话要点
-（每个会话一小节 `### <会话>`，同样按重要性排序：关键信息、结论/约定/分歧；每节只保留值得保留的信息，不凑条数）
+（当天每个活跃会话一小节 `### <会话>`，同样按重要性排序：关键信息、结论/约定/分歧；每节只保留值得保留的信息，不凑条数。标记"全天均匀采样"的会话为抽样子集，首尾消息必在，未收录部分不代表没有内容）
 ## 值得记住的
 （人名-关系、偏好、账号、截止日等沉淀信息；没有则写"无"）
 
 # 原则
 - 只依据给出的档案，不要编造；引用关键消息时带 会话/seq。
+- 结合「往日背景」做跟进：上期"需要处理"中的事项如今天有下文，标注已解决/有进展/仍悬置；延续中的话题只写新进展，不重复已知背景；全新线程正常展开。
 - 语气克制、信息密度高：完整性优先于长度，总长控制在 1000 字内。
-- 如果当天几乎没有消息，直接说明"当日无显著活动"并列出仅有的会话。
+- 如果当天几乎没有消息，直接说明"当日无显著活动"并列出仅有的会话；有往日悬置事项时顺带说明其状态。
+
+# 往日背景（此前数日的总结，仅供跟进；不是今天的档案）
+{prior}
 
 # 档案
 {transcript}"""
@@ -218,6 +222,54 @@ def missing_dates(repo_latest: str | None, upto: str) -> list[str]:
 # --------------------------------------------------------------------------
 # report generation
 # --------------------------------------------------------------------------
+def _spread(lines: list[str], k: int) -> list[str]:
+    """k chronological picks that always include the first and the last
+    line, with the rest evenly spaced across the day."""
+    n = len(lines)
+    if k >= n:
+        return lines
+    if k <= 1:
+        return [lines[-1]]
+    if k == 2:
+        return [lines[0], lines[-1]]
+    idxs = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+    return [lines[i] for i in idxs]
+
+
+def _pick_fitting(lines: list[str], target_chars: int) -> list[str]:
+    """Largest even-spread subset of lines whose joined size fits the
+    target (binary search on the pick count; always >= first+last)."""
+    if not lines or sum(len(x) + 1 for x in lines) <= target_chars:
+        return lines
+    lo, hi, best = 2, len(lines), _spread(lines, 2)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = _spread(lines, mid)
+        if sum(len(x) + 1 for x in cand) <= target_chars:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _apply_transcript_budget(conv_lines: list[list[str]], budget: int) -> None:
+    """Shrink the per-conversation line lists in place so their total
+    joined size fits the global transcript budget. Proportional per-conv
+    targets with a floor, so a busy day still mentions EVERY conversation
+    (a floor section keeps >= first+last lines) instead of dropping the
+    quiet ones."""
+    sizes = [sum(len(x) + 1 for x in ls) for ls in conv_lines]
+    total = sum(sizes)
+    if total <= budget:
+        return
+    floor = 600
+    for ls, sz in zip(conv_lines, sizes):
+        target = max(floor, int(budget * sz / total))
+        picked = _pick_fitting(ls, target)
+        ls[:] = picked
+
+
 async def run_digest(
     repo: Repository,
     llm,
@@ -230,8 +282,10 @@ async def run_digest(
     """Generate (and store) the report for one calendar day."""
     dc = cfg.digest
     start_ts, end_ts = day_range(date)
+    # full coverage by default: top_conversations=0 -> EVERY active
+    # conversation of the day gets a section (not just the busiest few)
     convs = await repo.conversations_active_between(
-        start_ts, end_ts, limit=max(1, dc.top_conversations)
+        start_ts, end_ts, limit=dc.top_conversations or -1
     )
 
     stats: dict = {"date": date, "conversations": len(convs), "sections": []}
@@ -241,12 +295,44 @@ async def run_digest(
         chatlog.log.info("DREAM      | %s empty (no active conversations)", date)
         return report
 
-    blocks: list[str] = []
+    # fetch every conversation's day (capped hard for pathological days);
+    # messages_per_conversation>0 acts as an explicit per-conv cap
+    conv_lines: list[list[str]] = []
     for c in convs:
-        scene, peer = c["scene"], c["peer_id"]
         rows = await repo.messages_between(
-            scene, peer, start_ts, end_ts, limit=dc.messages_per_conversation
+            c["scene"], c["peer_id"], start_ts, end_ts,
+            limit=dc.messages_per_conversation or 2000,
         )
+        conv_lines.append(
+            [
+                f"[{epoch_iso(r['time'])}] [{r['sender_id']}] "
+                f"{r['text_content'] or '(无文本)'}"
+                for r in rows
+            ]
+        )
+    _apply_transcript_budget(conv_lines, max(4000, dc.transcript_chars))
+
+    # prior-day reports for continuity (follow-ups, ongoing threads);
+    # walks back past digest-less days, capped so a long gap stays bounded
+    prior_blocks: list[str] = []
+    if dc.prior_days > 0:
+        d0 = datetime.strptime(date, "%Y-%m-%d")
+        got = back = 0
+        while got < dc.prior_days and back < 7:
+            back += 1
+            prev = (d0 - timedelta(days=back)).strftime("%Y-%m-%d")
+            prow = await repo.get_digest(prev)
+            if prow:
+                txt = prow["report"].strip()
+                if len(txt) > dc.prior_chars:
+                    txt = txt[: dc.prior_chars] + "…(截断)"
+                prior_blocks.append(f"[{prev}]\n{txt}")
+                got += 1
+    prior_txt = "\n\n".join(prior_blocks) or "(无)"
+
+    blocks: list[str] = []
+    for c, lines in zip(convs, conv_lines):
+        scene, peer = c["scene"], c["peer_id"]
         label = c.get("name") or f"{scene}/{peer}"
         name = label
         if adapter is not None:
@@ -257,19 +343,21 @@ async def run_digest(
                     name = await adapter.ensure_friend_name(peer) or label
             except Exception:
                 pass
-        lines = [
-            f"[{epoch_iso(r['time'])}] [{r['sender_id']}] {r['text_content'] or '(无文本)'}"
-            for r in rows
-        ]
-        blocks.append(
-            f"### {name} ({scene}/{peer}, 当日{c['cnt']}条, 摘{len(rows)}条)\n"
-            + "\n".join(lines)
-        )
+        sampled = len(lines) < c["cnt"]
+        head = f"### {name} ({scene}/{peer}, 当日{c['cnt']}条, 摘{len(lines)}条"
+        if sampled:
+            head += ", 全天均匀采样"
+        blocks.append(head + ")\n" + "\n".join(lines))
         stats["sections"].append(
-            {"scene": scene, "peer": peer, "name": name, "count": c["cnt"]}
+            {
+                "scene": scene, "peer": peer, "name": name,
+                "count": c["cnt"], "kept": len(lines), "sampled": sampled,
+            }
         )
 
-    prompt = DIGEST_PROMPT.format(date=date, transcript="\n\n".join(blocks))
+    prompt = DIGEST_PROMPT.format(
+        date=date, prior=prior_txt, transcript="\n\n".join(blocks)
+    )
     if not llm.configured:
         raise RuntimeError("LLM 未配置，无法做梦（检查 llm.chat.*）")
     msg = await llm.chat([{"role": "user", "content": prompt}])

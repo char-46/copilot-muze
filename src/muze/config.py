@@ -236,8 +236,13 @@ class DigestConfig(BaseModel):
 
     enabled: bool = True
     at: str = "01:00"  # local HH:MM (nightly)
-    top_conversations: int = 6
-    messages_per_conversation: int = 40
+    top_conversations: int = 0  # 0 = EVERY active conversation; N = busiest N only
+    messages_per_conversation: int = 0  # 0 = unlimited (budget-sampled); N = per-conv cap
+    transcript_chars: int = 48000  # global transcript budget fed to the LLM
+    # continuity: feed the previous N day reports into each digest so the
+    # LLM follows up (pending items resolved? ongoing threads' progress)
+    prior_days: int = 1  # 0 = summarize each day in isolation
+    prior_chars: int = 1600  # per prior report
     deliver: bool = True
     # --- morning briefing: push yesterday's digest to the admins at dawn ---
     morning_enabled: bool = True

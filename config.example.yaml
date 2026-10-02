@@ -112,8 +112,16 @@ digest:
   # user and their contacts (fed back into the agent's prompts).
   enabled: true
   at: "01:00"               # local time
-  top_conversations: 6      # busiest conversations per day
-  messages_per_conversation: 40
+  top_conversations: 0      # 0 = EVERY active conversation gets a section
+                            # (N = only the busiest N, not recommended)
+  messages_per_conversation: 0  # 0 = unlimited, even-sampled within budget
+                            # (N = hard per-conversation cap)
+  transcript_chars: 48000   # global transcript budget fed to the LLM; over
+                            # budget -> per-conversation even sampling that
+                            # keeps first+last messages, never drops a conv
+  prior_days: 1             # feed the previous N day reports into each
+                            # digest for follow-ups (0 = isolated days)
+  prior_chars: 1600         # per prior-report truncation
   deliver: true             # send the report to the control conversation
   # morning briefing: at dawn push yesterday's digest to the admins.
   # Targets default to every controller (private) + the control group;
