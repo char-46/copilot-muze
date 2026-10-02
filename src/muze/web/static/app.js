@@ -915,7 +915,7 @@ const CFG_FIELDS = [
     { path: "reply.forward_chars", label: "超长阈值（>此字数走合并转发链，0=关闭）", type: "text" },
     { path: "reply.strip_markdown", label: "QQ 文本去 markdown 标记", type: "checkbox" },
     { path: "reply.image_markdown", label: "附渲染图（图文，保留排版）", type: "checkbox" },
-    { path: "reply.render_font", label: "渲染字体文件（空=自动：data/fonts 或下载霞鹜文楷）", type: "text" },
+    { path: "reply.render_font", label: "渲染字体文件（空=内置字体；可放 MapleMono/LxgwWenKai 到 data/fonts/）", type: "text" },
   ]},
 ];
 

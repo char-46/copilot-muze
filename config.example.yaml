@@ -153,10 +153,9 @@ reply:                          # outbound QQ replies: full text, QQ-safe form
   node_chars: 4200             # per-node cap inside the chain
   strip_markdown: true         # QQ text is plain: strip md markers
   image_markdown: true         # send the rendered (formatted) image along -
-                               # 图文 with the plain text; fonts: drop
-                               # MapleMono*.ttf or LxgwWenKai*.ttf into
-                               # data/fonts/ (auto-downloads LXGW WenKai
-                               # otherwise, system CJK font as last resort)
+                               # 图文 with the plain text; rendering uses
+                               # bundled CJK fonts; drop MapleMono*.ttf or
+                               # LxgwWenKai*.ttf into data/fonts/ to override
   image_max_chars: 80000       # render at most this much source text
   render_font: ""              # explicit font file path; empty = auto
   # PDF export reuses the same renderer: /topdf (quote a message) and

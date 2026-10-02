@@ -377,6 +377,13 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                     s = None
         if s is None:
             return web.json_response({"error": "no such session"}, status=404)
+        from muze.ai.sessions import legacy_final_tail
+
+        _, _, runtime = pick(request)
+        tail = await legacy_final_tail(repo, s, getattr(runtime, "self_id", 0))
+        messages = list(s.messages or [])
+        if tail is not None:
+            messages.append(tail)
         return web.json_response(
             {
                 "id": s.id,
@@ -395,7 +402,7 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                 "events": [
                     {"t": round(t, 1), "kind": k, "detail": d} for t, k, d in s.events
                 ],
-                "messages": s.messages,
+                "messages": messages,
             }
         )
 

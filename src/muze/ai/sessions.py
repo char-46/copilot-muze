@@ -165,6 +165,49 @@ class Session:
         return body
 
 
+async def legacy_final_tail(repo, session: "Session", self_id: int) -> dict | None:
+    """Display-only compatibility for sessions created before 0.1.0-alpha.82:
+    the final assistant answer was never appended to the loop messages, so
+    the webui session view had no complete output (just a 200-char preview).
+
+    Best effort recovery: the bot's own archived reply in the control chat
+    (matched by preview head + time window; pre-alpha.82 delivery capped it
+    at 3000 chars). Falls back to the preview with a note. Returns a
+    loop-style assistant message dict, or None when nothing to add."""
+    msgs = session.messages or []
+    if not msgs:
+        return None
+    last = msgs[-1]
+    if last.get("role") == "assistant" and not last.get("tool_calls"):
+        return None  # already carries a final answer
+    if session.status != "done":
+        return None  # suspended/error turns have no final to recover
+    preview = (session.result_preview or "").strip()
+    if not preview:
+        return None
+    text = ""
+    key = (session.chat_key or "").split(":")
+    if len(key) == 3 and key[0] == "qq" and key[1] in ("friend", "group"):
+        try:
+            rows = await repo.get_messages(key[1], int(key[2]), limit=100)
+        except Exception:
+            rows = []
+        lo = session.created - 120
+        hi = (session.updated or session.created) + 900
+        head = preview[:20]
+        for r in rows:
+            if r["sender_id"] != self_id or not (lo <= r["time"] <= hi):
+                continue
+            tc = (r["text_content"] or "").strip()
+            if tc and tc.startswith(head):
+                text = tc
+                break
+    if not text:
+        text = preview + "\n\n(旧会话的完整输出未存档，以上为 200 字预览；alpha.82 起完整保留)"
+    elif len(text) >= 2990:
+        text += "\n\n(旧会话经 QQ 送达，存档上限约 3000 字)"
+    return {"role": "assistant", "content": text, "legacy": True}
+
 class SessionStore:
     def __init__(self, cap: int = 100) -> None:
         self.cap = cap

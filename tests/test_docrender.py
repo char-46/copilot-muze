@@ -1,17 +1,13 @@
-"""Document rendering (markdown -> PDF -> PNG): font resolution, md
-detection, byte-level output checks. Downloads are disabled so the suite
-never pulls the 24MB LXGW font; system fonts cover the render."""
+"""Document rendering (markdown -> PDF -> PNG): markdown detection,
+byte-level output checks, user-font drop-in. The PyMuPDF Story engine
+bundles CJK fallback fonts, so no font setup is required."""
+
+import shutil
+from pathlib import Path
 
 import pytest
 
 from muze import render as R
-
-pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
-
-
-@pytest.fixture(autouse=True)
-def no_download(monkeypatch):
-    monkeypatch.setattr(R, "_download", lambda url, dest: False)
 
 
 def test_looks_markdown():
@@ -20,10 +16,13 @@ def test_looks_markdown():
     assert not R.looks_markdown("普通文本一行。\n第二行。")
 
 
-def test_resolve_fonts_system_fallback(tmp_path):
-    fonts = R.resolve_fonts(tmp_path)
-    assert "body" in fonts
-    assert "mono" in fonts  # mono falls back to body
+def test_find_user_font(tmp_path):
+    assert R.find_user_font(None) is None
+    assert R.find_user_font(tmp_path) is None  # empty dir
+    f = tmp_path / "LxgwWenKai-Regular.ttf"
+    shutil.copy(r"C:\Windows\Fonts\Deng.ttf", f)
+    assert R.find_user_font(tmp_path) == f
+    assert R.find_user_font(None, override=str(f)) == f
 
 
 def test_render_pdf_bytes(tmp_path):
@@ -31,14 +30,23 @@ def test_render_pdf_bytes(tmp_path):
         pytest.skip("render deps missing")
     pdf = R.render_pdf("# 报告\n\n- 甲项\n- 乙项\n\n正文 **加粗**。", tmp_path)
     assert pdf[:5] == b"%PDF-"
-    assert len(pdf) > 10000  # an embedded CJK subset is never tiny
-    assert b"FontFile2" in pdf
+    assert len(pdf) > 10000  # CJK font subset embedded
 
 
 def test_render_pdf_plain_text(tmp_path):
     if not R.RENDER_OK:
         pytest.skip("render deps missing")
     pdf = R.render_pdf("纯文本一段。\n第二行。", tmp_path, markdown=False)
+    assert pdf[:5] == b"%PDF-"
+
+
+def test_render_pdf_user_font(tmp_path):
+    if not R.RENDER_OK:
+        pytest.skip("render deps missing")
+    (tmp_path / "MapleMono-NF-CN-Regular.ttf").write_bytes(
+        Path(r"C:\Windows\Fonts\Deng.ttf").read_bytes()
+    )
+    pdf = R.render_pdf("# 用自定义字体\n\n正文内容。", tmp_path)
     assert pdf[:5] == b"%PDF-"
 
 

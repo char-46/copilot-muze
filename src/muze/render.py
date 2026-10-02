@@ -5,135 +5,56 @@ Used for two outbound reply forms:
   (QQ plain text carries no formatting);
 - /topdf & /sess getpdf export documents as PDF files.
 
-Pipeline: markdown -> HTML (python-markdown) -> PDF (xhtml2pdf, fonts
-embedded as base64 @font-face — path/URL font loading is unreliable on
-Windows) -> PNG (pypdfium2 raster, pages stitched vertically).
+Pipeline: markdown -> HTML (python-markdown) -> PDF (PyMuPDF Story, the C
+MuPDF layout engine with bundled CJK fallback fonts — no font setup needed,
+~30ms per page) -> PNG (PyMuPDF raster, pages stitched vertically with PIL).
 
-Fonts: user-droppable data/fonts/ wins (Maple Mono* or LxgwWenKai*), else
-LXGW WenKai is downloaded there once (GitHub direct TTF links), else system
-CJK fonts. PDF is the intermediate of the PNG path, so a future PDF export
-needs no extra plumbing (render_pdf is exposed directly).
+A user font (Maple Mono / LXGW WenKai / any .ttf dropped into data/fonts/)
+still wins: it is passed to Story via an Archive + @font-face.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
 import logging
 import re
-import urllib.request
 from pathlib import Path
 
 log = logging.getLogger("muze.render")
 
-# deps are optional at import time (rendering degrades to "no image")
 try:  # pragma: no cover - trivial import guard
     import markdown as _md
-    import pypdfium2 as _pdfium
-    from PIL import Image
-    from xhtml2pdf import pisa
+    import pymupdf
 
     RENDER_OK = True
 except Exception:  # pragma: no cover
-    _md = _pdfium = Image = pisa = None
+    _md = pymupdf = None
     RENDER_OK = False
 
-# LXGW WenKai: open-source (OFL) CJK font, direct TTF release assets.
-_LXGW_TAG = "v1.520"
-_FONT_URLS = {
-    "body": f"https://github.com/lxgw/LxgwWenKai/releases/download/{_LXGW_TAG}/LXGWWenKai-Regular.ttf",
-    "mono": f"https://github.com/lxgw/LxgwWenKai/releases/download/{_LXGW_TAG}/LXGWWenKaiMono-Regular.ttf",
-}
-# user-dropped files win; first pattern match per role is used
-_LOCAL_PATTERNS = {
-    "body": ["maplemono*cn*regular*.ttf", "maplemono*-regular*.ttf", "maplemono*.ttf",
-             "lxgwwenkalite*.ttf", "lxgwwenkai-regular*.ttf", "lxgwwenkai.ttf", "wenkai*.ttf"],
-    "mono": ["maplemono*cn*regular*.ttf", "maplemono*-regular*.ttf", "maplemono*.ttf",
-             "lxgwwenkaimono*.ttf"],
-}
-# last-resort system fonts (Windows-first, then common Linux/macOS)
-_SYSTEM_CANDIDATES = [
-    r"C:\Windows\Fonts\Deng.ttf",
-    r"C:\Windows\Fonts\msyh.ttf",
-    r"C:\Windows\Fonts\simhei.ttf",
-    r"C:\Windows\Fonts\simfang.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/System/Library/Fonts/PingFang.ttc",
+# user-dropped font files win (first pattern match is used, any role)
+_LOCAL_PATTERNS = [
+    "maplemono*cn*regular*.ttf", "maplemono*-regular*.ttf", "maplemono*.ttf",
+    "lxgwwenkai*.ttf", "lxgw*.ttf", "wenkai*.ttf",
 ]
 
-_bytes_cache: dict[str, bytes] = {}
 
-
-# ------------------------------------------------------------------ fonts
-def _download(url: str, dest: Path) -> bool:
-    try:
-        log.info("downloading font %s -> %s", url.split("/")[-1], dest)
-        req = urllib.request.Request(url, headers={"User-Agent": "muze"})
-        with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-        return dest.stat().st_size > 1_000_000
-    except Exception as e:
-        log.warning("font download failed (%s): %s", url, e)
-        dest.unlink(missing_ok=True)
-        return False
-
-
-def _find_local(directory: Path, patterns: list[str]) -> Path | None:
-    if not directory.is_dir():
+def find_user_font(font_dir: Path | None, override: str = "") -> Path | None:
+    """Explicit override file, else a dropped-in font under font_dir."""
+    if override:
+        p = Path(override)
+        if p.is_file():
+            return p
+        log.warning("render_font %s not found, using built-in fonts", override)
+    d = Path(font_dir) if font_dir else None
+    if not d or not d.is_dir():
         return None
-    files = {p.name.lower(): p for p in directory.glob("*.ttf")}
-    for pat in patterns:
+    files = {p.name.lower(): p for p in d.glob("*.ttf")}
+    for pat in _LOCAL_PATTERNS:
         for name, p in files.items():
             if re.fullmatch(pat.replace(".", r"\.").replace("*", ".*"), name):
                 return p
     return None
-
-
-def resolve_fonts(font_dir: Path | None) -> dict[str, bytes]:
-    """role -> font file bytes; roles: body, mono. Cached by path+mtime."""
-    out: dict[str, bytes] = {}
-    d = Path(font_dir) if font_dir else None
-    for role in ("body", "mono"):
-        src: Path | None = None
-        if d is not None:
-            src = _find_local(d, _LOCAL_PATTERNS[role])
-            if src is None and role == "body" and out.get("body") is None:
-                pass  # fall through to download below
-        if src is None and d is not None and role in _FONT_URLS and RENDER_OK:
-            dest = d / _FONT_URLS[role].split("/")[-1]
-            if not dest.exists() and _download(_FONT_URLS[role], dest):
-                pass
-            if dest.exists():
-                src = dest
-        if src is None and role == "mono":
-            src = None  # mono is optional: body covers code with CJK glyphs
-        if src is None:
-            continue
-        key = str(src)
-        blob = _bytes_cache.get(key)
-        if blob is None:
-            blob = Path(src).read_bytes()
-            _bytes_cache[key] = blob
-        out[role] = blob
-    if "body" not in out:  # system fallback, same file for both roles
-        for cand in _SYSTEM_CANDIDATES:
-            p = Path(cand)
-            if p.exists():
-                blob = _bytes_cache.get(cand)
-                if blob is None:
-                    blob = p.read_bytes()
-                    _bytes_cache[cand] = blob
-                out["body"] = blob
-                break
-    if "mono" not in out and "body" in out:
-        out["mono"] = out["body"]  # CJK-safe code font (mono if provided)
-    return out
 
 
 # ------------------------------------------------------------------- html
@@ -161,65 +82,80 @@ def looks_markdown(text: str) -> bool:
     """Heuristic: does this text carry markdown worth rendering?"""
     if not text:
         return False
-    hits = sum(1 for rx in _MD_HINTS if rx.search(text))
-    return hits >= 1
+    return any(rx.search(text) for rx in _MD_HINTS)
 
 
-def _b64_uri(blob: bytes) -> str:
-    return "data:font/ttf;base64," + base64.b64encode(blob).decode()
+def _esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _css(fonts: dict[str, bytes]) -> str:
-    body = fonts["body"]
-    mono = fonts.get("mono") or body
-    face = f"@font-face {{ font-family: muzefont; src: url({_b64_uri(body)}); }}"
-    facem = f"@font-face {{ font-family: muzemono; src: url({_b64_uri(mono)}); }}"
-    return face + facem + """
-body { font-family: muzefont; font-size: 12px; line-height: 1.55; }
-h1 { font-size: 18px; } h2 { font-size: 15px; } h3 { font-size: 13px; }
-h1, h2, h3, h4 { -pdf-keep-with-next: true; }
-p { margin: .35em 0; }
-ul, ol { margin: .3em 0 .3em 0; }
-li { margin: .1em 0; }
-pre { font-family: muzemono; font-size: 10.5px; background-color: #f2f2f2;
-      padding: 6px 8px; margin: .4em 0; }
-code { font-family: muzemono; font-size: 10.5px; }
-blockquote { color: #444444; margin: .4em 0 .4em 10px; }
-table { margin: .4em 0; -pdf-keep-in-frame-mode: shrink; }
-td, th { padding: 3px 8px; font-size: 11px; }
-hr { margin: .5em 0; }
+_BASE_CSS = """
+body { font-size: 12px; }
+h1 { font-size: 1.6em; font-weight: bold; }
+h2 { font-size: 1.35em; font-weight: bold; }
+h3 { font-size: 1.15em; font-weight: bold; }
+pre { background-color: #f0f0f0; font-family: sans-serif; }
+code { font-family: sans-serif; }
+blockquote { color: #444444; margin-left: 1em; }
 """
 
 
+def _story_pdf(html_body: str, font: Path | None) -> bytes:
+    css = _BASE_CSS
+    arch = None
+    if font is not None:
+        css = (
+            f"@font-face {{ font-family: muzefont; src: url({font.name}); }}\n"
+            "body { font-family: muzefont; font-size: 12px; }\n"
+            "h1 { font-size: 1.6em; font-weight: bold; }\n"
+            "h2 { font-size: 1.35em; font-weight: bold; }\n"
+            "h3 { font-size: 1.15em; font-weight: bold; }\n"
+            "pre { background-color: #f0f0f0; font-family: muzefont; }\n"
+            "code { font-family: muzefont; }\n"
+            "blockquote { color: #444444; margin-left: 1em; }\n"
+        )
+        arch = pymupdf.Archive(str(font.parent))
+    story = pymupdf.Story(html=f"<html><body>{html_body}</body></html>",
+                          user_css=css, archive=arch)
+    buf = io.BytesIO()
+    writer = pymupdf.DocumentWriter(buf)
+    mediabox = pymupdf.paper_rect("a4")
+    where = mediabox + (40, 40, -40, -40)
+    more = 1
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------- document
-def render_pdf(text: str, font_dir: Path | None = None, *, markdown: bool | None = None) -> bytes:
+def render_pdf(
+    text: str,
+    font_dir: Path | None = None,
+    *,
+    markdown: bool | None = None,
+    font_override: str = "",
+) -> bytes:
     """Markdown/plain text -> PDF bytes. ``markdown=None`` auto-detects."""
     if not RENDER_OK:
         raise RuntimeError("rendering dependencies unavailable")
-    fonts = resolve_fonts(font_dir)
-    if "body" not in fonts:
-        raise RuntimeError("no usable CJK font found (drop one into data/fonts/)")
     if markdown is None:
         markdown = looks_markdown(text)
     if markdown:
         html_body = markdown_to_html(text)
     else:
-        html_body = "<p>" + _esc(text).replace("\n", "<br>") + "</p>"
-    doc = (
-        "<html><head><style>" + _css(fonts) + "</style></head><body>"
-        + html_body + "</body></html>"
-    )
-    buf = io.BytesIO()
-    rc = pisa.CreatePDF(io.StringIO(doc), dest=buf)
-    if rc.err:
-        raise RuntimeError(f"pdf render failed: {rc.err}")
-    return buf.getvalue()
-
-
-def _esc(text: str) -> str:
-    return (
-        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    )
+        html_body = "<p>" + _esc(text or "").replace("\n", "<br>") + "</p>"
+    font = find_user_font(font_dir, font_override)
+    pdf = _story_pdf(html_body, font)
+    try:  # shrink the embedded fallback font (no-op without fonttools)
+        doc = pymupdf.Document(stream=pdf, filetype="pdf")
+        doc.subset_fonts()
+        return doc.tobytes()
+    except Exception:
+        return pdf
 
 
 def render_png(
@@ -229,20 +165,24 @@ def render_png(
     markdown: bool | None = None,
     scale: float = 2.0,
     max_pages: int = 8,
+    font_override: str = "",
 ) -> bytes | None:
     """Text -> single tall PNG (A4 pages stitched vertically). None = failed."""
     if not RENDER_OK:
         return None
     try:
-        pdf = render_pdf(text, font_dir, markdown=markdown)
-        doc = _pdfium.PdfDocument(pdf)
+        pdf = render_pdf(text, font_dir, markdown=markdown, font_override=font_override)
+        doc = pymupdf.Document(stream=pdf, filetype="pdf")
         n = min(len(doc), max_pages)
-        imgs = [doc[i].render(scale=scale).to_pil() for i in range(n)]
-        if not imgs:
+        if n <= 0:
             return None
+        dpi = int(72 * max(1.0, scale))
+        imgs = [doc[i].get_pixmap(dpi=dpi).pil_image() for i in range(n)]
         if len(imgs) == 1:
             out = imgs[0]
         else:
+            from PIL import Image
+
             w = max(im.width for im in imgs)
             h = sum(im.height for im in imgs)
             out = Image.new("RGB", (w, h), "white")

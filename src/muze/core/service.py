@@ -354,19 +354,18 @@ class ControlService:
     def _font_dir(self) -> "Path | None":
         from pathlib import Path
 
-        override = (getattr(self.cfg.reply, "render_font", "") or "").strip()
-        if override:
-            p = Path(override)
-            return p.parent if p.is_file() else Path(self.cfg.storage.data_dir) / "fonts"
-        d = Path(self.cfg.storage.data_dir) / "fonts"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return Path(self.cfg.storage.data_dir) / "fonts"
 
     async def _render_png(self, text: str) -> "Path | None":
         """Rendered markdown image of the FULL text; None = skip silently."""
         from muze.render import png_cache_key, render_png
 
-        png = await asyncio.to_thread(render_png, text, self._font_dir())
+        png = await asyncio.to_thread(
+            render_png,
+            text,
+            self._font_dir(),
+            font_override=(self.cfg.reply.render_font or ""),
+        )
         if not png:
             return None
         p = self._render_dir() / f"{png_cache_key(text)}.png"
@@ -1617,7 +1616,10 @@ class ControlService:
             if not body:
                 return CommandOutcome.err("引用的消息没有文本内容")
         try:
-            pdf = await asyncio.to_thread(render_pdf, body, self._font_dir())
+            pdf = await asyncio.to_thread(
+                render_pdf, body, self._font_dir(),
+                font_override=(self.cfg.reply.render_font or ""),
+            )
         except Exception as e:
             return CommandOutcome.err(f"渲染失败: {e}")
         name = f"muze-{title[:16].strip() or 'doc'}-{ctx.reply_seq}.pdf"
@@ -1654,7 +1656,10 @@ class ControlService:
                 parts += [f"<details-tool `{m.get('name', '')}`>", (m.get("content") or "")[:2000], ""]
         body = "\n".join(parts)
         try:
-            pdf = await asyncio.to_thread(render_pdf, body, self._font_dir())
+            pdf = await asyncio.to_thread(
+                render_pdf, body, self._font_dir(),
+                font_override=(self.cfg.reply.render_font or ""),
+            )
         except Exception as e:
             return CommandOutcome.err(f"渲染失败: {e}")
         name = f"muze-sess-{session.id}.pdf"
