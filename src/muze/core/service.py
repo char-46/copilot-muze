@@ -23,7 +23,7 @@ from typing import Awaitable, Callable
 from muze.chatlog import ChatLog, conv_id, render_segment, size_fmt
 from muze.config import MuzeConfig, is_control_conversation
 from muze.provider.base import NotSupported, ProtocolAdapter, ProtocolError
-from muze.provider.milky.models import out_file, out_image, out_reply, out_text
+from muze.provider.milky.models import out_image, out_reply, out_text
 from muze.reply import has_markdown_structure, plain_chunks, split_forward_nodes, strip_markdown
 from muze.store.media import to_file_uri
 from muze.store.repo import Repository
@@ -418,11 +418,24 @@ class ControlService:
                         await self._send_segments(scene, peer_id, [out_image(to_file_uri(p))])
             else:
                 segs: list[dict] = [out_text(plain)]
-                if want_image:
-                    p = await self._render_png(text)
-                    if p:
-                        segs.append(out_image(to_file_uri(p)))
-                res = await self._send_segments(scene, peer_id, segs)
+                img_path = await self._render_png(text) if want_image else None
+                if img_path is not None:
+                    segs.append(out_image(to_file_uri(img_path)))
+                try:
+                    res = await self._send_segments(scene, peer_id, segs)
+                except ProtocolError:
+                    if img_path is None:
+                        raise
+                    # 图文合发被拒（如图片形状问题）不能连带吞掉文字：
+                    # 降级为纯文字，图片单独再试一次
+                    log.warning("tuwen send failed, falling back to text-only")
+                    res = await self._send_segments(scene, peer_id, [out_text(plain)])
+                    try:
+                        await self._send_segments(
+                            scene, peer_id, [out_image(to_file_uri(img_path))]
+                        )
+                    except ProtocolError as e:
+                        log.warning("image follow-up failed: %s", e)
                 self.chatlog.sent(scene, peer_id, res.message_seq, preview or plain[:80])
         except ProtocolError as e:
             log.warning("send_text to %s failed: %s", conv_id(scene, peer_id), e)
@@ -1627,7 +1640,7 @@ class ControlService:
         path.write_bytes(pdf)
         if ctx.qq_reachable:
             try:
-                await self._send_segments(ctx.scene, ctx.peer_id, [out_file(to_file_uri(path), name)])
+                await self.adapter.send_file(ctx.scene, ctx.peer_id, str(path), name)
             except ProtocolError as e:
                 return CommandOutcome.err(f"PDF 已生成但发送失败（{path}）: {e}")
         return CommandOutcome(f"PDF 已生成并发送（{len(pdf) // 1024}KB）")
@@ -1667,7 +1680,7 @@ class ControlService:
         path.write_bytes(pdf)
         if ctx.qq_reachable:
             try:
-                await self._send_segments(ctx.scene, ctx.peer_id, [out_file(to_file_uri(path), name)])
+                await self.adapter.send_file(ctx.scene, ctx.peer_id, str(path), name)
             except ProtocolError as e:
                 return CommandOutcome.err(f"PDF 已生成但发送失败（{path}）: {e}")
         return CommandOutcome(f"会话 #{session.id} 的 PDF 已生成并发送")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from muze.config import MilkyEndpoint
@@ -327,6 +328,26 @@ class MilkyAdapter(ProtocolAdapter):
             self.caps.send_forward = False
             self._degrade(f"forward send degraded: {e}")
             raise NotSupported(str(e)) from e
+
+    async def send_file(self, scene: str, peer_id: int, path: str, name: str = "") -> str:
+        """Real file delivery via the upload APIs (LLBot extension; Milky
+        outbound segments have no file type)."""
+        from muze.store.media import to_file_uri
+
+        api = "upload_group_file" if scene == "group" else "upload_private_file"
+        params: dict[str, Any] = {
+            "file_uri": to_file_uri(path),
+            "file_name": name or Path(path).name,
+        }
+        if scene == "group":
+            params = {"group_id": peer_id, **params}
+        else:
+            params = {"user_id": peer_id, **params}
+        try:
+            data = await self.client.call(api, params)
+        except ProtocolError as e:
+            raise NotSupported(f"file upload failed: {e}") from e
+        return str((data or {}).get("file_id", ""))
 
     async def get_history_messages(
         self,

@@ -65,7 +65,7 @@ async def seed_message(repo, seq=10, text="一段长文本内容", segments=None
 
 
 def sent_files(adapter):
-    return [s for _, _, segs in adapter.sent for s in segs if s["type"] == "file"]
+    return [(scene, peer, name) for scene, peer, name in getattr(adapter, "files", [])]
 
 
 async def test_topdf_quoted_text_message(env, fake_pdf):
@@ -75,7 +75,7 @@ async def test_topdf_quoted_text_message(env, fake_pdf):
     assert not out.is_error, out.text
     assert fake_pdf and "长**文本**内容" in fake_pdf[0]  # markdown kept for render
     files = sent_files(adapter)
-    assert files and files[0]["data"]["file_name"].endswith(".pdf")
+    assert files and files[0][2].endswith(".pdf")
 
 
 async def test_topdf_without_quote_errors(env):
@@ -147,4 +147,4 @@ async def test_sess_getpdf(env, fake_pdf):
     assert not out.is_error, out.text
     assert fake_pdf and "最终**答案**" in fake_pdf[0]
     files = sent_files(adapter)
-    assert files and "ab12" in files[0]["data"]["file_name"]
+    assert files and "ab12" in files[0][2]

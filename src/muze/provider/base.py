@@ -158,6 +158,13 @@ class ProtocolAdapter(ABC):
         """Send a merged-forward chain (each node = a segment list)."""
         raise NotSupported("forward send not supported by this protocol side")
 
+    async def send_file(
+        self, scene: str, peer_id: int, path: str, name: str = ""
+    ) -> str:
+        """Send a real FILE (Milky outbound has no file segment; protocol
+        sides provide an upload API). Returns a file id."""
+        raise NotSupported("file send not supported by this protocol side")
+
     @abstractmethod
     async def get_history_messages(
         self,

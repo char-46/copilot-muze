@@ -6,7 +6,7 @@ import pytest
 from muze.chatlog import ChatLog
 from muze.config import MuzeConfig
 from muze.core.service import ControlContext, ControlService, Runtime
-from muze.provider.base import Caps, NotSupported, ProtocolAdapter
+from muze.provider.base import Caps, NotSupported, ProtocolAdapter, ProtocolError
 from muze.provider.milky.models import SendMessageResult
 from muze.store.db import open_db
 from muze.store.repo import Repository
@@ -18,6 +18,11 @@ class Recorder(ProtocolAdapter):
         self.caps.send_forward = forward_ok
         self.sent: list[tuple[str, int, list]] = []
         self.forwarded: list[tuple[str, int, list]] = []
+        self.files: list[tuple[str, int, str]] = []
+
+    async def send_file(self, scene, peer_id, path, name=""):
+        self.files.append((scene, peer_id, name))
+        return "fid-fake"
 
     async def start(self):
         raise NotImplementedError
@@ -183,6 +188,27 @@ async def test_render_failure_never_blocks_text(env, monkeypatch):
     await service.send_text("friend", 1, "# 标题\n正文" + "长" * 6000)
     assert adapter.forwarded  # chain still sent
     assert adapter.sent == []  # no image, no crash
+
+
+async def test_tuwen_failure_keeps_text(env, monkeypatch, tmp_path):
+    """图文合发被协议端拒绝时，文字必须照发（不能被图片拖死）。"""
+    service, adapter, *_ = env
+    fake_png(monkeypatch, service, tmp_path / "d.png")
+    calls = {"n": 0}
+
+    orig = service._send_segments
+
+    async def flaky(scene, peer, segs):
+        if any(s["type"] == "image" for s in segs) and calls["n"] == 0:
+            calls["n"] += 1
+            raise ProtocolError("send_private_message: retcode=-400 image shape")
+        return await orig(scene, peer, segs)
+
+    monkeypatch.setattr(service, "_send_segments", flaky)
+    await service.send_text("friend", 1, "# 标题\n\n**加粗**正文")
+    texts_sent = [t for _, _, segs in adapter.sent for t in texts(segs)]
+    assert "标题\n\n加粗正文" in texts_sent  # text survived
+    assert any(s["type"] == "image" for _, _, segs in adapter.sent for s in segs)
 
 
 async def test_deliver_routes_long_text_through_chain(env, monkeypatch, tmp_path):

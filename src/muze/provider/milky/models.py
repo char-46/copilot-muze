@@ -369,18 +369,23 @@ def out_reply(message_seq: int) -> dict:
 
 
 def out_image(file_uri: str) -> dict:
-    return {"type": "image", "data": {"file_uri": file_uri}}
+    # Milky outbound media field is "uri" (spec + LLBot-verified); the old
+    # "file_uri" key made LLBot reject the WHOLE message (retcode -400)
+    return {"type": "image", "data": {"uri": file_uri}}
 
 
 def out_record(file_uri: str) -> dict:
-    return {"type": "record", "data": {"file_uri": file_uri}}
+    return {"type": "record", "data": {"uri": file_uri}}
 
 
 def out_video(file_uri: str) -> dict:
-    return {"type": "video", "data": {"file_uri": file_uri}}
+    return {"type": "video", "data": {"uri": file_uri}}
 
 
 def out_file(file_uri: str, file_name: str = "") -> dict:
+    """Internal shape only — Milky outbound has NO file segment; real file
+    delivery goes through upload_private_file / upload_group_file (see
+    MilkyAdapter.send_file)."""
     data: dict = {"file_uri": file_uri}
     if file_name:
         data["file_name"] = file_name

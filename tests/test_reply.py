@@ -1,12 +1,21 @@
 """Reply shaping: markdown stripping, structure detection, chain splitting."""
 
-from muze.provider.milky.models import out_forward, out_text
+from muze.provider.milky.models import out_forward, out_image, out_record, out_text, out_video
 from muze.reply import (
     has_markdown_structure,
     plain_chunks,
     split_forward_nodes,
     strip_markdown,
 )
+
+
+def test_outbound_media_segments_use_spec_uri_field():
+    # Milky outbound media data field is "uri" — LLBot rejects the whole
+    # message otherwise (retcode -400 invalid_type at data/uri)
+    for seg in (out_image("file:///x/a.png"), out_record("file:///x/a.silk"),
+                out_video("file:///x/a.mp4")):
+        assert seg["data"] == {"uri": seg["data"]["uri"]}
+        assert "file_uri" not in seg["data"]
 
 
 def test_strip_basic_markers():
