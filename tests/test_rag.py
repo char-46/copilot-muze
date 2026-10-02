@@ -215,6 +215,7 @@ def _gov(**over):
     g.cpu_busy = lambda: over.get("cpu")
     g.gpu_util = lambda: over.get("gpu")
     g.gpu_free_gb = lambda: over.get("free")
+    g.gpu_vram_used_pct = lambda: over.get("vram")  # None -> pressure unknown, no veto
     return g
 
 
@@ -515,6 +516,104 @@ async def test_run_forced_repicks_device_before_first_pass(repo):
 def test_governor_force_uses_full_thread_cap():
     assert _gov(power=True, cpu=90, gpu=0, free=8).cpu_threads(force=True) == 4
     assert _gov(power=True, cpu=100, gpu=0, free=8).cpu_threads() == 1  # busy-scaled
+
+
+# ------------------------------------------------------ vram stewardship
+class _FakeSTModel:
+    def __init__(self):
+        self.moves: list[str] = []
+
+    def to(self, device):
+        self.moves.append(device)
+
+
+class _PressureGovernor:
+    def __init__(self, pressed, fits=False):
+        self.pressed = pressed
+        self.fits = fits
+
+    def vram_pressure(self):
+        return (self.pressed, "vram 95% >= 85%") if self.pressed else (False, "vram 40%")
+
+    def gpu_fits(self):
+        return (True, "ok") if self.fits else (False, "no")
+
+
+def _st_embedder():
+    emb = Embedder(MuzeConfig().rag.embedding)
+    emb._local = _FakeSTModel()
+    emb._device = "cuda"
+    return emb
+
+
+async def test_vram_eviction_moves_st_model_to_ram():
+    emb = _st_embedder()
+    out = await emb.evict_if_vram_pressure(_PressureGovernor(pressed=True))
+    assert out == "cpu"
+    assert emb._device == "cpu"
+    assert emb._local.moves == ["cpu"]  # kept in RAM, still usable
+    assert emb._local is not None
+
+
+async def test_vram_eviction_drops_fastembed():
+    emb = _st_embedder()
+    emb.cfg.backend = "fastembed"
+    out = await emb.evict_if_vram_pressure(_PressureGovernor(pressed=True))
+    assert out == "unloaded"
+    assert emb._local is None and emb._device == ""
+
+
+async def test_vram_eviction_noop_when_not_pressed_or_cpu():
+    g = _PressureGovernor(pressed=False)
+    assert await _st_embedder().evict_if_vram_pressure(g) is None
+    emb = _st_embedder()
+    emb._device = "cpu"  # already off the GPU
+    assert await emb.evict_if_vram_pressure(_PressureGovernor(pressed=True)) is None
+    assert await _st_embedder().evict_if_vram_pressure(None) is None
+
+
+async def test_gpu_promotion_reloads_on_cuda_when_fits():
+    emb = _st_embedder()
+    emb._device = "cpu"
+    loads = []
+
+    async def fake_load(device, governor=None, full_threads=False):
+        loads.append(device)
+        emb._device = device
+        emb._local = _FakeSTModel()
+
+    emb._load_local = fake_load
+    ok = await emb.promote_to_gpu_if_fits(_PressureGovernor(pressed=False, fits=True))
+    assert ok is True and loads == ["cuda"] and emb._device == "cuda"
+    # not fitting / explicit cpu config -> no promotion
+    emb2 = _st_embedder()
+    emb2._device = "cpu"
+    assert await emb2.promote_to_gpu_if_fits(_PressureGovernor(False, fits=False)) is False
+    emb3 = _st_embedder()
+    emb3._device = "cpu"
+    emb3.cfg.device = "cpu"
+    assert await emb3.promote_to_gpu_if_fits(_PressureGovernor(False, fits=True)) is False
+
+
+def test_governor_vram_pressure_and_device_gate():
+    g = _gov(power=True, cpu=5, gpu=5, free=8)
+    g.gpu_vram_used_pct = lambda: 92.0
+    assert g.vram_pressure() == (True, "vram 92% >= 85%")
+    # free GB would fit (1.6G) but system-wide pressure vetoes the GPU
+    g.gpu_free_gb = lambda: 2.0
+    assert g.choose_device() == "cpu"
+    # comfortable again -> cuda
+    g.gpu_vram_used_pct = lambda: 40.0
+    g.gpu_free_gb = lambda: 8.0
+    assert g.choose_device() == "cuda"
+    # threshold 0 disables the gate entirely
+    g.cfg.embedding.vram_evict_pct = 0
+    g.gpu_vram_used_pct = lambda: 99.0
+    assert g.vram_pressure()[0] is False
+    # unknown -> no veto
+    g.cfg.embedding.vram_evict_pct = 85.0
+    g.gpu_vram_used_pct = lambda: None
+    assert g.vram_pressure()[0] is False
 
 
 # ------------------------------------------------------ auto-inject

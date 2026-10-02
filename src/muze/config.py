@@ -195,6 +195,7 @@ class RagEmbedding(BaseModel):
     gpu_weight_gb: float = 1.6  # VRAM the model needs (0.6B fp16 + overhead)
     gpu_reserve_gb: float = 0.8  # comfortable tier headroom (squeeze tier eats it)
     gpu_max_util: float = 50.0  # use GPU only while utilisation is below this
+    vram_evict_pct: float = 85.0  # system-wide VRAM usage >= this evicts a GPU-resident model to RAM (0=off)
     cpu_max_threads: int = 4  # cap for CPU inference (dynamic below this)
     unload_idle_sec: float = 1800.0  # free the local model after this idle (0=never)
 

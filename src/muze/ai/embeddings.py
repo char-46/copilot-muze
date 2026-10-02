@@ -10,7 +10,10 @@ the rest of the process:
   between batches;
 - **back-off**: repeated failures trip a cooldown so we never hammer a broken
   backend; while cooling, a configured remote fallback is used;
-- **idle unload**: the local model can be released after inactivity.
+- **idle unload**: the local model can be released after inactivity;
+- **VRAM stewardship**: under system-wide VRAM pressure a GPU-resident model
+  is evicted (moved to RAM, or dropped for fixed-device backends) and
+  promoted back once the GPU is comfortable again.
 
 One model id == one vector space; callers must rebuild the index when it
 changes (VecStore enforces this).
@@ -162,6 +165,74 @@ class Embedder:
         self._device = ""
         log.info("RAG embedder unloaded after idle")
         return True
+
+    # ------------------------------------------------- vram stewardship
+    async def evict_if_vram_pressure(self, governor=None) -> str | None:
+        """System-wide VRAM pressure (a game started, another app's model,
+        ...): get OUR model off the GPU right now. sentence-transformers
+        moves to system RAM and stays usable (slower); fastembed's ONNX
+        session is device-fixed, so it is dropped and reloads on demand.
+        Returns "cpu" | "unloaded" | None (nothing to do)."""
+        if self._local is None or self._device != "cuda" or governor is None:
+            return None
+        try:
+            pressed, why = governor.vram_pressure()
+        except Exception:
+            return None
+        if not pressed:
+            return None
+        async with self._lock:
+            if self._local is None or self._device != "cuda":
+                return None
+            if self.cfg.backend == "fastembed":
+                self._local = None
+                self._device = ""
+                action = "unloaded"
+            else:
+                await asyncio.to_thread(self._move_local, "cpu")
+                action = "cpu"
+            log.info("RAG embedder evicted from GPU (%s) -> %s", why, action)
+            return action
+
+    async def promote_to_gpu_if_fits(self, governor=None) -> bool:
+        """The mirror of eviction: once a CPU-resident model fits the
+        comfortable GPU tier again (game exited; headroom + util gates give
+        natural hysteresis vs the evict threshold), reload it on the GPU —
+        reload rather than .to() so dtype/thread choices stay fresh. An
+        explicitly configured cpu device is never promoted."""
+        if self._local is None or self._device != "cpu" or governor is None:
+            return False
+        if (self.cfg.device or "auto") not in ("auto", "cuda"):
+            return False
+        try:
+            fits, why = governor.gpu_fits()
+        except Exception:
+            return False
+        if not fits:
+            return False
+        async with self._lock:
+            if self._local is None or self._device != "cpu":
+                return False
+            self._local = None
+            self._device = ""
+            try:
+                await self._load_local("cuda", governor)
+                log.info("RAG embedder promoted back to GPU (%s)", why)
+                return True
+            except Exception as e:
+                log.warning("RAG embedder GPU promote failed: %s", e)
+                return False
+
+    def _move_local(self, device: str) -> None:
+        self._local.to(device)
+        if device == "cpu":
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        self._device = device
 
     # -------------------------------------------------------------- embed
     async def embed(self, texts: list[str], query: bool = False) -> list[list[float]]:

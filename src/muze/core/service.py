@@ -885,9 +885,11 @@ class ControlService:
         if gov is not None:
             snap = gov.snapshot()
             if any(v is not None for v in snap.values()):
+                vram = snap.get("gpu_vram_used_pct")
                 lines.append(
                     f"资源: power={snap['power']} cpu={snap['cpu_pct']:.0f}%"
                     f" gpu={snap['gpu_util']:.0f}% free={snap['gpu_free_gb']:.1f}G"
+                    + (f" vram占用={vram:.0f}%" if vram is not None else "")
                     if snap["cpu_pct"] is not None and snap["gpu_util"] is not None
                     else f"资源: {snap}"
                 )

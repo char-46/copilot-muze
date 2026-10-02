@@ -127,9 +127,14 @@ async def test_schedule_task_tool_passes_timing_kwargs(repo):
     assert "error" in out
 
     service.runtime.scheduler = Scheduler(repo, service, ChatLog())
+    import datetime as _dt
+
+    future_iso = (
+        _dt.datetime.now().astimezone() + _dt.timedelta(hours=2)
+    ).isoformat(timespec="seconds")
     for args in (
         {"prompt": "两小时后提醒我喝水", "delay_sec": 7200, "note": "用户原话"},
-        {"prompt": "总结", "at_iso": "2026-10-02T09:00:00+08:00"},
+        {"prompt": "总结", "at_iso": future_iso},
         {"prompt": "每小时总结一次", "interval_sec": 3600},
     ):
         out = json.loads(await runner.run("schedule_task", args))

@@ -13,7 +13,10 @@ Policy (see rag.embedding / rag):
   headroom) and GPU util is low; a tight VRAM situation may still squeeze
   onto the GPU by eating the headroom; otherwise CPU (thread-capped while
   the machine is busy). CPU and GPU are never used in parallel — embedding
-  is batch-throughput work, one device saturates it.
+  is batch-throughput work, one device saturates it;
+- VRAM stewardship: system-wide VRAM usage >= ``vram_evict_pct`` evicts a
+  GPU-resident model (moved to RAM / dropped, reloaded on demand) so it
+  never competes with a game for memory.
 """
 
 from __future__ import annotations
@@ -90,6 +93,17 @@ class ResourceGovernor:
         except Exception:
             return None
 
+    def gpu_vram_used_pct(self) -> float | None:
+        """System-wide VRAM usage in % (all processes, not just ours)."""
+        if not self._ensure_nvml():
+            return None
+        try:
+            h = self._nvml.nvmlDeviceGetHandleByIndex(0)
+            mi = self._nvml.nvmlDeviceGetMemoryInfo(h)
+            return mi.used * 100.0 / mi.total if mi.total else None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------- policy
     def idle(self, last_activity: float = 0.0) -> tuple[bool, str]:
         """May background indexing run at all? A busy GPU is NOT a veto here —
@@ -120,6 +134,20 @@ class ResourceGovernor:
             return False, f"gpu busy {util:.0f}%"
         return True, "ok"
 
+    def vram_pressure(self) -> tuple[bool, str]:
+        """True when SYSTEM-WIDE VRAM usage is high (a game started, a model
+        in another app, ...) — a GPU-resident embedding model should be
+        evicted to RAM / dropped so it stops competing for VRAM."""
+        threshold = float(self.cfg.embedding.vram_evict_pct)
+        if threshold <= 0:
+            return False, "off"
+        used = self.gpu_vram_used_pct()
+        if used is None:
+            return False, "unknown"
+        if used >= threshold:
+            return True, f"vram {used:.0f}% >= {threshold:.0f}%"
+        return False, f"vram {used:.0f}%"
+
     def choose_device(self) -> str:
         """Tiered: explicit cuda/cpu is obeyed; auto picks GPU whenever the
         model fits in free VRAM and the GPU isn't busy — including the
@@ -129,6 +157,10 @@ class ResourceGovernor:
         if want in ("cuda", "cpu"):
             return want
         if self._nvml is None and not self._ensure_nvml():
+            return "cpu"
+        pressed, why = self.vram_pressure()
+        if pressed:
+            log.debug("RAG device=cpu (%s)", why)
             return "cpu"
         free = self.gpu_free_gb()
         if free is None:
@@ -164,4 +196,5 @@ class ResourceGovernor:
             "cpu_pct": self.cpu_busy(),
             "gpu_util": self.gpu_util(),
             "gpu_free_gb": self.gpu_free_gb(),
+            "gpu_vram_used_pct": self.gpu_vram_used_pct(),
         }

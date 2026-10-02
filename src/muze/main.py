@@ -181,6 +181,7 @@ class App:
         self._last_activity = time.time()
         self._last_profile_refresh = 0.0
         self._enrich_task = None
+        self._vram_task = None
 
         # skills / scheduler / reloader
         from muze.reloader import Reloader
@@ -330,6 +331,7 @@ class App:
         self._mt_task = asyncio.create_task(self._maintenance_loop())
         self._enrich_task = asyncio.create_task(self._startup_enrich())
         self._rag_task = asyncio.create_task(self._rag_loop())
+        self._vram_task = asyncio.create_task(self._vram_steward_loop())
         if os.environ.get("MUZE_SUPERVISOR_PID"):
             self._sup_task = asyncio.create_task(self._supervisor_watch())
         if spawn_console:
@@ -515,6 +517,28 @@ class App:
             except Exception:
                 log.exception("rag indexing pass failed")
 
+    async def _vram_steward_loop(self) -> None:
+        """VRAM stewardship, every 60s, OUTSIDE any idle gate: while the user
+        games (busy machine, indexing skipped) a GPU-resident embedding model
+        must still be evicted to RAM the moment system VRAM pressure spikes —
+        and promoted back once the GPU is comfortable again."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=60)
+                return
+            except asyncio.TimeoutError:
+                pass
+            rag = getattr(self, "rag", None)
+            if rag is None or not rag.enabled or rag.embedder is None:
+                continue
+            try:
+                await rag.embedder.evict_if_vram_pressure(rag.governor)
+                await rag.embedder.promote_to_gpu_if_fits(rag.governor)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("vram steward pass failed")
+
     async def _maintenance_loop(self) -> None:
         from muze.profiles import refresh_profiles
 
@@ -566,6 +590,8 @@ class App:
             self._enrich_task.cancel()
         if getattr(self, "_rag_task", None) is not None:
             self._rag_task.cancel()
+        if getattr(self, "_vram_task", None) is not None:
+            self._vram_task.cancel()
         rf = getattr(self.runtime, "rag_force", None)
         if rf is not None and not rf.done():
             rf.cancel()
