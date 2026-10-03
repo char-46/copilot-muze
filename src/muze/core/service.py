@@ -1648,25 +1648,31 @@ class ControlService:
     async def _session_pdf(self, session, ctx: ControlContext) -> CommandOutcome:
         """Render an agent session transcript (full loop incl. tool rounds)
         into a PDF file and send it back."""
+        from muze.ai.sessions import legacy_final_tail
         from muze.render import render_pdf
 
         parts = [f"# 会话 #{session.id} {session.title}", "", f"> {session.prompt}", ""]
-        for m in session.messages:
+        messages = list(session.messages)
+        if messages and messages[-1].get("role") != "assistant":
+            tail = await legacy_final_tail(self.repo, session, self.runtime.self_id)
+            if tail is not None:
+                messages.append(tail)
+        for m in messages:
             role = m.get("role", "")
             if role == "user":
-                parts += ["**你**：", m.get("content", ""), ""]
+                parts += ["**我**：", m.get("content", ""), ""]
             elif role == "assistant":
                 content = m.get("content") or ""
                 calls = m.get("tool_calls") or []
-                head = "**muze**：" if content else "**muze**（工具轮）"
+                head = "**muze**：" if content else "**muze**（调工具）"
                 parts += [head, content, ""]
                 for c in calls:
                     fn = c.get("function", {}) or {}
-                    parts.append(f"`🔧 {fn.get('name', '?')}({(fn.get('arguments') or '')[:200]})`")
+                    parts.append(f"`?? {fn.get('name', '?')}({fn.get('arguments') or ''})`")
                 if calls:
                     parts.append("")
             elif role == "tool":
-                parts += [f"<details-tool `{m.get('name', '')}`>", (m.get("content") or "")[:2000], ""]
+                parts += [f"<details-tool `{m.get('name', '')}`>", m.get("content") or "", ""]
         body = "\n".join(parts)
         try:
             pdf = await asyncio.to_thread(
