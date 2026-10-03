@@ -29,6 +29,10 @@ Notes:
   the muze package: scripts\ and the repo-level skills\ are not inside, so
   keep this folder (scripts) from the original checkout and let skills live
   in data\skills. -Tag/-SkipPull are meaningless with -Wheel.
+  WARNING (wheel mode): the local checkout's pyproject/uv.lock stay at the
+  old version, so the script PARKS them as *.wheeloff after installing the
+  wheel. That makes plain 'uv run muze ...' safe (no project -> no implicit
+  sync -> .venv used as-is). Git-mode updates restore them automatically.
 #>
 param(
     [string]$Tag = "",          # tag to deploy; empty = latest semver tag
@@ -84,6 +88,11 @@ if ($Wheel) {
         Write-Step "git fetch --tags..."
         git -C $Repo fetch --tags --force --prune 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+        # coming back from wheel mode: drop parked project files so the
+        # checkout --force below restores the real ones
+        foreach ($f in @("pyproject.toml", "uv.lock")) {
+            Remove-Item (Join-Path $Repo "$f.wheeloff") -Force -ErrorAction SilentlyContinue
+        }
 
         if (-not $Tag) {
             # latest tag by semver order (release > rc > beta > alpha)
@@ -127,6 +136,18 @@ if ($Wheel) {
     Write-Step "uv pip install --reinstall $spec"
     & uv pip install --python $Py --reinstall $spec
     if ($LASTEXITCODE -ne 0) { throw "wheel install failed" }
+    # de-project the deployment so plain `uv run muze ...` is safe: uv run
+    # syncs implicitly whenever it finds a pyproject.toml, which would revert
+    # this wheel back to the stale checkout version. With the project files
+    # renamed away, uv run just uses .venv as-is. Git-mode updates restore
+    # them via checkout --force (they are tracked).
+    foreach ($f in @("pyproject.toml", "uv.lock")) {
+        $p = Join-Path $Repo $f
+        if (Test-Path $p) {
+            Move-Item $p "$p.wheeloff" -Force
+            Write-Step "parked $f -> $f.wheeloff (uv run safe)"
+        }
+    }
 } else {
     $uvArgs = @("sync")
     foreach ($e in $extraList) { $uvArgs += @("--extra", $e) }
