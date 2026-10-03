@@ -135,7 +135,9 @@ if ($Wheel) {
     }
     Write-Step "uv pip install --reinstall $spec"
     & uv pip install --python $Py --reinstall $spec
-    if ($LASTEXITCODE -ne 0) { throw "wheel install failed" }
+    if ($LASTEXITCODE -ne 0) {
+        throw "wheel install failed -- likely a locked .venv file (os error 5): a service started via 'uv run muze ...' or muze.exe keeps that exe locked. Recover with: scripts\start.ps1 -Stop, rerun this script, then scripts\start.ps1 (updates while running are normally fine when the service was started by start.ps1, which uses 'python -m muze')"
+    }
     # de-project the deployment so plain `uv run muze ...` is safe: uv run
     # syncs implicitly whenever it finds a pyproject.toml, which would revert
     # this wheel back to the stale checkout version. With the project files
