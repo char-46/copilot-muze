@@ -141,7 +141,7 @@ main { flex: 1; overflow: hidden; }
   background: var(--bg2); align-items: flex-end;
 }
 .composer textarea {
-  flex: 1; resize: none; max-height: 180px; font: inherit; line-height: 1.45;
+  flex: 1; resize: none; min-height: 64px; max-height: 220px; font: inherit; line-height: 1.45;
   padding: 8px 10px; border-radius: 10px; background: var(--bg); color: var(--fg);
   border: 1px solid var(--line); outline: none;
 }
@@ -203,6 +203,11 @@ main { flex: 1; overflow: hidden; }
 .md ul,.md ol { margin: .4em 0; padding-left: 1.5em; }
 .md hr { border: 0; border-top: 1px solid rgba(127,127,127,.3); margin: .6em 0; }
 .md a { color: inherit; }
+.md table { border-collapse: collapse; margin: .5em 0; font-size: .95em; display: block; overflow-x: auto; max-width: 100%; }
+.md th,.md td { border: 1px solid rgba(127,127,127,.35); padding: .3em .7em; text-align: left; vertical-align: top; }
+.md th { background: rgba(127,127,127,.15); }
+.md tr:nth-child(2n) td { background: rgba(127,127,127,.07); }
+.md input[type="checkbox"] { pointer-events: none; }
 details.tool { margin: .25em 0; font-size: .9em; }
 details.tool summary { cursor: pointer; color: #888; }
 details.tool pre { background: rgba(127,127,127,.1); border-radius: 6px; padding: .5em .7em; white-space: pre-wrap; margin: .3em 0; max-height: 20em; overflow-y: auto; }

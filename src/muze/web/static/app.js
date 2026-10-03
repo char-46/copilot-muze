@@ -104,10 +104,27 @@ function fmtTime(t) {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
-/* ---------------- tiny markdown ----------------
- * Renders model output in the AI tab and session details. Safe: everything
- * is escaped first, then a small subset is transformed (headings, lists,
- * blockquote, fenced/inline code, bold/italic/strike, http(s) links). */
+/* ---------------- markdown ----------------
+ * Primary renderer: vendored marked.js (GFM tables, nested lists, etc.).
+ * Safety: input is HTML-escaped BEFORE parsing, so raw HTML in model output
+ * can never execute. Falls back to the tiny built-in renderer when the
+ * vendor script failed to load. */
+let _markedReady = false;
+try {
+  if (window.marked) {
+    marked.setOptions({ gfm: true, breaks: true });
+    _markedReady = true;
+  }
+} catch (e) { /* fall through to tiny renderer */ }
+function mdRender(text) {
+  const src = esc((text ?? "").toString()).replace(/\r\n/g, "\n");
+  if (_markedReady) {
+    try { return marked.parse(src); } catch (e) { /* fall through */ }
+  }
+  return mdTiny(src);
+}
+
+/* tiny fallback: subset renderer (no tables, no nesting) */
 function mdInline(s) {
   return s
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
@@ -117,8 +134,8 @@ function mdInline(s) {
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
       '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
-function mdRender(text) {
-  const src = esc((text ?? "").toString()).replace(/\r\n/g, "\n");
+/* tiny fallback: subset renderer (no tables, no nesting); src is pre-escaped */
+function mdTiny(src) {
   const codes = [];
   let body = src.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     codes.push(`<pre><code>${code.replace(/\n$/, "")}</code></pre>`);
@@ -702,7 +719,7 @@ $("#aiFilter").addEventListener("input", renderSessList);
 function autosize() {
   const t = $("#aiinput");
   t.style.height = "auto";
-  t.style.height = Math.min(t.scrollHeight, 180) + "px";
+  t.style.height = Math.max(64, Math.min(t.scrollHeight, 220)) + "px";
 }
 $("#aiinput").addEventListener("input", autosize);
 $("#aiinput").addEventListener("keydown", (e) => {
