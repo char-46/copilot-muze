@@ -425,7 +425,7 @@ SPEC = [
                 "把一个可独立完成的子任务交给子智能体（全新上下文、只读工具），拿回它的最终报告。"
                 "适合大规模翻查/多步检索/独立调研——避免几十轮工具调用把主对话上下文撑爆。"
                 "prompt 写成完整自包含的指令（目标、范围、期望输出格式），子智能体看不到当前对话。"
-                "子智能体不能再派生子智能体。"
+                "子智能体最多可再嵌套派生 2 层（共 3 层），按需分治。"
             ),
             "parameters": {
                 "type": "object",
@@ -514,9 +514,12 @@ SPEC = [
 # media/forward reads live there.
 _SUBAGENT_EXCLUDE = {
     "send_message", "send_media", "schedule_task", "remember",
-    "memory_update", "memory_delete", "profile_update", "subagent",
+    "memory_update", "memory_delete", "profile_update",
     "make_chart",
 }
+# NOTE: "subagent" is deliberately NOT excluded — sub-agents may nest up to
+# MAX_SUB_DEPTH levels (enforced at runtime in Agent.run_subagent, not by
+# the spec, so the model sees the tool and gets a clear error past the cap)
 SUBAGENT_SPEC = [
     s for s in SPEC if s["function"]["name"] not in _SUBAGENT_EXCLUDE
 ]
@@ -953,15 +956,17 @@ class ToolRunner:
         return {"purpose": purpose, "descriptions": out}
 
     async def t_subagent(self, args: dict) -> dict:
+        from muze.ai.agent import MAX_SUB_DEPTH
+
         agent = getattr(self.service, "agent", None)
         if agent is None:
             return {"error": "agent 未装配"}
-        if getattr(self.ctx, "sub_depth", 0) >= 1:
-            return {"error": "子智能体不能再派生子智能体（链深限制 1）"}
         prompt = str(args.get("prompt", "")).strip()
         if not prompt:
             return {"error": "prompt 不能为空"}
         result = await agent.run_subagent(prompt, self.ctx)
+        if "error" in result:  # e.g. nesting past MAX_SUB_DEPTH
+            return result
         return {
             "sub_session": f"#{result['id']}",
             "status": result["status"],

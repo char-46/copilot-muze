@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from muze.ai.llm import LLMClient
 from muze.ai.sessions import ERROR, RUNNING, SUSPEND, Session, SessionStore
@@ -25,9 +25,8 @@ log = logging.getLogger("muze.ai")
 
 MAX_HISTORY = 30  # per control conversation
 TOOL_RESULT_LIMIT = 6000  # chars kept per tool result fed back to the model
-# subagent runs a full child loop (up to 16 steps x slow LLM streams); the
-# parent's per-tool stall cap is multiplied by this for it
-SUBAGENT_STALL_MULT = 4
+# sub-agents may nest (a sub-agent spawning sub-agents) up to this depth
+MAX_SUB_DEPTH = 3
 
 
 class AgentBusy(Exception):
@@ -110,6 +109,7 @@ class Agent:
         self._waiting = 0
         self._tasks: set[asyncio.Task] = set()
         self._session_tasks: dict[str, asyncio.Task] = {}  # session id -> task (for /sess stop)
+        self._live_children: dict[int, Session] = {}  # live sub-agent sessions (stall watchdogs)
         # process boot time: resume_interrupted() runs ~20s after start and
         # must only pick up crash debris from BEFORE this boot — a session
         # created after boot that is "running" is live traffic, not debris
@@ -283,25 +283,33 @@ class Agent:
     async def run_subagent(self, prompt: str, ctx: ControlContext) -> dict:
         """One delegated sub-task: a fresh child session running the read-only
         tool subset in its own loop; the final report comes back as the parent
-        tool's payload. Chain depth is capped at 1 (a sub-agent cannot spawn
-        further sub-agents)."""
+        tool's payload. Sub-agents may nest further up to MAX_SUB_DEPTH."""
+        depth = getattr(ctx, "sub_depth", 0)
+        if depth > MAX_SUB_DEPTH:
+            return {
+                "error": f"子智能体嵌套已达上限（{MAX_SUB_DEPTH} 层），请直接完成当前任务",
+                "depth": depth,
+            }
         child = self.sessions.create(ctx.chat_key, prompt)
         child.title = "子任务: " + prompt[:24]
         child.status = "running"
-        child.event("sub", "子智能体启动（只读工具）")
+        child.event("sub", f"子智能体启动（只读工具，第 {depth} 层）")
         await self._persist(child)
+        self._live_children[id(child)] = child  # liveness for stall watchdogs
         sub_ctx = ControlContext(
             source=ctx.source, chat_key=ctx.chat_key, scene="", peer_id=0,
             user_label=ctx.user_label,
         )
-        sub_ctx.sub_depth = getattr(ctx, "sub_depth", 0) + 1
+        sub_ctx.sub_depth = depth + 1
         self.chatlog.agent(ctx.source, "sub", "in", prompt[:200])
         try:
-            async with self._turn_slot():
-                outcome = await self._drive_sub(child, prompt, sub_ctx)
+            # NOTE: no _turn_slot() here. One user turn = one admission slot;
+            # nested sub-agents are part of that turn. Acquiring slots per
+            # level would deadlock once depth >= max_concurrent_turns.
+            outcome = await self._drive_sub(child, prompt, sub_ctx)
         except asyncio.CancelledError:
-            # parent's stall cap cancelled us mid-child-loop: leave the
-            # child session inspectable/resumable, not dangling "running"
+            # a watchdog cancelled us mid-child-loop: leave the child session
+            # inspectable/resumable, not dangling "running"
             child.finish(False, "被父级超时中止")
             self._track(self._persist(child))
             raise
@@ -312,10 +320,45 @@ class Agent:
             log.exception("subagent crashed")
             child.finish(False, str(e))
             outcome = CommandOutcome(f"子智能体失败: {e}", is_error=True)
+        finally:
+            self._live_children.pop(id(child), None)
         await self._finalize(child)
         report = outcome.text or "(子智能体未返回内容)"
         self.chatlog.agent(ctx.source, "sub", "out", report[:200])
         return {"id": child.id, "status": child.status, "report": report}
+
+    async def _watch_sub(self, coro):
+        """Await a subagent call under a PROGRESS-based stall watchdog.
+
+        A sub-agent legitimately runs for many minutes (a whole child loop
+        of LLM streams), so NO total-time cap applies: it is killed only
+        when no live child session has shown life (streamed chunk, event,
+        step) within the plain stall window. Session.bump()/.event() both
+        refresh Session.updated, which is the liveness signal."""
+        stall = self._turn_timeout()
+        task = asyncio.ensure_future(coro)
+        try:
+            while True:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(task), stall)
+                except TimeoutError:
+                    if task.done():
+                        return task.result()
+                    newest = max(
+                        (s.updated for s in self._live_children.values()),
+                        default=0.0,
+                    )
+                    if time.time() - newest > stall:
+                        raise TimeoutError(
+                            f"工具 subagent 已 {int(stall)} 秒无任何进展"
+                            "（无输出、无步进），已中止"
+                        )
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task  # let run_subagent's cleanup settle
+            raise
 
     async def _drive_sub(
         self, session: Session, text: str, ctx: ControlContext
@@ -881,18 +924,18 @@ class Agent:
                 # run the step's tools concurrently (independent by design).
                 # Per-call stall cap: a hung tool becomes a TOOL-LEVEL error
                 # the model can see and recover from — it no longer aborts
-                # the whole turn. subagent legitimately runs a whole child
-                # loop (up to 16 steps x slow LLM streams), so it gets a
-                # multiplied cap.
+                # the whole turn. subagent is awaited under a PROGRESS-based
+                # watchdog instead of any total-time cap (see _watch_sub).
                 async def _run_one(name: str, coro):
-                    cap = stall * (SUBAGENT_STALL_MULT if name == "subagent" else 1)
-                    if cap <= 0:
+                    if name == "subagent" and stall > 0:
+                        return await self._watch_sub(coro)
+                    if stall <= 0:
                         return await coro
                     try:
-                        return await asyncio.wait_for(coro, cap)
+                        return await asyncio.wait_for(coro, stall)
                     except TimeoutError:
                         return TimeoutError(
-                            f"工具 {name} 超过 {int(cap)} 秒未完成（卡死），已中止"
+                            f"工具 {name} 超过 {int(stall)} 秒未完成（卡死），已中止"
                         )
 
                 coros = [runner.run(n, a) for _, n, a in calls]

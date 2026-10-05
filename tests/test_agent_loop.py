@@ -309,43 +309,6 @@ async def test_converse_tool_stall_becomes_tool_error(env, monkeypatch):
     assert any("卡死" in e for e in evs)
 
 
-async def test_subagent_gets_multiplied_stall_cap(env, monkeypatch):
-    """subagent legitimately runs for minutes (child loop of LLM steps), so
-    its cap is stall*SUBAGENT_STALL_MULT — a run slower than the plain stall
-    but under the multiplied cap must COMPLETE."""
-    service, repo = env
-
-    class SlowSubRunner:
-        def __init__(self, *a, **k):
-            pass
-
-        async def run(self, name, args):
-            if name == "subagent":
-                await asyncio.sleep(0.12)  # > stall(0.05), < 0.05*4
-                return '{"report": "child done"}'
-            await asyncio.sleep(30)  # normal tool: must hit the plain cap
-
-    monkeypatch.setattr("muze.ai.agent.ToolRunner", SlowSubRunner)
-    llm = ScriptLLM(
-        [
-            {"role": "assistant",
-             "tool_calls": [{"id": "1", "function": {"name": "subagent",
-                                                     "arguments": "{}"}}]},
-            {"role": "assistant",
-             "tool_calls": [{"id": "2", "function": {"name": "cli",
-                                                     "arguments": "{}"}}]},
-            {"role": "assistant", "content": "两次都处理了"},
-        ]
-    )
-    llm.cfg = _llm_cfg(turn_timeout_sec=0.05)
-    agent = Agent(service, repo, llm, ChatLog(), 3)
-    out = await agent.converse("派个崽", _qq_ctx())
-    assert not out.is_error and out.text == "两次都处理了"
-    evs = [e[2] for e in agent.sessions.latest(1)[0].events]
-    assert any("child done" in e for e in evs)  # subagent finished fine
-    assert any("cli" in e and "卡死" in e for e in evs)  # normal tool capped
-
-
 async def test_submit_is_async_and_queryable_by_sess(env, monkeypatch):
     service, repo = env
 
@@ -730,19 +693,26 @@ async def test_subagent_tool_runs_readonly_child_loop(env):
     # first session = the parent (latest sorted by updated; assert loosely)
 
 
-async def test_subagent_depth_is_capped_at_one(env):
+async def test_subagent_depth_is_capped(env):
     import json
 
+    from muze.ai.agent import MAX_SUB_DEPTH
     from muze.ai.tools import ToolRunner
 
     service, repo = env
-    agent = Agent(service, repo, ScriptLLM([]), ChatLog(), 3)
+    agent = Agent(service, repo, ScriptLLM([{"role": "assistant", "content": "孙辈完成"}]), ChatLog(), 3)  # noqa: E501
     service.agent = agent
     c = ctx()
-    c.sub_depth = 1  # simulate a sub-agent context
+    c.sub_depth = MAX_SUB_DEPTH  # last allowed level still runs
     runner = ToolRunner(service, repo, service.adapter, None, c)
-    r = json.loads(await runner.run("subagent", {"prompt": "再派生一个"}))
-    assert "error" in r and "子智能体" in r["error"]
+    r = json.loads(await runner.run("subagent", {"prompt": "合法层级"}))
+    assert "report" in r and "孙辈完成" in r["report"]
+
+    c2 = ctx()
+    c2.sub_depth = MAX_SUB_DEPTH + 1  # past the cap: clear error, no child
+    runner2 = ToolRunner(service, repo, service.adapter, None, c2)
+    r2 = json.loads(await runner2.run("subagent", {"prompt": "超限层级"}))
+    assert "error" in r2 and "上限" in r2["error"]
 
 
 async def test_subagent_spec_excludes_write_tools():
@@ -751,10 +721,111 @@ async def test_subagent_spec_excludes_write_tools():
     names = {s["function"]["name"] for s in SUBAGENT_SPEC}
     full = {s["function"]["name"] for s in SPEC}
     assert names <= full
-    for banned in ("send_message", "send_media", "schedule_task", "subagent",
+    for banned in ("send_message", "send_media", "schedule_task",
                    "remember", "profile_update", "make_chart"):
         assert banned not in names
     assert "search_archive" in names and "read_document" in names
+    assert "subagent" in names  # nesting is allowed, capped at runtime
+
+
+async def test_subagent_nests_three_levels(env):
+    """parent -> child -> grandchild all complete; depth cap enforced one
+    level further (see test_subagent_depth_is_capped)."""
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",  # parent r1: spawn child
+             "tool_calls": [{"id": "1", "function": {"name": "subagent",
+                                                     "arguments": '{"prompt":"调研X"}'}}]},
+            {"role": "assistant",  # child r1: spawn grandchild
+             "tool_calls": [{"id": "2", "function": {"name": "subagent",
+                                                     "arguments": '{"prompt":"查细节"}'}}]},
+            {"role": "assistant", "content": "孙辈：细节查完"},  # grandchild final
+            {"role": "assistant", "content": "子辈汇总"},  # child final
+            {"role": "assistant", "content": "父辈结论"},  # parent final
+        ]
+    )
+    service, repo = env
+    agent = Agent(service, repo, llm, ChatLog(), 8)
+    service.agent = agent
+    out = await agent.converse("调研X", _qq_ctx())
+    assert out.text == "父辈结论"
+    kids = [s for s in agent.sessions.latest(10) if s.title.startswith("子任务")]
+    assert len(kids) == 2  # child + grandchild
+    assert all(k.status == "done" for k in kids)
+
+
+async def test_subagent_watchdog_progress_beats_stall(env, monkeypatch):
+    """No total-time cap: a sub-agent slower than the stall window survives
+    as long as its session shows life; a silent one is killed within ~stall."""
+    service, repo = env
+
+    class SlowQuietRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            if name == "subagent":
+                await asyncio.sleep(0.2)  # way over stall, no bumps
+                return '{"report": "不应到达"}'
+            return "{}"
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", SlowQuietRunner)
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "subagent",
+                                                     "arguments": "{}"}}]},
+            {"role": "assistant", "content": "超时后继续"},
+        ]
+    )
+    llm.cfg = _llm_cfg(turn_timeout_sec=0.05)
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("派个哑崽", _qq_ctx())
+    assert out.text == "超时后继续"
+    evs = [e[2] for e in agent.sessions.latest(1)[0].events]
+    assert any("无任何进展" in e for e in evs)
+
+    # same long run, but a live child session keeps bumping -> survives
+    from muze.ai.sessions import Session
+
+    class SlowAliveRunner(SlowQuietRunner):
+        def __init__(self, *a, **k):
+            super().__init__()
+
+        async def run(self, name, args):
+            if name == "subagent":
+                fake = Session(id="beat", chat_key="x", prompt="p")
+                agent2._live_children[id(fake)] = fake
+
+                async def _beat():
+                    for _ in range(10):
+                        await asyncio.sleep(0.03)
+                        fake.bump(1)
+
+                bt = asyncio.create_task(_beat())
+                try:
+                    await asyncio.sleep(0.2)  # >> stall, but alive
+                    return '{"report": "活着跑完了"}'
+                finally:
+                    bt.cancel()
+                    agent2._live_children.pop(id(fake), None)
+            return "{}"
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", SlowAliveRunner)
+    llm2 = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "subagent",
+                                                     "arguments": "{}"}}]},
+            {"role": "assistant", "content": "活着完成"},
+        ]
+    )
+    llm2.cfg = _llm_cfg(turn_timeout_sec=0.05)
+    agent2 = Agent(service, repo, llm2, ChatLog(), 3)
+    out2 = await agent2.converse("派个活崽", _qq_ctx())
+    assert out2.text == "活着完成"
+    evs2 = [e[2] for e in agent2.sessions.latest(1)[0].events]
+    assert any("活着跑完了" in e for e in evs2)
 
 
 async def test_loop_messages_visible_while_running(env, monkeypatch):
