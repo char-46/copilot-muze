@@ -498,9 +498,13 @@ function msgNode(m) {
     const calls = (m.tool_calls || []).map((c) =>
       `<details class="tool"><summary>🔧 ${esc(c.function?.name || "?")}(` +
       `<code>${esc(c.function?.arguments || "")}</code>)</summary></details>`).join("");
+    const think = m.reasoning_content
+      ? `<details class="tool think"><summary>💭 思考过程（${m.reasoning_content.length} 字）</summary>` +
+        `<div class="thinkbody">${esc(m.reasoning_content)}</div></details>`
+      : "";
     row.innerHTML = `<div class="ava">M</div><div class="col">` +
       (m.content ? `<div class="bubble md">${mdRender(m.content)}</div>` : "") +
-      calls + (m.content ? `<a class="copybtn">⧉ 复制</a>` : "") + `</div>`;
+      think + calls + (m.content ? `<a class="copybtn">⧉ 复制</a>` : "") + `</div>`;
     return row;
   }
   if (m.role === "tool") {
@@ -533,9 +537,10 @@ function renderSession(s) {
     z.id = "ailive";
     z.className = "ailive";
     const ev = (s.events || []).filter((e) =>
-      e.kind === "tool" || e.kind === "tool_result" || e.kind === "llm");
-    const chips = ev.slice(-4).map((e) => {
-      const icon = e.kind === "tool" ? "🔧" : e.kind === "tool_result" ? "✅" : "🧠";
+      e.kind === "tool" || e.kind === "tool_result" || e.kind === "llm" || e.kind === "think");
+    const chips = ev.slice(-5).map((e) => {
+      const icon = e.kind === "tool" ? "🔧" : e.kind === "tool_result" ? "✅"
+        : e.kind === "think" ? "💭" : "🧠";
       return `<span class="chip">${icon} ${esc((e.detail || "").slice(0, 90))}</span>`;
     }).join("");
     z.innerHTML =

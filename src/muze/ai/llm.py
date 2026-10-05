@@ -110,9 +110,17 @@ class LLMClient:
         live progress.
         """
         client = self._chat_client()
+        # never echo provider-side extras (reasoning_content/finish_reason)
+        # back to the API on later rounds — servers may reject unknown fields
+        _DROP = {"reasoning_content", "finish_reason"}
+        clean = [
+            {k: v for k, v in m.items() if k not in _DROP}
+            if isinstance(m, dict) else m
+            for m in messages
+        ]
         kwargs: dict = {
             "model": self.cfg.chat.model,
-            "messages": messages,
+            "messages": clean,
             "stream": True,
         }
         if self.cfg.chat.temperature is not None:
@@ -131,6 +139,7 @@ class LLMClient:
             raise
 
         content: list[str] = []
+        reasoning: list[str] = []
         tool_calls: dict[int, dict] = {}
         finish = ""
         usage_d: dict = {}
@@ -151,6 +160,17 @@ class LLMClient:
                         if on_chunk is not None:
                             try:
                                 on_chunk(len(piece))
+                            except Exception:
+                                pass
+                    # thinking models stream their reasoning separately; it
+                    # never goes back to the API (stripped above) — it is
+                    # kept on the message for the webui "思考过程" view
+                    rpiece = getattr(delta, "reasoning_content", None) or ""
+                    if rpiece:
+                        reasoning.append(rpiece)
+                        if on_chunk is not None:
+                            try:
+                                on_chunk(len(rpiece))
                             except Exception:
                                 pass
                     for tc in delta.tool_calls or []:
@@ -175,6 +195,9 @@ class LLMClient:
         text = "".join(content)
         if text:
             msg["content"] = text
+        rtext = "".join(reasoning)
+        if rtext:
+            msg["reasoning_content"] = rtext
         if tool_calls:
             msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
         log.info(

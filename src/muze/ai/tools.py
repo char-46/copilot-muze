@@ -144,9 +144,11 @@ SPEC = [
         "function": {
             "name": "describe_image",
             "description": (
-                "用视觉模型识别某条消息中的图片内容（截图/照片/图表等含信息量的图才值得调用；"
-                "表情包/小图会被跳过并说明原因；已有识别结果的图直接复用不再重复调用）。"
-                "purpose 用一句话说明你为什么要看这张图（识别目标），系统据此判断值不值得调用视觉。"
+                "用视觉模型识别某条消息中的图片内容。是否值得调用由你判断："
+                "结合当前请求、长期记忆和会话背景，只对携带信息量的图片调用"
+                "（如截图、照片、文档/图表、用户明确问到的图）；"
+                "与任务无关的备份图、装饰图、聊天灌水图不要调用。"
+                "purpose 用一句话写清识别目标，结果会缓存，重复问同一张图不会重复调用。"
             ),
             "parameters": {
                 "type": "object",
@@ -157,6 +159,10 @@ SPEC = [
                     "purpose": {
                         "type": "string",
                         "description": "识别目标，如'看清楚发票金额'、'这张截图里的报错'",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "表情/贴图默认跳过；确实需要识别时置 true",
                     },
                 },
                 "required": ["scene", "peer_id", "message_seq"],
@@ -522,19 +528,7 @@ def _now_iso() -> str:
     return f"{datetime.now().astimezone():%Y-%m-%d %H:%M:%S}"
 
 
-def vision_worth(row: dict) -> str | None:
-    """Should this archived image get a (costly) vision call?
-
-    Returns None when it IS worth describing, else a short reason string
-    (value gate: tiny stickers/memes carry nothing worth a model call)."""
-    if row.get("kind") == "face":
-        return "表情/贴图，无需视觉识别"
-    w, h = row.get("width") or 0, row.get("height") or 0
-    if w and h and (w < 160 or h < 160):
-        return f"尺寸过小（{w}x{h}），大概率是贴图/角标"
-    if (row.get("file_size") or 0) and row["file_size"] < 12 * 1024:
-        return "文件过小（<12KB），无有效信息量"
-    return None
+_FACE_WORDS = ("表情", "贴图", "sticker", "emoji", "颜文字", "表情包")
 
 
 class ToolRunner:
@@ -927,22 +921,25 @@ class ToolRunner:
 
     async def t_describe_image(self, args: dict) -> dict:
         purpose = str(args.get("purpose", "")).strip() or "详细描述图片内容"
+        force = bool(args.get("force"))
         medias = await self.repo.media_for_message(
             args["scene"], args["peer_id"], args["message_seq"]
         )
-        images = [m for m in medias if m["kind"] == "image" and m["status"] == "done"]
+        images = [m for m in medias if m["kind"] in ("image", "face") and m["status"] == "done"]
         if not images:
             summaries = [m.get("summary") or "" for m in medias if m["kind"] == "image"]
             return {"descriptions": [s for s in summaries if s] or "(无已下载图片)"}
         out: list[str] = []
         for m in images[:3]:
-            # value gate: reuse a previous description, skip low-value images
+            # cached descriptions are reused (no repeat vision calls)
             if m.get("summary"):
                 out.append(f"(复用已识别结果) {m['summary']}")
                 continue
-            skip = vision_worth(m)
-            if skip is not None:
-                out.append(f"(跳过) {skip}")
+            # faces/stickers: recognized only when the goal (or force) asks
+            if m["kind"] == "face" and not force and not any(
+                w in purpose.lower() for w in _FACE_WORDS
+            ):
+                out.append("(跳过) 表情/贴图；如确需识别请带 force=true 再说一次")
                 continue
             desc = await self.llm.vision_describe(m["file_path"], purpose)
             out.append(desc)

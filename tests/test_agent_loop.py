@@ -715,6 +715,109 @@ async def test_subagent_spec_excludes_write_tools():
     assert "search_archive" in names and "read_document" in names
 
 
+async def test_loop_messages_visible_while_running(env, monkeypatch):
+    """The webui session view polls /api/sess/<id>: tool calls and results
+    must already be in session.messages DURING the round, not only at end."""
+    service, repo = env
+    gate = asyncio.Event()
+    seen: dict = {}
+
+    class FakeRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            await gate.wait()  # hold the tool round open
+            return '{"ok": 1}'
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", FakeRunner)
+    import muze.ai.agent as agent_mod
+
+    orig = agent_mod.Agent._drive
+
+    async def drive(self, session, ctx, messages, start, commit, rollback, **kw):
+        task = asyncio.create_task(
+            orig(self, session, ctx, messages, start, commit, rollback, **kw)
+        )
+        await asyncio.sleep(0.15)  # loop reached the pending tool call
+        seen["roles"] = [m.get("role") for m in session.messages]
+        gate.set()
+        return await task
+
+    monkeypatch.setattr(agent_mod.Agent, "_drive", drive)
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "cli", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("查", ctx())
+    assert out.text == "done"
+    # the assistant tool-call message was visible mid-round
+    assert "assistant" in seen["roles"]
+
+
+async def test_reasoning_kept_on_message_and_stripped_from_requests():
+    """Thinking models stream reasoning_content: it must survive onto the
+    message (webui 思考过程) but never be echoed back to the API."""
+    from types import SimpleNamespace
+
+    from muze.ai.llm import LLMClient
+    from muze.config import LLMConfig
+
+    llm = LLMClient(LLMConfig())
+
+    def chunk(content=None, reasoning=None):
+        d = SimpleNamespace(content=content, reasoning_content=reasoning, tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(delta=d, finish_reason=None)], usage=None)
+
+    async def fake_create(**kwargs):
+        sent = kwargs["messages"]
+        # the sanitize step must have stripped provider extras from history
+        for m in sent:
+            assert "reasoning_content" not in m and "finish_reason" not in m
+        async def gen():
+            yield chunk(reasoning="先想一想…")
+            yield chunk(reasoning="再想一点")
+            yield chunk(content="答案")
+        return gen()
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return await fake_create(**kwargs)
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    def fake_client():
+        return FakeClient()
+
+    monkeypatch_client = pytest.MonkeyPatch()
+    monkeypatch_client.setattr(llm, "_chat_client", fake_client)
+    try:
+        chunks: list[int] = []
+        msg = await llm.chat(
+            [
+                {"role": "user", "content": "问"},
+                # a history entry carrying provider extras (as persisted)
+                {"role": "assistant", "content": "旧答", "reasoning_content": "旧思考",
+                 "finish_reason": "stop"},
+            ],
+            on_chunk=lambda n: chunks.append(n),
+        )
+    finally:
+        monkeypatch_client.undo()
+    assert msg["content"] == "答案"
+    assert msg["reasoning_content"] == "先想一想…再想一点"
+    assert sum(chunks) > 0  # reasoning also fed the live progress counter
+
+
+
 async def test_sess_stop_cancels_running_session(env):
     service, repo = env
     never = asyncio.Event()
@@ -755,7 +858,7 @@ async def test_sess_del_removes_session(env):
     assert await repo.get_ai_session(s.id) is None
 
 
-async def test_describe_image_value_gate_and_cache(env, tmp_path):
+async def test_describe_image_face_conditional_and_cache(env, tmp_path):
     import json
 
     from muze.ai.tools import ToolRunner
@@ -770,38 +873,52 @@ async def test_describe_image_value_gate_and_cache(env, tmp_path):
             calls.append(path)
             return "图里是报价表"
 
-    async def add_media(seq, kind="image", w=800, h=600, size=90000, summary=None):
-        mid = await repo.add_media(
+    async def add_media(seq, kind="image", summary=None):
+        return await repo.add_media(
             {
                 "scene": "friend", "peer_id": 9, "message_seq": seq, "seg_index": 0,
                 "kind": kind, "file_path": str(tmp_path / f"m{seq}.png"),
-                "file_name": f"m{seq}.png", "width": w, "height": h,
-                "file_size": size, "status": "done", "summary": summary,
+                "file_name": f"m{seq}.png", "width": 800, "height": 600,
+                "file_size": 90000, "status": "done", "summary": summary,
                 "resource_id": None, "file_id": None, "file_hash": None,
                 "duration": None,
             }
         )
-        return mid
 
-    # 1: face sticker; 2: tiny image; 3: cached summary; 4: worthy image
     await add_media(1, kind="face")
-    await add_media(2, w=80, h=60)
-    await add_media(3, summary="旧识别：发票金额200元")
-    await add_media(4)
+    await add_media(2, summary="旧识别：发票金额200元")
+    await add_media(3)
 
     runner = ToolRunner(service, repo, service.adapter, FakeVision(), ctx())
+    # faces are skipped unless the purpose is about faces or force=true
     r = json.loads(await runner.run(
-        "describe_image",
-        {"scene": "friend", "peer_id": 9, "message_seq": 4, "purpose": "看金额"},
+        "describe_image", {"scene": "friend", "peer_id": 9, "message_seq": 1,
+                           "purpose": "看金额"},
+    ))
+    assert "跳过" in r["descriptions"][0] and calls == []
+    r = json.loads(await runner.run(
+        "describe_image", {"scene": "friend", "peer_id": 9, "message_seq": 1,
+                           "purpose": "这个人常用的表情包风格", "force": True},
+    ))
+    assert calls == [str(tmp_path / "m1.png")]  # force recognizes it
+
+    # cached summary reused without a vision call; unknown image described + cached
+    calls.clear()
+    r = json.loads(await runner.run(
+        "describe_image", {"scene": "friend", "peer_id": 9, "message_seq": 2,
+                           "purpose": "金额"},
+    ))
+    assert calls == [] and "复用" in r["descriptions"][0]
+    r = json.loads(await runner.run(
+        "describe_image", {"scene": "friend", "peer_id": 9, "message_seq": 3,
+                           "purpose": "看金额"},
     ))
     assert r["descriptions"] == ["图里是报价表"]
-    assert calls == [str(tmp_path / "m4.png")]  # only the worthy one hit vision
-
-    # the description was cached back: second call reuses it
+    assert calls == [str(tmp_path / "m3.png")]
+    # second look at seq 3 reuses the cached description
     calls.clear()
-    r2 = json.loads(await runner.run(
-        "describe_image",
-        {"scene": "friend", "peer_id": 9, "message_seq": 4, "purpose": "再看一次"},
+    r = json.loads(await runner.run(
+        "describe_image", {"scene": "friend", "peer_id": 9, "message_seq": 3,
+                           "purpose": "再确认"},
     ))
-    assert calls == []  # no new vision call
-    assert "复用" in r2["descriptions"][0] and "报价表" in r2["descriptions"][0]
+    assert calls == [] and "复用" in r["descriptions"][0]

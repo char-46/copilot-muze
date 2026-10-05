@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 from muze.ai.llm import LLMClient
 from muze.ai.sessions import ERROR, RUNNING, SUSPEND, Session, SessionStore
-from muze.ai.tools import SPEC, SUBAGENT_SPEC, ToolRunner, vision_worth
+from muze.ai.tools import SPEC, SUBAGENT_SPEC, ToolRunner
 from muze.chatlog import ChatLog, epoch_iso
 from muze.core.service import (
     CommandOutcome,
@@ -67,7 +67,8 @@ SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）�
 - 查询也可用 cli 工具（和 /help 的命令完全一致），如 cli({"command":"search 关键词"})、
   cli({"command":"summary group/123 60"})；不确定命令就 cli({"command":"help"})。
 - 需要逐条看消息内容时才用 get_recent_messages。
-- 图片内容用 describe_image 识别（说明 purpose 识别目标；小图/表情会自动跳过，已有结果直接复用）；
+- 图片内容用 describe_image 识别（是否值得调用由你结合当前请求、长期记忆与背景判断，只识别携带信息量的图；
+  说明 purpose 识别目标，结果自动缓存；表情/贴图仅在任务相关时用 force 识别）；
   本地文档/压缩包用 read_document（docx/pdf/xlsx/xls/pptx/rtf/txt + zip/7z/tar；压缩包先看列表再 entry 读成员）；
   网页/在线文档用 fetch_url。
 - 大规模翻查、多步独立调研用 subagent 委派子智能体（全新上下文、只读工具），拿回报告再综合，避免撑爆主对话。
@@ -838,6 +839,10 @@ class Agent:
                 session.event("llm", f"第{step}轮（调用模型）")
                 msg = await self._chat(messages, ctx, session, tools=tools)
                 session.step = step
+                # thinking trace: visible live in the webui session view
+                rtext = msg.get("reasoning_content") or ""
+                if rtext:
+                    session.event("think", rtext[:400])
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
                     answer = (msg.get("content") or "").strip()
@@ -845,6 +850,10 @@ class Agent:
                     final_text = answer
                     break
                 messages.append(msg)
+                # publish the loop state so the webui shows tool calls while
+                # the round is still executing (it polls /api/sess/<id>)
+                session.messages = messages[1:]
+                session.updated = time.time()
                 calls = []
                 for call in tool_calls:
                     fn = call.get("function", {}) or {}
@@ -884,6 +893,8 @@ class Agent:
                     messages.append(
                         {"role": "tool", "tool_call_id": cid, "content": content}
                     )
+                session.messages = messages[1:]  # live tool results in webui
+                session.updated = time.time()
             else:
                 # step limit reached: keep the loop state (messages end on a
                 # tool result) and SUSPEND so /sess go can continue.
@@ -941,9 +952,9 @@ class Agent:
             )
         transcript = "\n".join(lines)
 
-        # Describe a few recent images to ground the summary — only ones that
-        # carry actual information (value gate skips stickers/tiny images,
-        # reuses cached descriptions).
+        # Describe a few recent images to ground the summary (cached
+        # descriptions are reused; the model's own judgment decides value
+        # when it calls describe_image with a purpose).
         image_notes: list[str] = []
         try:
             for r in reversed(rows):
@@ -956,8 +967,6 @@ class Agent:
                     if m.get("summary"):
                         image_notes.append(f"seq={r['message_seq']} 图片: {m['summary']}")
                         break
-                    if vision_worth(m) is not None:
-                        continue
                     desc = await self.llm.vision_describe(
                         m["file_path"],
                         "概括这张图片：出现的对象/人物、图中文字、与聊天相关的关键细节",
