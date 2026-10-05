@@ -192,6 +192,42 @@ def test_key_reader_bare_esc_and_tilde_codes():
     assert r() == "IGN" and r() == "z"
 
 
+def test_key_reader_survives_slow_followup_bytes(monkeypatch):
+    """Regression: under load (busy serve / ConPTY batching) the byte AFTER a
+    prefix can land beyond the old 30ms window — the prefix was consumed as
+    IGN and the code byte (H/P/K/M) leaked into the buffer as literal text.
+    The disambiguation window is generous now, so slow delivery still decodes."""
+    import asyncio
+
+    class SlowMsvcrt:
+        def __init__(self, seq, delays):
+            self.seq = list(seq)
+            self.delays = list(delays)  # seconds to be "unavailable" first
+
+        def kbhit(self) -> bool:
+            if self.delays and self.delays[0] > 0:
+                self.delays[0] -= 0.01
+                return False
+            return any(self.seq)
+
+        def getwch(self) -> str:
+            if self.delays:
+                self.delays.pop(0)
+            s = self.seq.pop(0)
+            ch = s[0]
+            if s[1:]:
+                self.seq.insert(0, s[1:])
+            return ch
+
+    async def run():
+        # \x00 prefix, then 'H' shows up only after 120ms (> old 30ms window)
+        m = SlowMsvcrt(["\x00", "H"], [0.0, 0.12])
+        reader = console.make_key_reader(msvcrt_mod=m, platform="nt")
+        return await asyncio.to_thread(reader, 5.0)
+
+    assert asyncio.run(run()) == "UP"
+
+
 def test_editor_accepts_esc_token_history():
     # ESC token (from the reader) clears; UP/DOWN tokens drive history
     hist = ["one"]

@@ -188,6 +188,14 @@ _WIN_SPECIAL = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT", "S": "DEL", "
 _CSI_SPECIAL = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT", "H": "HOME", "F": "END"}
 _CSI_TILDE = {"1": "HOME", "3": "DEL", "4": "END"}
 
+# Disambiguation window for the byte(s) following a prefix (\x00/\xe0 legacy
+# enhanced keys, ESC CSI sequences). Under load (busy serve, ConPTY input
+# batching) the follow-up byte can land well after 30ms; a too-tight window
+# consumed the prefix and leaked the code byte (H/P/K/M) into the buffer as
+# literal text. No human types a meaningful follow-up within this window, so
+# a generous timeout is free.
+_PREFIX_WAIT = 0.25
+
 
 def make_key_reader(msvcrt_mod=None, platform: str | None = None):
     """A poll_key(timeout) -> str|None callable, or None when unavailable.
@@ -222,20 +230,20 @@ def make_key_reader(msvcrt_mod=None, platform: str | None = None):
                 if ch is None:
                     return None
                 if ch in ("\x00", "\xe0"):  # legacy enhanced-key prefix
-                    nxt = _next(deadline=time.monotonic() + 0.03)
+                    nxt = _next(deadline=time.monotonic() + _PREFIX_WAIT)
                     return _WIN_SPECIAL.get(nxt, "IGN") if nxt else "IGN"
                 if ch == "\x1b":  # VT input mode: CSI sequence or bare Esc
-                    nxt = _next(time.monotonic() + 0.03)
+                    nxt = _next(deadline=time.monotonic() + _PREFIX_WAIT)
                     if nxt is None:
                         return "ESC"
                     if nxt != "[":  # e.g. ESC+x alt-style: keep the x
                         pending.append(nxt)
                         return "ESC"
-                    fin = _next(time.monotonic() + 0.03)
+                    fin = _next(deadline=time.monotonic() + _PREFIX_WAIT)
                     if fin in _CSI_SPECIAL:
                         return _CSI_SPECIAL[fin]
                     if fin in _CSI_TILDE:
-                        _next(time.monotonic() + 0.02)  # consume the '~'
+                        _next(deadline=time.monotonic() + _PREFIX_WAIT)  # consume the '~'
                         return _CSI_TILDE[fin]
                     return "IGN"
                 return ch
