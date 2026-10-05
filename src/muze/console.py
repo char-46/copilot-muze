@@ -222,29 +222,52 @@ def make_key_reader(msvcrt_mod=None, platform: str | None = None):
                     time.sleep(0.002)
 
             pending: list[str] = []  # char read ahead during ESC disambiguation
+            wait_legacy = [False]  # prefix seen; the code byte is still pending
 
             def poll_key(timeout: float = 0.05):
                 if pending:
                     return pending.pop(0)
+                ch: str | None
+                if wait_legacy[0]:
+                    # the enhanced-key code byte can arrive arbitrarily late
+                    # (GIL starvation under LLM streaming) — the input queue is
+                    # ordered, so the next byte IS the code byte
+                    ch = _next(time.monotonic() + timeout)
+                    if ch is None:
+                        return None
+                    wait_legacy[0] = False
+                    return _WIN_SPECIAL.get(ch, "IGN")
                 ch = _next(time.monotonic() + timeout)
                 if ch is None:
                     return None
                 if ch in ("\x00", "\xe0"):  # legacy enhanced-key prefix
                     nxt = _next(deadline=time.monotonic() + _PREFIX_WAIT)
-                    return _WIN_SPECIAL.get(nxt, "IGN") if nxt else "IGN"
+                    if nxt is None:
+                        wait_legacy[0] = True  # decode it on a later poll
+                        return None
+                    return _WIN_SPECIAL.get(nxt, "IGN")
                 if ch == "\x1b":  # VT input mode: CSI sequence or bare Esc
                     nxt = _next(deadline=time.monotonic() + _PREFIX_WAIT)
                     if nxt is None:
                         return "ESC"
+                    if nxt == "O":  # SS3: \x1bOA..D (application cursor mode)
+                        fin = _next(deadline=time.monotonic() + _PREFIX_WAIT)
+                        return _CSI_SPECIAL.get(fin, "IGN")
                     if nxt != "[":  # e.g. ESC+x alt-style: keep the x
                         pending.append(nxt)
                         return "ESC"
+                    # CSI: optional parameter bytes (digits/;) then a final
+                    # byte, e.g. \x1b[1;5D = Ctrl+Left, \x1b[3;5~ = Ctrl+Del
+                    params = ""
                     fin = _next(deadline=time.monotonic() + _PREFIX_WAIT)
-                    if fin in _CSI_SPECIAL:
+                    while fin is not None and (fin.isdigit() or fin == ";"):
+                        params += fin
+                        fin = _next(deadline=time.monotonic() + _PREFIX_WAIT)
+                    if fin in _CSI_SPECIAL:  # params ignored: Ctrl+Left -> LEFT
                         return _CSI_SPECIAL[fin]
-                    if fin in _CSI_TILDE:
-                        _next(deadline=time.monotonic() + _PREFIX_WAIT)  # consume the '~'
-                        return _CSI_TILDE[fin]
+                    if fin == "~" and params:
+                        key = params.split(";")[0][:1]  # primary modifier group
+                        return _CSI_TILDE.get(key, "IGN")
                     return "IGN"
                 return ch
 

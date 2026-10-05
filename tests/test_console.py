@@ -192,6 +192,30 @@ def test_key_reader_bare_esc_and_tilde_codes():
     assert r() == "IGN" and r() == "z"
 
 
+def test_key_reader_csi_with_params_and_ss3():
+    # \x1b[1;5D (Ctrl+Left) previously mis-decoded '1' as HOME, swallowed the
+    # ';' and leaked '5'/'D' into the buffer as literal text
+    r = win_reader(["\x1b[1;5D", "\x1b[1;5C", "a"])
+    assert r() == "LEFT" and r() == "RIGHT"
+    assert r() == "a"
+    r = win_reader(["\x1b[3;5~", "b"])  # Ctrl+Del
+    assert r() == "DEL" and r() == "b"
+    r = win_reader(["\x1bOD", "\x1bOA", "c"])  # SS3 application-mode arrows
+    assert r() == "LEFT" and r() == "UP"
+    assert r() == "c"
+
+
+def test_key_reader_legacy_code_byte_arrives_on_later_poll():
+    """GIL starvation under LLM streaming can delay the code byte beyond any
+    fixed window; the reader must hold the prefix state across polls instead
+    of consuming the prefix and leaking the code byte as text."""
+    m = FakeMsvcrt(["\x00"])
+    reader = console.make_key_reader(msvcrt_mod=m, platform="nt")
+    assert reader(0.01) is None  # prefix consumed, code byte missing
+    m.q.append("K")  # LEFT's code byte shows up much later
+    assert reader(0.05) == "LEFT"
+
+
 def test_key_reader_survives_slow_followup_bytes(monkeypatch):
     """Regression: under load (busy serve / ConPTY batching) the byte AFTER a
     prefix can land beyond the old 30ms window — the prefix was consumed as
