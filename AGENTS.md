@@ -27,11 +27,13 @@ Python 3.11+, dependencies managed with `uv`.
 ## Test gate
 
 ```
-A:\copilot-muze\.venv\Scripts\python.exe -m pytest -q
+A:\copilot-muze\.venv\Scripts\python.exe -m pytest -q -n 4
 ```
 
 All tests must pass before any commit. There is no separate lint/typecheck
-command configured; pytest is the gate. (Baseline: 187 tests.)
+command configured; pytest is the gate. (Baseline: 341 tests; ~17s with
+`-n 4`, ~40s serial. Use plain `-m pytest -q` when debugging a single
+worker's output — xdist interleaves logs.)
 
 ## Commit / release procedure (every feature batch)
 

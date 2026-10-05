@@ -135,37 +135,55 @@ async def test_rag_chat_windows_optin(repo):
 
 async def test_rag_chat_covers_all_conversations_no_starvation(repo):
     """Regression: _index_chat used to visit only the 300 most-recently-active
-    conversations (list_conversations' cap ordered by last_active_at DESC) —
+    conversations (list_conversations' cap ordered by last_active_at DESC) ——
     with 346 in the archive the least-active 46 were starved forever: they sat
     in the progress denominator but never got windows. Coverage must reach
-    every conversation regardless of activity."""
+    every conversation regardless of activity. (Fixture rows are bulk-inserted
+    in one transaction — 305 single upserts dominated this test's runtime.)"""
+    import json as _json
+
     from muze.provider.milky.models import IncomingMessage
 
     cfg = MuzeConfig()
     cfg.rag.enabled = True
     cfg.rag.chat = True
+    cfg.rag.embedding.min_interval_sec = 0  # fake embedder: no throttle needed
     vec = VecStore(repo)
     await vec.setup()
     indexer = RagIndexer(repo, vec, FakeEmbedder(), cfg)
 
     n = 305  # just past the old 300 cap
+    rows = []
+    convs = []
     for i in range(1, n + 1):
         scene = "friend" if i % 2 else "group"
         text = f"会话{i}的消息"
-        await repo.upsert_message(
-            IncomingMessage.from_raw(
-                {
-                    "message_scene": scene,
-                    "peer_id": i,
-                    "message_seq": 1,
-                    "sender_id": i,
-                    "time": 1790000000 + i,
-                    "segments": [{"type": "text", "data": {"text": text}}],
-                }
-            ),
-            text,
-            "event",
+        raw = IncomingMessage.from_raw(
+            {
+                "message_scene": scene,
+                "peer_id": i,
+                "message_seq": 1,
+                "sender_id": i,
+                "time": 1790000000 + i,
+                "segments": [{"type": "text", "data": {"text": text}}],
+            }
+        ).model_dump(mode="json", exclude_none=True)
+        rows.append(
+            (scene, i, 1, i, 1790000000 + i, _json.dumps(raw, ensure_ascii=False),
+             text, "event", 1790000000 + i)
         )
+        convs.append((scene, i, "", 1, 1790000000 + i, 1790000000 + i))
+    await repo.conn.executemany(
+        "INSERT INTO messages (scene, peer_id, message_seq, sender_id, time, raw_json,"
+        " text_content, source, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    await repo.conn.executemany(
+        "INSERT INTO conversations (scene, peer_id, name, last_seq, last_active_at, last_op_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        convs,
+    )
+    await repo.conn.commit()
 
     await indexer.run_once(force=True)
 

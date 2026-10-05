@@ -25,6 +25,11 @@ from muze.store.repo import Repository
 
 log = logging.getLogger("muze.rag")
 
+# chat indexing visits at most this many conversations per pass (most
+# recently active first); tests shrink this to keep the no-starvation
+# regression cheap
+CHAT_CONV_CAP = 1000
+
 
 class VecStore:
     """Thin wrapper over the sqlite-vec virtual table (+ model guard)."""
@@ -267,12 +272,13 @@ class RagIndexer:
         wm = int(self.cfg.rag.window_messages)
         wc = int(self.cfg.rag.window_chars)
         done = 0
-        # NOTE: list_conversations caps at 1000 rows ordered by last_active_at
-        # DESC. A limit below the archive's conversation count starves the
-        # least-recently-active tail FOREVER (they sit in the progress
-        # denominator but are never visited) — hit with 346 convs vs 300.
-        convs = await self.repo.list_conversations(limit=1000)
-        if len(convs) >= 1000:
+        # NOTE: list_conversations caps at CHAT_CONV_CAP rows ordered by
+        # last_active_at DESC. A limit below the archive's conversation count
+        # starves the least-recently-active tail FOREVER (they sit in the
+        # progress denominator but are never visited) — hit with 346 convs
+        # vs 300. (Constant so tests can shrink it.)
+        convs = await self.repo.list_conversations(limit=CHAT_CONV_CAP)
+        if len(convs) >= CHAT_CONV_CAP:
             log.warning(
                 "rag chat indexing reached the 1000-conversation cap; "
                 "older conversations are not being indexed"

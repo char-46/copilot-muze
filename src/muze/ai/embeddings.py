@@ -253,12 +253,17 @@ class Embedder:
     def _move_local(self, device: str) -> None:
         self._local.to(device)
         if device == "cpu":
-            try:
-                import torch
+            # empty_cache only matters when torch state exists — i.e. torch
+            # was already imported by a real model load. Importing it here
+            # just to clear a cache that cannot exist costs seconds.
+            import sys
 
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            torch = sys.modules.get("torch")
+            if torch is not None:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
         self._device = device
 
     # -------------------------------------------------------------- embed

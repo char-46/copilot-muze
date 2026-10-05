@@ -198,7 +198,20 @@ class App:
                 f"{instlock.describe_holder(None, _lock_path)}；"
                 "若确认没有其他实例在跑，删除 serve.lock 后重试。"
             )
-        self.conn = await open_db(str(acct / "muze.db"))
+        # per-process DB pool keyed by resolved path: when two account
+        # instances log into the SAME QQ (e.g. one QQ behind two Milky
+        # endpoints) they resolve to the same muze.db — two separate
+        # connections writing one file fight each other with SQLITE_BUSY,
+        # so they share ONE serialized aiosqlite connection instead.
+        db_path = str(acct / "muze.db")
+        entry = _DB_POOL.get(db_path)
+        if entry is not None:
+            entry["refs"] += 1
+            self.conn = entry["conn"]
+        else:
+            self.conn = await open_db(db_path)
+            _DB_POOL[db_path] = {"conn": self.conn, "refs": 1}
+        self._db_path = db_path
         self.repo = Repository(self.conn)
 
         # multi-account isolation: one data dir belongs to exactly one account
@@ -734,11 +747,23 @@ class App:
         if self.adapter is not None:
             await _safe("adapter.close", self.adapter.close(), 5)
         if self.conn is not None:
+            # pooled connection: close only when the last sharer is gone
+            entry = _DB_POOL.get(getattr(self, "_db_path", ""))
+            if entry is not None:
+                entry["refs"] -= 1
+                if entry["refs"] > 0:
+                    self.conn = None  # someone else still uses it
+                else:
+                    _DB_POOL.pop(self._db_path, None)
             await _safe("conn.close", self.conn.close(), 5)
 
 
 RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve
 FORCE_EXIT_SECONDS = 10  # graceful shutdown deadline after Ctrl-C
+
+# per-process shared DB connections (see App.startup): same QQ behind two
+# endpoints must not open two competing writers to one muze.db
+_DB_POOL: dict[str, dict] = {}
 
 
 def _force_exit_after(seconds: float) -> None:
