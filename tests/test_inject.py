@@ -342,7 +342,7 @@ async def test_resume_rebuilds_empty_message_list(repo):
 
     captured = {}
 
-    async def fake_chat(messages, ctx, session):
+    async def fake_chat(messages, ctx, session, tools=None):
         captured["messages"] = [dict(m) for m in messages]
         return {"content": "答了"}
 
@@ -376,7 +376,7 @@ async def test_resume_answers_dangling_tool_calls(repo):
 
     captured = {}
 
-    async def fake_chat(messages, ctx, session):
+    async def fake_chat(messages, ctx, session, tools=None):
         captured["messages"] = [dict(m) for m in messages]
         return {"content": "查完了"}
 

@@ -202,7 +202,7 @@ async def test_structured_query_tools(env):
     assert any(c["conv"] == "friend/100" for c in d["conversations"])
 
     d2 = json.loads(await runner.run("directory", {"kind": "friends"}))
-    assert d2 == {"friends": []}
+    assert d2["friends"] == [] and "now" in d2
 
 
 # ------------------------------------------------- progress + turn timeout
@@ -230,7 +230,9 @@ def _sent_texts(service):
     ]
 
 
-async def test_converse_sends_tool_call_lines(env, monkeypatch):
+async def test_converse_does_not_send_tool_call_lines(env, monkeypatch):
+    """Tool-call status lines are noise: they must NOT be pushed to the chat
+    front (the webui session view shows live events instead)."""
     service, repo = env
 
     class FakeRunner:
@@ -247,7 +249,6 @@ async def test_converse_sends_tool_call_lines(env, monkeypatch):
                 "role": "assistant",
                 "tool_calls": [
                     {"id": "1", "function": {"name": "search_archive", "arguments": "{}"}},
-                    {"id": "2", "function": {"name": "search_archive", "arguments": "{}"}},
                 ],
             },
             {"role": "assistant", "content": "done"},
@@ -257,12 +258,12 @@ async def test_converse_sends_tool_call_lines(env, monkeypatch):
     agent = Agent(service, repo, llm, ChatLog(), 3)
     out = await agent.converse("查一下", _qq_ctx())
     assert out.text == "done"
-    lines = _sent_texts(service)
-    # one compact line for the round, duplicate tool names collapsed
-    assert any("🔧" in l and l.count("search_archive") == 1 for l in lines)
-    # tool lines never enter the conversation history
-    assert not any(m.get("role") == "assistant" and str(m.get("content", "")).startswith("🔧")
-                   for m in llm.last_messages)
+    # tool rounds no longer push anything to the chat front (heartbeats may)
+    sent = _sent_texts(service)
+    assert all("🔧" not in l for l in sent)
+    # tool rounds are still visible as session events (webui)
+    kinds = [e[1] for e in agent.sessions.latest(1)[0].events]
+    assert "tool" in kinds and "tool_result" in kinds
 
 
 async def test_converse_heartbeats_show_live_output(env):
@@ -640,3 +641,167 @@ def test_default_max_steps_and_heuristic_title():
     assert LLMConfig().agent_max_steps == 48
     assert heuristic_title("第一行\n第二行") == "第一行"
     assert heuristic_title("   ") == "(无标题)"
+
+
+# ------------------------------------------------------- new tool surface
+async def test_tool_results_carry_current_time(env):
+    import json
+
+    from muze.ai.tools import ToolRunner
+
+    service, repo = env
+    runner = ToolRunner(service, repo, service.adapter, None, ctx())
+    r = json.loads(await runner.run("directory", {"kind": "conversations"}))
+    assert "now" in r and r["now"][4] == "-"  # YYYY-MM-DD ...
+    # errors carry it too
+    r2 = json.loads(await runner.run("directory", {"kind": "bogus"}))
+    assert "now" in r2
+
+
+async def test_subagent_tool_runs_readonly_child_loop(env):
+    import json
+
+    service, repo = env
+    # script order: parent r1 (subagent call) -> child answer -> parent r2
+    llm = ScriptLLM(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "1", "function": {"name": "subagent",
+                                             "arguments": '{"prompt":"查上周群聊里关于X的讨论并汇总"}'}},
+                ],
+            },
+            {"role": "assistant", "content": "子报告：X 被讨论了 3 次"},
+            {"role": "assistant", "content": "综合子报告：结论"},
+        ]
+    )
+    agent = Agent(service, repo, llm, ChatLog(), 6)
+    service.agent = agent
+    out = await agent.converse("帮我调研X", _qq_ctx())
+    assert out.text == "综合子报告：结论"
+    kids = [s for s in agent.sessions.latest(10) if s.title.startswith("子任务")]
+    assert kids and kids[0].status == "done"
+    assert kids[0].prompt.startswith("查上周群聊")
+    # the child tool payload came back to the parent as the tool result
+    tr = [m for m in agent.sessions.latest(10)[0].messages if m.get("role") == "tool"]
+    # first session = the parent (latest sorted by updated; assert loosely)
+
+
+async def test_subagent_depth_is_capped_at_one(env):
+    import json
+
+    from muze.ai.tools import ToolRunner
+
+    service, repo = env
+    agent = Agent(service, repo, ScriptLLM([]), ChatLog(), 3)
+    service.agent = agent
+    c = ctx()
+    c.sub_depth = 1  # simulate a sub-agent context
+    runner = ToolRunner(service, repo, service.adapter, None, c)
+    r = json.loads(await runner.run("subagent", {"prompt": "再派生一个"}))
+    assert "error" in r and "子智能体" in r["error"]
+
+
+async def test_subagent_spec_excludes_write_tools():
+    from muze.ai.tools import SPEC, SUBAGENT_SPEC
+
+    names = {s["function"]["name"] for s in SUBAGENT_SPEC}
+    full = {s["function"]["name"] for s in SPEC}
+    assert names <= full
+    for banned in ("send_message", "send_media", "schedule_task", "subagent",
+                   "remember", "profile_update", "make_chart"):
+        assert banned not in names
+    assert "search_archive" in names and "read_document" in names
+
+
+async def test_sess_stop_cancels_running_session(env):
+    service, repo = env
+    never = asyncio.Event()
+
+    class BlockLLM:
+        configured = True
+
+        async def chat(self, messages, tools=None, on_chunk=None):
+            await never.wait()
+            return {"role": "assistant", "content": "x"}
+
+    agent = Agent(service, repo, BlockLLM(), ChatLog(), 3)
+    service.agent = agent
+    session = agent.submit("跑不完", _qq_ctx())
+    await asyncio.sleep(0.05)
+    assert session.status == "running"
+
+    res = await service.run_command(f"sess stop {session.id}", _qq_ctx())
+    assert "已取消" in res.text
+    await asyncio.sleep(0.05)
+    assert session.status == "error" and "取消" in session.result_preview
+    # a finished/absent session cannot be stopped
+    res2 = await service.run_command("sess stop deadbeef", _qq_ctx())
+    assert res2.is_error
+
+
+async def test_sess_del_removes_session(env):
+    service, repo = env
+    agent = Agent(service, repo, ScriptLLM([]), ChatLog(), 3)
+    service.agent = agent
+    s = agent.sessions.create("qq:friend:1", "待删除")
+    s.finish(True, "做完了")
+    await agent._persist(s)
+
+    res = await service.run_command(f"sess del {s.id}", _qq_ctx())
+    assert "已删除" in res.text
+    assert agent.sessions.get(s.id) is None
+    assert await repo.get_ai_session(s.id) is None
+
+
+async def test_describe_image_value_gate_and_cache(env, tmp_path):
+    import json
+
+    from muze.ai.tools import ToolRunner
+
+    service, repo = env
+    calls: list[str] = []
+
+    class FakeVision:
+        configured = True
+
+        async def vision_describe(self, path, question):
+            calls.append(path)
+            return "图里是报价表"
+
+    async def add_media(seq, kind="image", w=800, h=600, size=90000, summary=None):
+        mid = await repo.add_media(
+            {
+                "scene": "friend", "peer_id": 9, "message_seq": seq, "seg_index": 0,
+                "kind": kind, "file_path": str(tmp_path / f"m{seq}.png"),
+                "file_name": f"m{seq}.png", "width": w, "height": h,
+                "file_size": size, "status": "done", "summary": summary,
+                "resource_id": None, "file_id": None, "file_hash": None,
+                "duration": None,
+            }
+        )
+        return mid
+
+    # 1: face sticker; 2: tiny image; 3: cached summary; 4: worthy image
+    await add_media(1, kind="face")
+    await add_media(2, w=80, h=60)
+    await add_media(3, summary="旧识别：发票金额200元")
+    await add_media(4)
+
+    runner = ToolRunner(service, repo, service.adapter, FakeVision(), ctx())
+    r = json.loads(await runner.run(
+        "describe_image",
+        {"scene": "friend", "peer_id": 9, "message_seq": 4, "purpose": "看金额"},
+    ))
+    assert r["descriptions"] == ["图里是报价表"]
+    assert calls == [str(tmp_path / "m4.png")]  # only the worthy one hit vision
+
+    # the description was cached back: second call reuses it
+    calls.clear()
+    r2 = json.loads(await runner.run(
+        "describe_image",
+        {"scene": "friend", "peer_id": 9, "message_seq": 4, "purpose": "再看一次"},
+    ))
+    assert calls == []  # no new vision call
+    assert "复用" in r2["descriptions"][0] and "报价表" in r2["descriptions"][0]

@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 from muze.ai.llm import LLMClient
 from muze.ai.sessions import ERROR, RUNNING, SUSPEND, Session, SessionStore
-from muze.ai.tools import SPEC, ToolRunner
+from muze.ai.tools import SPEC, SUBAGENT_SPEC, ToolRunner, vision_worth
 from muze.chatlog import ChatLog, epoch_iso
 from muze.core.service import (
     CommandOutcome,
@@ -67,7 +67,10 @@ SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）�
 - 查询也可用 cli 工具（和 /help 的命令完全一致），如 cli({"command":"search 关键词"})、
   cli({"command":"summary group/123 60"})；不确定命令就 cli({"command":"help"})。
 - 需要逐条看消息内容时才用 get_recent_messages。
-- 图片内容用 describe_image 识别；本地文档用 read_document；网页/在线文档用 fetch_url。
+- 图片内容用 describe_image 识别（说明 purpose 识别目标；小图/表情会自动跳过，已有结果直接复用）；
+  本地文档/压缩包用 read_document（docx/pdf/xlsx/xls/pptx/rtf/txt + zip/7z/tar；压缩包先看列表再 entry 读成员）；
+  网页/在线文档用 fetch_url。
+- 大规模翻查、多步独立调研用 subagent 委派子智能体（全新上下文、只读工具），拿回报告再综合，避免撑爆主对话。
 - 发送图片/文件/表情用 send_media（归档媒体给 media_id 或 会话/seq；本地文件给 path）；图片文字用 ocr_image；画柱状/折线图用 make_chart（再用 send_media 发）。
 - 联网检索用 web_search（要链接）或 research（搜索+抓取正文，推荐）；未配置搜索时如实说明无法联网。
 - 计划任务（"两小时后/每隔…"）用 schedule_task，时间换算是你的职责。
@@ -102,6 +105,7 @@ class Agent:
         self._running = 0
         self._waiting = 0
         self._tasks: set[asyncio.Task] = set()
+        self._session_tasks: dict[str, asyncio.Task] = {}  # session id -> task (for /sess stop)
         # process boot time: resume_interrupted() runs ~20s after start and
         # must only pick up crash debris from BEFORE this boot — a session
         # created after boot that is "running" is live traffic, not debris
@@ -178,11 +182,27 @@ class Agent:
                 self._slots.notify_all()
 
     # ------------------------------------------------------------- session
-    def _track(self, coro) -> asyncio.Task:
+    def _track(self, coro, session: Session | None = None) -> asyncio.Task:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        if session is not None:
+            self._session_tasks[session.id] = task
+            task.add_done_callback(lambda _t, sid=session.id: self._session_tasks.pop(sid, None))
         return task
+
+    def cancel_session(self, sid: str) -> bool:
+        """Cancel a running background session turn (/sess stop)."""
+        sid = (sid or "").lstrip("#").strip()
+        task = self._session_tasks.get(sid)
+        if task is None or task.done():
+            return False
+        s = self.sessions.get(sid)
+        if s is not None:
+            s.finish(False, "已被用户取消（/sess stop）")
+            self._track(self._persist(s))
+        task.cancel()
+        return True
 
     async def load_sessions(self) -> None:
         """Restore persisted sessions so suspended/continued turns survive a
@@ -228,7 +248,7 @@ class Agent:
         the session id immediately; several sessions in one conversation all
         run in parallel (up to the account's concurrency cap)."""
         session = self.sessions.create(ctx.chat_key, text)
-        self._track(self._run_session(session, text, ctx))
+        self._track(self._run_session(session, text, ctx), session)
         return session
 
     async def _run_session(self, session: Session, text: str, ctx: ControlContext) -> None:
@@ -254,7 +274,59 @@ class Agent:
         """Continue an existing session in the background (fire-and-forget):
         `extra_text` None resumes a suspended/errored turn from where it
         stopped; a message continues a finished session as a new turn."""
-        self._track(self._run_resume(session, ctx, extra_text))
+        self._track(self._run_resume(session, ctx, extra_text), session)
+
+    async def run_subagent(self, prompt: str, ctx: ControlContext) -> dict:
+        """One delegated sub-task: a fresh child session running the read-only
+        tool subset in its own loop; the final report comes back as the parent
+        tool's payload. Chain depth is capped at 1 (a sub-agent cannot spawn
+        further sub-agents)."""
+        child = self.sessions.create(ctx.chat_key, prompt)
+        child.title = "子任务: " + prompt[:24]
+        child.status = "running"
+        child.event("sub", "子智能体启动（只读工具）")
+        await self._persist(child)
+        sub_ctx = ControlContext(
+            source=ctx.source, chat_key=ctx.chat_key, scene="", peer_id=0,
+            user_label=ctx.user_label,
+        )
+        sub_ctx.sub_depth = getattr(ctx, "sub_depth", 0) + 1
+        self.chatlog.agent(ctx.source, "sub", "in", prompt[:200])
+        try:
+            async with self._turn_slot():
+                outcome = await self._drive_sub(child, prompt, sub_ctx)
+        except asyncio.CancelledError:
+            raise
+        except AgentBusy as e:
+            child.finish(False, str(e))
+            outcome = CommandOutcome(str(e), is_error=True)
+        except Exception as e:
+            log.exception("subagent crashed")
+            child.finish(False, str(e))
+            outcome = CommandOutcome(f"子智能体失败: {e}", is_error=True)
+        await self._finalize(child)
+        report = outcome.text or "(子智能体未返回内容)"
+        self.chatlog.agent(ctx.source, "sub", "out", report[:200])
+        return {"id": child.id, "status": child.status, "report": report}
+
+    async def _drive_sub(
+        self, session: Session, text: str, ctx: ControlContext
+    ) -> CommandOutcome:
+        messages: list[dict] = [
+            {"role": "system", "content": await self._system_prompt(ctx, query=text)},
+            {"role": "user", "content": text},
+        ]
+
+        async def commit(_final_text: str) -> None:  # no shared history
+            return None
+
+        async def rollback() -> None:
+            return None
+
+        return await self._drive(
+            session, ctx, messages, 1, commit, rollback,
+            tools=SUBAGENT_SPEC, max_steps=min(16, self.max_steps),
+        )
 
     @staticmethod
     def _ctx_for_chat_key(chat_key: str) -> ControlContext:
@@ -578,6 +650,7 @@ class Agent:
         messages: list[dict],
         ctx: ControlContext | None = None,
         session: Session | None = None,
+        tools: list | None = None,
     ) -> dict:
         """One LLM round with a couple of transient-failure retries.
 
@@ -595,14 +668,14 @@ class Agent:
                     and ctx.qq_reachable
                 )
                 if not heartbeat:
-                    return await self.llm.chat(messages, tools=SPEC)
+                    return await self.llm.chat(messages, tools=tools or SPEC)
                 stop = asyncio.Event()
                 hb = asyncio.create_task(self._heartbeat(ctx, stop, session))
                 try:
                     if session is None:
-                        return await self.llm.chat(messages, tools=SPEC)
+                        return await self.llm.chat(messages, tools=tools or SPEC)
                     return await self.llm.chat(
-                        messages, tools=SPEC, on_chunk=session.bump
+                        messages, tools=tools or SPEC, on_chunk=session.bump
                     )
                 finally:
                     stop.set()
@@ -748,6 +821,8 @@ class Agent:
         start_step: int,
         commit,
         rollback,
+        tools: list | None = None,
+        max_steps: int | None = None,
     ) -> CommandOutcome:
         """The tool-calling loop. `messages` is mutated in place and, at the
         end, stored on the session (system stripped) so a suspended/error turn
@@ -755,12 +830,13 @@ class Agent:
         runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         stall = self._turn_timeout()
         final_text = ""
+        step_budget = max_steps if max_steps is not None else self.max_steps
 
         try:
-            for step in range(start_step, self.max_steps + 1):
+            for step in range(start_step, step_budget + 1):
                 session.new_round()
                 session.event("llm", f"第{step}轮（调用模型）")
-                msg = await self._chat(messages, ctx, session)
+                msg = await self._chat(messages, ctx, session, tools=tools)
                 session.step = step
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
@@ -784,9 +860,8 @@ class Agent:
                 )
                 for _cid, n, a in calls:
                     session.event("tool", f"{n}({_brief(a)})")
-                if self._progress and ctx.qq_reachable:
-                    names = "、".join(dict.fromkeys(n for _, n, _ in calls if n))
-                    await self._notify(ctx, f"{self._tag(session)}🔧 {names}")
+                # tool-call status lines are no longer pushed to the chat
+                # front (noise); the webui session view shows live events
                 # run the step's tools concurrently (independent by design);
                 # stall cap catches tools that hang — NOT slow LLM output,
                 # which is bounded only by silence between stream chunks
@@ -812,9 +887,9 @@ class Agent:
             else:
                 # step limit reached: keep the loop state (messages end on a
                 # tool result) and SUSPEND so /sess go can continue.
-                session.suspend(messages[1:], f"第 {self.max_steps} 轮达上限")
+                session.suspend(messages[1:], f"第 {step_budget} 轮达上限")
                 return CommandOutcome(
-                    f"已达工具调用步数上限（{self.max_steps} 步），本轮已暂停；"
+                    f"已达工具调用步数上限（{step_budget} 步），本轮已暂停；"
                     f"回复 /sess go {session.id} 继续。"
                 )
         except TimeoutError:
@@ -866,7 +941,9 @@ class Agent:
             )
         transcript = "\n".join(lines)
 
-        # Describe a few recent images to ground the summary.
+        # Describe a few recent images to ground the summary — only ones that
+        # carry actual information (value gate skips stickers/tiny images,
+        # reuses cached descriptions).
         image_notes: list[str] = []
         try:
             for r in reversed(rows):
@@ -874,13 +951,26 @@ class Agent:
                     break
                 medias = await self.repo.media_for_message(scene, peer_id, r["message_seq"])
                 for m in medias:
-                    if m["kind"] == "image" and m["status"] == "done":
-                        desc = await self.llm.vision_describe(
-                            m["file_path"],
-                            "概括这张图片：出现的对象/人物、图中文字、与聊天相关的关键细节",
-                        )
-                        image_notes.append(f"seq={r['message_seq']} 图片: {desc}")
+                    if m["kind"] != "image" or m["status"] != "done":
+                        continue
+                    if m.get("summary"):
+                        image_notes.append(f"seq={r['message_seq']} 图片: {m['summary']}")
                         break
+                    if vision_worth(m) is not None:
+                        continue
+                    desc = await self.llm.vision_describe(
+                        m["file_path"],
+                        "概括这张图片：出现的对象/人物、图中文字、与聊天相关的关键细节",
+                    )
+                    image_notes.append(f"seq={r['message_seq']} 图片: {desc}")
+                    if m.get("id"):
+                        try:
+                            await self.repo.update_media(
+                                m["id"], status=m["status"], summary=desc[:500]
+                            )
+                        except Exception:
+                            pass
+                    break
         except Exception as e:
             log.debug("image describe skipped: %s", e)
 

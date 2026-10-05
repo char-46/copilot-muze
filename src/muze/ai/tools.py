@@ -143,13 +143,21 @@ SPEC = [
         "type": "function",
         "function": {
             "name": "describe_image",
-            "description": "用视觉模型识别某条消息中的图片内容",
+            "description": (
+                "用视觉模型识别某条消息中的图片内容（截图/照片/图表等含信息量的图才值得调用；"
+                "表情包/小图会被跳过并说明原因；已有识别结果的图直接复用不再重复调用）。"
+                "purpose 用一句话说明你为什么要看这张图（识别目标），系统据此判断值不值得调用视觉。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "scene": {"type": "string", "enum": ["friend", "group"]},
                     "peer_id": {"type": "integer"},
                     "message_seq": {"type": "integer"},
+                    "purpose": {
+                        "type": "string",
+                        "description": "识别目标，如'看清楚发票金额'、'这张截图里的报错'",
+                    },
                 },
                 "required": ["scene", "peer_id", "message_seq"],
             },
@@ -256,12 +264,20 @@ SPEC = [
         "function": {
             "name": "read_document",
             "description": (
-                "读取本地文档全文（QQ 收到的文件已自动落盘，配合 cli 的 msg/media 命令找到路径）。"
-                "支持 docx/txt/md/html/csv/json；doc/pdf 暂不支持会明确报错。"
+                "读取本地文档/压缩包（QQ 收到的文件已自动落盘，配合 cli 的 msg/media 命令找到路径）。"
+                "文本: txt/md/json/csv/xml/html；文档: docx/pdf/xlsx/xls/pptx/rtf，"
+                "旧版 doc/ppt 会嗅探真实格式尽力提取；压缩包: zip/7z/tar/gz（rar 需机器装有 7-Zip）。"
+                "压缩包先不传 entry 看文件列表（含小文本预览），再 entry=<文件名> 读其中一项。"
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "本地文件绝对路径"}},
+                "properties": {
+                    "path": {"type": "string", "description": "本地文件绝对路径"},
+                    "entry": {
+                        "type": "string",
+                        "description": "压缩包内的成员文件名（仅压缩包需要）",
+                    },
+                },
                 "required": ["path"],
             },
         },
@@ -398,6 +414,28 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "subagent",
+            "description": (
+                "把一个可独立完成的子任务交给子智能体（全新上下文、只读工具），拿回它的最终报告。"
+                "适合大规模翻查/多步检索/独立调研——避免几十轮工具调用把主对话上下文撑爆。"
+                "prompt 写成完整自包含的指令（目标、范围、期望输出格式），子智能体看不到当前对话。"
+                "子智能体不能再派生子智能体。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "给子智能体的完整任务指令（自包含）",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_skill",
             "description": (
                 "阅读一个已安装技能的完整说明（先 cli({\"command\":\"skills\"}) 看列表）。"
@@ -465,6 +503,39 @@ SPEC = [
     },
 ]
 
+# Sub-agents run with a READ-ONLY tool set: they research, they never act.
+# cli is kept (its write commands are approval-gated anyway) because msg/
+# media/forward reads live there.
+_SUBAGENT_EXCLUDE = {
+    "send_message", "send_media", "schedule_task", "remember",
+    "memory_update", "memory_delete", "profile_update", "subagent",
+    "make_chart",
+}
+SUBAGENT_SPEC = [
+    s for s in SPEC if s["function"]["name"] not in _SUBAGENT_EXCLUDE
+]
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+
+    return f"{datetime.now().astimezone():%Y-%m-%d %H:%M:%S}"
+
+
+def vision_worth(row: dict) -> str | None:
+    """Should this archived image get a (costly) vision call?
+
+    Returns None when it IS worth describing, else a short reason string
+    (value gate: tiny stickers/memes carry nothing worth a model call)."""
+    if row.get("kind") == "face":
+        return "表情/贴图，无需视觉识别"
+    w, h = row.get("width") or 0, row.get("height") or 0
+    if w and h and (w < 160 or h < 160):
+        return f"尺寸过小（{w}x{h}），大概率是贴图/角标"
+    if (row.get("file_size") or 0) and row["file_size"] < 12 * 1024:
+        return "文件过小（<12KB），无有效信息量"
+    return None
+
 
 class ToolRunner:
     def __init__(
@@ -487,12 +558,14 @@ class ToolRunner:
         try:
             handler = getattr(self, f"t_{name}")
             result = await handler(args)
+            if isinstance(result, dict):
+                result.setdefault("now", _now_iso())
             payload = json.dumps(result, ensure_ascii=False, default=str)
         except ProtocolError as e:
-            payload = json.dumps({"error": f"协议端错误: {e}"}, ensure_ascii=False)
+            payload = json.dumps({"error": f"协议端错误: {e}", "now": _now_iso()}, ensure_ascii=False)
         except Exception as e:
             log.warning("tool %s failed: %s", name, e)
-            payload = json.dumps({"error": str(e)}, ensure_ascii=False)
+            payload = json.dumps({"error": str(e), "now": _now_iso()}, ensure_ascii=False)
         log.info("LLM tool  | %s(%s) -> %s", name, _args_brief(args), payload[:4000])
         return payload
 
@@ -853,6 +926,7 @@ class ToolRunner:
         return out
 
     async def t_describe_image(self, args: dict) -> dict:
+        purpose = str(args.get("purpose", "")).strip() or "详细描述图片内容"
         medias = await self.repo.media_for_message(
             args["scene"], args["peer_id"], args["message_seq"]
         )
@@ -860,11 +934,42 @@ class ToolRunner:
         if not images:
             summaries = [m.get("summary") or "" for m in medias if m["kind"] == "image"]
             return {"descriptions": [s for s in summaries if s] or "(无已下载图片)"}
-        out = []
+        out: list[str] = []
         for m in images[:3]:
-            desc = await self.llm.vision_describe(m["file_path"], "详细描述这张图片的内容")
+            # value gate: reuse a previous description, skip low-value images
+            if m.get("summary"):
+                out.append(f"(复用已识别结果) {m['summary']}")
+                continue
+            skip = vision_worth(m)
+            if skip is not None:
+                out.append(f"(跳过) {skip}")
+                continue
+            desc = await self.llm.vision_describe(m["file_path"], purpose)
             out.append(desc)
-        return {"descriptions": out}
+            if m.get("id"):
+                try:  # cache for the next ask
+                    await self.repo.update_media(
+                        m["id"], status=m["status"], summary=desc[:500]
+                    )
+                except Exception:
+                    pass
+        return {"purpose": purpose, "descriptions": out}
+
+    async def t_subagent(self, args: dict) -> dict:
+        agent = getattr(self.service, "agent", None)
+        if agent is None:
+            return {"error": "agent 未装配"}
+        if getattr(self.ctx, "sub_depth", 0) >= 1:
+            return {"error": "子智能体不能再派生子智能体（链深限制 1）"}
+        prompt = str(args.get("prompt", "")).strip()
+        if not prompt:
+            return {"error": "prompt 不能为空"}
+        result = await agent.run_subagent(prompt, self.ctx)
+        return {
+            "sub_session": f"#{result['id']}",
+            "status": result["status"],
+            "report": result["report"],
+        }
 
     async def t_send_message(self, args: dict) -> dict:
         from muze.reply import strip_markdown
@@ -1020,11 +1125,14 @@ class ToolRunner:
         from muze.docs import read_document
 
         path = str(args.get("path", "")).strip()
+        entry = args.get("entry") or None
+        if entry:
+            entry = str(entry).strip()
         try:
-            text = await __import__("asyncio").to_thread(read_document, path)
+            text = await __import__("asyncio").to_thread(read_document, path, entry)
         except (FileNotFoundError, ValueError) as e:
             return {"error": str(e)}
-        return {"path": path, "content": text}
+        return {"path": path, "entry": entry, "content": text}
 
     async def t_fetch_url(self, args: dict) -> dict:
         from muze.docs import fetch_url

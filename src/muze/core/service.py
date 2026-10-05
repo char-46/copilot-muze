@@ -1266,9 +1266,9 @@ class ControlService:
 
     @slash(
         "sess",
-        "/sess [list|go [id]|getpdf <id>|<id> [消息]]",
-        "AI 会话：list 列表 / go [id] 继续（省略 id = 全部）/ getpdf <id> 导出 PDF / "
-        "<id> 看详情 / <id> 消息 在完成后继续追问",
+        "/sess [list|go [id]|stop <id>|del <id>|getpdf <id>|<id> [消息]]",
+        "AI 会话：list 列表 / go [id] 继续（省略 id = 最近一个可续）/ stop <id> 取消运行中的 / "
+        "del <id> 删除 / getpdf <id> 导出 PDF / <id> 看详情 / <id> 消息 在完成后继续追问",
     )
     async def cmd_sess(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.agent is None:
@@ -1276,18 +1276,26 @@ class ControlService:
         store = self.agent.sessions
 
         if not args or args[0] in ("list", "ls"):
-            rows = store.latest(10)
+            try:
+                n = max(1, min(int(args[1]), 50)) if len(args) >= 2 else 10
+            except ValueError:
+                n = 10
+            rows = store.latest(n)
             if not rows:
                 return CommandOutcome("暂无 AI 会话")
             icon = {"running": "⏳", "done": "✔", "error": "✖", "suspend": "⏸"}
-            lines = [
-                f"{icon.get(s.status, '?')} #{s.id} {s.title} "
-                f"[{s.chat_key}] {s.elapsed():.0f}s"
-                for s in rows
-            ]
+            lines = []
+            for s in rows:
+                preview = (s.result_preview or "").strip().replace("\n", " ")
+                lines.append(
+                    f"{icon.get(s.status, '?')} #{s.id} {s.title} "
+                    f"[{s.chat_key}] {s.elapsed():.0f}s"
+                    + (f" | {preview[:60]}" if preview else "")
+                )
             return CommandOutcome(
                 "\n".join(lines)
-                + "\n/sess <id> 详情 · /sess go [id] 继续 · /sess <id> <消息> 追问"
+                + "\n/sess <id> 详情 · /sess go [id] 继续 · /sess stop <id> 取消"
+                " · /sess del <id> 删除 · /sess <id> <消息> 追问"
             )
 
         sub = args[0]
@@ -1305,10 +1313,25 @@ class ControlService:
             pending = store.resumable()
             if not pending:
                 return CommandOutcome("没有可继续的会话（暂停或出错的）")
-            for s in pending:
-                self.agent.resume(s, ctx)
-            ids = "、".join(f"#{s.id}" for s in pending)
-            return CommandOutcome(f"已继续 {len(pending)} 个会话：{ids}，完成后回复")
+            s = pending[0]  # the most recent resumable one only (quiet default)
+            self.agent.resume(s, ctx)
+            extra = f"（还有 {len(pending) - 1} 个可续，用 /sess go <id> 逐个继续）" if len(pending) > 1 else ""
+            return CommandOutcome(f"已继续 #{s.id}（{s.title}），完成后回复{extra}")
+
+        if sub == "stop":
+            if len(args) < 2:
+                return CommandOutcome.err("用法: /sess stop <id>（运行中的会话）")
+            if not self.agent.cancel_session(args[1]):
+                return CommandOutcome.err(f"#{args[1].lstrip('#')} 不在运行中（或已结束）")
+            return CommandOutcome(f"已取消 #{args[1].lstrip('#')}")
+
+        if sub in ("del", "rm", "delete"):
+            if len(args) < 2:
+                return CommandOutcome.err("用法: /sess del <id>")
+            sid = args[1].lstrip("#").strip()
+            self.agent.sessions.drop(sid)
+            await self.repo.delete_ai_session(sid)
+            return CommandOutcome(f"已删除 #{sid}")
 
         if sub in ("getpdf", "pdf"):
             if len(args) < 2:

@@ -231,6 +231,13 @@ class SessionStore:
         sid = (sid or "").lstrip("#").strip()
         return self._sessions.get(sid)
 
+    def drop(self, sid: str) -> None:
+        """Remove from memory (running sessions are protected)."""
+        sid = (sid or "").lstrip("#").strip()
+        s = self._sessions.get(sid)
+        if s is not None and s.status != "running":
+            del self._sessions[sid]
+
     def recent(self, n: int = 8) -> list[Session]:
         return list(self._sessions.values())[-n:]
 

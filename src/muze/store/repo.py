@@ -345,17 +345,18 @@ class Repository:
     async def update_media(
         self, media_id: int, *, status: str, file_path: str | None = None,
         file_size: int | None = None, error: str | None = None,
-        content_hash: str | None = None,
+        content_hash: str | None = None, summary: str | None = None,
     ) -> None:
         await self.conn.execute(
             """
             UPDATE media SET status=?, file_path=COALESCE(?, file_path),
                              file_size=COALESCE(?, file_size),
                              content_hash=COALESCE(?, content_hash),
+                             summary=COALESCE(?, summary),
                              error=?, updated_at=?
             WHERE id=?
             """,
-            (status, file_path, file_size, content_hash, error, _now(), media_id),
+            (status, file_path, file_size, content_hash, summary, error, _now(), media_id),
         )
         await self.conn.commit()
 
