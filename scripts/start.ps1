@@ -4,9 +4,10 @@ muze service lifecycle (start / stop / restart). update.ps1 never touches the
 service -- this script is the only one that does, and YOU run it.
 
 Usage:
-  powershell -ExecutionPolicy Bypass -File scripts\start.ps1           # start (if not running)
-  powershell -ExecutionPolicy Bypass -File scripts\start.ps1 -Stop     # stop daemon+serve (hard kill)
-  powershell -ExecutionPolicy Bypass -File scripts\start.ps1 -Restart  # stop, then start
+  powershell -ExecutionPolicy Bypass -File scripts\start.ps1                 # foreground daemon in THIS console (like `uv run muze daemon`, Ctrl+C to stop)
+  powershell -ExecutionPolicy Bypass -File scripts\start.ps1 -Background     # start hidden daemon (with startup verification)
+  powershell -ExecutionPolicy Bypass -File scripts\start.ps1 -Stop           # stop daemon+serve (hard kill)
+  powershell -ExecutionPolicy Bypass -File scripts\start.ps1 -Restart        # stop, then background start
 
 Notes:
 - Stop is a hard kill (Windows cannot Ctrl-C a process attached to another
@@ -14,10 +15,15 @@ Notes:
   watermarks, and the startup pull recovers anything missed while down.
   For a code/config flip WITHOUT downtime prefer /restart (console / WebUI /
   `muze cli`), which re-execs serve in place (or rc=100 relaunch via daemon).
+- Default (no switch) runs the daemon in the FOREGROUND of the current
+  console: logs stream to stdout/stderr here and Ctrl+C stops everything.
+  -Background detaches (hidden window, logs to data\logs\daemon.*.log) and
+  verifies startup before returning.
 #>
 param(
     [switch]$Stop,
     [switch]$Restart,
+    [switch]$Background,
     [string]$Config = "config.yaml"
 )
 
@@ -66,6 +72,9 @@ if ($Stop -or $Restart) {
         Start-Sleep -Seconds 2
     }
     if ($Stop) { exit 0 }
+    # foreground/restart: fall through to the start section (Restart keeps
+    # its historical detached behavior; pass both flags for a fg restart)
+    if ($Restart) { $Background = $true }
 }
 
 # ---------------------------------------------------------------- start
@@ -78,6 +87,14 @@ if (-not (Test-Path $CfgAbs)) {
     throw "config not found: $CfgAbs (copy config.example.yaml to config.yaml and edit it)"
 }
 
+# ------------------------------------------------------- foreground start
+if (-not $Background) {
+    Write-Step "starting muze daemon in the FOREGROUND (Ctrl+C to stop)..."
+    & $Py -m muze daemon -c $CfgAbs
+    exit $LASTEXITCODE
+}
+
+# ------------------------------------------------------- background start
 $logDir = Join-Path $Repo "data\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $outLog = Join-Path $logDir "daemon.out.log"
