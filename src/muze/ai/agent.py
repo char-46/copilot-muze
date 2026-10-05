@@ -25,6 +25,9 @@ log = logging.getLogger("muze.ai")
 
 MAX_HISTORY = 30  # per control conversation
 TOOL_RESULT_LIMIT = 6000  # chars kept per tool result fed back to the model
+# subagent runs a full child loop (up to 16 steps x slow LLM streams); the
+# parent's per-tool stall cap is multiplied by this for it
+SUBAGENT_STALL_MULT = 4
 
 
 class AgentBusy(Exception):
@@ -297,6 +300,10 @@ class Agent:
             async with self._turn_slot():
                 outcome = await self._drive_sub(child, prompt, sub_ctx)
         except asyncio.CancelledError:
+            # parent's stall cap cancelled us mid-child-loop: leave the
+            # child session inspectable/resumable, not dangling "running"
+            child.finish(False, "被父级超时中止")
+            self._track(self._persist(child))
             raise
         except AgentBusy as e:
             child.finish(False, str(e))
@@ -871,16 +878,27 @@ class Agent:
                     session.event("tool", f"{n}({_brief(a)})")
                 # tool-call status lines are no longer pushed to the chat
                 # front (noise); the webui session view shows live events
-                # run the step's tools concurrently (independent by design);
-                # stall cap catches tools that hang — NOT slow LLM output,
-                # which is bounded only by silence between stream chunks
+                # run the step's tools concurrently (independent by design).
+                # Per-call stall cap: a hung tool becomes a TOOL-LEVEL error
+                # the model can see and recover from — it no longer aborts
+                # the whole turn. subagent legitimately runs a whole child
+                # loop (up to 16 steps x slow LLM streams), so it gets a
+                # multiplied cap.
+                async def _run_one(name: str, coro):
+                    cap = stall * (SUBAGENT_STALL_MULT if name == "subagent" else 1)
+                    if cap <= 0:
+                        return await coro
+                    try:
+                        return await asyncio.wait_for(coro, cap)
+                    except TimeoutError:
+                        return TimeoutError(
+                            f"工具 {name} 超过 {int(cap)} 秒未完成（卡死），已中止"
+                        )
+
                 coros = [runner.run(n, a) for _, n, a in calls]
-                results = (
-                    await asyncio.wait_for(
-                        asyncio.gather(*coros, return_exceptions=True), stall
-                    )
-                    if stall > 0
-                    else await asyncio.gather(*coros, return_exceptions=True)
+                results = await asyncio.gather(
+                    *[_run_one(n, c) for (_, n, _a), c in zip(calls, coros)],
+                    return_exceptions=True,
                 )
                 for (cid, name, _a), res in zip(calls, results):
                     if isinstance(res, BaseException):

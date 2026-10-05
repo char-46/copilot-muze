@@ -279,8 +279,10 @@ async def test_converse_heartbeats_show_live_output(env):
     assert any("模型输出中" in l for l in beats)
 
 
-async def test_converse_tool_stall_aborts_turn(env, monkeypatch):
-    """A HUNG tool aborts the turn; a slow-but-alive model never would."""
+async def test_converse_tool_stall_becomes_tool_error(env, monkeypatch):
+    """A hung tool no longer aborts the whole turn: its stall cap fires as a
+    TOOL-LEVEL error the model sees and recovers from (slow-but-alive model
+    output was never cut and still isn't)."""
     service, repo = env
 
     class HungRunner:
@@ -295,13 +297,53 @@ async def test_converse_tool_stall_aborts_turn(env, monkeypatch):
         [
             {"role": "assistant",
              "tool_calls": [{"id": "1", "function": {"name": "cli", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "工具挂了但我还在"},
         ]
     )
     llm.cfg = _llm_cfg(turn_timeout_sec=0.05)
     agent = Agent(service, repo, llm, ChatLog(), 3)
     out = await agent.converse("会卡住", _qq_ctx())
-    assert out.is_error and "卡死" in out.text
-    assert agent._histories["qq:friend:1"] == []  # aborted turn dropped
+    assert not out.is_error and out.text == "工具挂了但我还在"
+    # the hung tool is visible as a timed-out session event
+    evs = [e[2] for e in agent.sessions.latest(1)[0].events]
+    assert any("卡死" in e for e in evs)
+
+
+async def test_subagent_gets_multiplied_stall_cap(env, monkeypatch):
+    """subagent legitimately runs for minutes (child loop of LLM steps), so
+    its cap is stall*SUBAGENT_STALL_MULT — a run slower than the plain stall
+    but under the multiplied cap must COMPLETE."""
+    service, repo = env
+
+    class SlowSubRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            if name == "subagent":
+                await asyncio.sleep(0.12)  # > stall(0.05), < 0.05*4
+                return '{"report": "child done"}'
+            await asyncio.sleep(30)  # normal tool: must hit the plain cap
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", SlowSubRunner)
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "subagent",
+                                                     "arguments": "{}"}}]},
+            {"role": "assistant",
+             "tool_calls": [{"id": "2", "function": {"name": "cli",
+                                                     "arguments": "{}"}}]},
+            {"role": "assistant", "content": "两次都处理了"},
+        ]
+    )
+    llm.cfg = _llm_cfg(turn_timeout_sec=0.05)
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("派个崽", _qq_ctx())
+    assert not out.is_error and out.text == "两次都处理了"
+    evs = [e[2] for e in agent.sessions.latest(1)[0].events]
+    assert any("child done" in e for e in evs)  # subagent finished fine
+    assert any("cli" in e and "卡死" in e for e in evs)  # normal tool capped
 
 
 async def test_submit_is_async_and_queryable_by_sess(env, monkeypatch):
