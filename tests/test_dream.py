@@ -373,15 +373,29 @@ async def test_weekly_rollup_and_night_chain(repo):
     assert wk not in await missing_weeks(repo)
 
 
-async def test_dream_night_rolls_up_completed_week(repo):
+async def test_dream_night_rolls_up_completed_week(repo, monkeypatch):
+    # Freeze time to Wed 2026-09-16: yesterday (Tue) sits inside the CURRENT
+    # week so the first dream_night below can never roll a week up by itself.
+    # (Run on a real Monday this test used to break: yesterday-Sunday alone
+    # completed an ISO week and the first call already consumed the rollup.)
+    from muze import digest as digest_mod
+
+    class FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 16, 12, 0, 0).astimezone()
+
+    monkeypatch.setattr(digest_mod, "datetime", FrozenDT)
+
     llm = FakeLLM()
     cfg = MuzeConfig()
     # no day digests -> nothing to do (no week rollup either)
     text = await dream_night(repo, llm, cfg, ChatLog())
     assert "补做 1 天" in text  # yesterday itself
+    assert "周报" not in text  # current week never rolls up
 
     # give the completed last week day-reports only; next night should roll it up
-    monday = datetime.now().astimezone() - timedelta(days=7)
+    monday = FrozenDT.now() - timedelta(days=7)
     monday = monday - timedelta(days=monday.weekday())
     await repo.upsert_digest(
         monday.strftime("%Y-%m-%d"), "周一报告", 24.0, {}, period="day"

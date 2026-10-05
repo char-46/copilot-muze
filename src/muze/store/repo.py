@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, Iterable
 
 import aiosqlite
 
 from muze.provider.milky.models import IncomingMessage
+
+log = logging.getLogger("muze.store")
 
 
 def _now() -> int:
@@ -50,6 +53,28 @@ class Repository:
         return int(row[0]) if row else None
 
     # ------------------------------------------------------------ messages
+    async def _exec_retry(self, sql: str, params: tuple) -> aiosqlite.Cursor:
+        """Execute one write with bounded retry on transient SQLITE_BUSY.
+
+        busy_timeout (30s) already absorbs normal contention; this catches
+        the rare starved case so a momentary cross-process lock burst never
+        kills the ingest dispatch."""
+        import asyncio
+
+        delay = 0.5
+        for attempt in range(4):
+            try:
+                return await self.conn.execute(sql, params)
+            except aiosqlite.OperationalError as e:
+                if "locked" not in str(e) and "busy" not in str(e).lower():
+                    raise
+                if attempt == 3:
+                    raise
+                log.warning("sqlite busy (attempt %d): %s; retrying in %.1fs", attempt + 1, e, delay)
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise RuntimeError("unreachable")
+
     async def upsert_message(
         self,
         msg: IncomingMessage,
@@ -62,7 +87,7 @@ class Repository:
         conv_name is the conversation's display name (group name / friend
         remark), stored on conversations.name when non-empty."""
         raw = msg.model_dump(mode="json", exclude_none=True)
-        cur = await self.conn.execute(
+        cur = await self._exec_retry(
             """
             INSERT INTO messages
                 (scene, peer_id, message_seq, sender_id, time, raw_json,

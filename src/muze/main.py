@@ -186,6 +186,18 @@ class App:
         # media bytes go to the shared app-level blob store (cross-account dedup)
         acct = cfg.storage.account_dir(uin)
         self.account_dir = acct
+        # exactly one serve process per account directory: a second writer on
+        # the same muze.db shows up as SQLITE_BUSY storms on the ingest path
+        from muze import instlock
+
+        _lock_path = acct / "serve.lock"
+        self._instlock = instlock.acquire(_lock_path, timeout=20.0)
+        if self._instlock is None:
+            raise RuntimeError(
+                f"账号数据目录 {acct} 已被另一个 muze 进程占用"
+                f"{instlock.describe_holder(None, _lock_path)}；"
+                "若确认没有其他实例在跑，删除 serve.lock 后重试。"
+            )
         self.conn = await open_db(str(acct / "muze.db"))
         self.repo = Repository(self.conn)
 
