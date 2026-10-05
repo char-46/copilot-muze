@@ -184,6 +184,80 @@ async def open_db(path: str) -> aiosqlite.Connection:
     await conn.execute("PRAGMA busy_timeout=30000")
     await conn.execute("PRAGMA foreign_keys=ON")
     await migrate(conn)
+
+    # connection-level BUSY resilience: every write through this connection
+    # (any repo method) retries on transient "database is locked" instead of
+    # killing its caller. busy_timeout already absorbs normal contention;
+    # this catches the starved tail (e.g. an orphaned process finishing its
+    # last writes). A BUSY statement never applied, so retrying is safe.
+    import asyncio as _asyncio
+
+    class _RetryingExecute:
+        """Awaitable AND async-with (mirrors aiosqlite's execute protocol)."""
+
+        __slots__ = ("_conn",)
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        async def _acquire(self, sql, params):
+            delay = 0.5
+            for attempt in range(4):
+                if params is None:
+                    cm = self._conn._muze_orig_execute(sql)
+                else:
+                    cm = self._conn._muze_orig_execute(sql, params)
+                try:
+                    return await cm
+                except aiosqlite.OperationalError as e:
+                    msg = str(e).lower()
+                    if "locked" not in msg and "busy" not in msg:
+                        raise
+                    if attempt == 3:
+                        raise
+                    log.warning(
+                        "sqlite busy (attempt %d) on %.40s...; retry in %.1fs",
+                        attempt + 1, str(sql).strip(), delay,
+                    )
+                    await _asyncio.sleep(delay)
+                    delay *= 2
+            raise RuntimeError("unreachable")
+
+        def __await__(self):
+            raise TypeError("call conn.execute(sql, params) first")
+
+        def __call__(self, sql, params=None):
+            # params pass through UNTOUCHED: dict (named :params), tuple,
+            # list — sqlite3 accepts them all as given
+            return _BoundRetry(self, sql, params)
+
+    class _BoundRetry:
+        __slots__ = ("_owner", "_sql", "_params", "_cur")
+
+        def __init__(self, owner, sql, params):
+            self._owner = owner
+            self._sql = sql
+            self._params = params
+            self._cur = None
+
+        def __await__(self):
+            return self._owner._acquire(self._sql, self._params).__await__()
+
+        async def __aenter__(self):
+            self._cur = await self._owner._acquire(self._sql, self._params)
+            return self._cur
+
+        async def __aexit__(self, *exc):
+            if self._cur is not None:
+                try:
+                    await self._cur.close()
+                except Exception:
+                    pass
+            return None
+
+    conn._muze_orig_execute = conn.execute  # real method; test seam
+    conn.execute = _RetryingExecute(conn)  # type: ignore[method-assign]
+
     # sqlite-vec powers semantic (vector) retrieval; best-effort — RAG just
     # stays unavailable if the extension can't be loaded.
     try:

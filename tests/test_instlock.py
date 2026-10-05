@@ -94,6 +94,8 @@ async def test_busy_timeout_is_30s(tmp_path):
 
 
 async def test_upsert_message_retries_transient_busy(tmp_path, monkeypatch):
+    """The connection-level retry wrapper (db.py open_db) makes any write
+    survive a transient BUSY — not just upsert_message."""
     from muze.store.db import open_db
     from muze.store.repo import Repository
     from muze.provider.milky.models import IncomingMessage
@@ -109,18 +111,34 @@ async def test_upsert_message_retries_transient_busy(tmp_path, monkeypatch):
             time=1700000000,
             segments=[],
         )
-        real = conn.execute
+        real = conn._muze_orig_execute
         calls = {"n": 0}
 
-        async def flaky(sql, params=None):
+        def flaky(sql, params=None):
             if "INSERT INTO messages" in sql and calls["n"] == 0:
                 calls["n"] += 1
-                raise aiosqlite.OperationalError("database is locked")
-            return await real(sql, params or ())
 
-        monkeypatch.setattr(conn, "execute", flaky)
+                class _BusyCM:
+                    def __await__(self):
+                        async def _raise():
+                            raise aiosqlite.OperationalError("database is locked")
+                        return _raise().__await__()
+
+                    async def __aenter__(self):
+                        raise aiosqlite.OperationalError("database is locked")
+
+                    async def __aexit__(self, *exc):
+                        return None
+
+                return _BusyCM()
+
+            if params is None:
+                return real(sql)
+            return real(sql, params)
+
+        monkeypatch.setattr(conn, "_muze_orig_execute", flaky)
         inserted = await repo.upsert_message(msg, "hi", "event")
         assert inserted is True
-        assert calls["n"] == 1  # one busy, then success via retry
+        assert calls["n"] == 1  # one busy, then success via the conn wrapper
     finally:
         await conn.close()
