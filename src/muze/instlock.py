@@ -31,14 +31,31 @@ class InstanceLock:
         self._handle = handle  # open file object; closing it releases the lock
 
 
+# one lock per resolved path per PROCESS: two App instances inside the same
+# serve process may legitimately share an account directory (e.g. the same
+# QQ exposed through two Milky endpoints); cross-process exclusion is what
+# the OS lock provides.
+_held: dict[str, InstanceLock] = {}
+
+
 def acquire(path: Path, timeout: float = 20.0) -> InstanceLock | None:
     """Try to take the exclusive lock, waiting up to `timeout` seconds.
 
-    Returns the lock handle, or None when another process holds it (the
+    Returns the lock handle, or None when another PROCESS holds it (the
     wait exists for a dying predecessor — an rc=100 relaunch overlap —
-    not for a healthy second instance).
+    not for a healthy second instance). Re-acquiring a path this process
+    already holds returns the shared handle (same-process sharing is OK).
     """
     import os
+
+    path = Path(path).resolve()
+    key = str(path).lower() if os.name == "nt" else str(path)
+    existing = _held.get(key)
+    if existing is not None and existing._handle.closed:
+        _held.pop(key, None)
+        existing = None
+    if existing is not None:
+        return existing
 
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + max(0.0, timeout)
@@ -58,7 +75,9 @@ def acquire(path: Path, timeout: float = 20.0) -> InstanceLock | None:
             f.truncate()
             f.write(str(time.time()).encode())
             f.flush()
-            return InstanceLock(path, f)
+            lock = InstanceLock(path, f)
+            _held[key] = lock
+            return lock
         except OSError:
             f.close()
             if time.monotonic() >= deadline:
