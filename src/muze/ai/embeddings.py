@@ -132,6 +132,7 @@ class Embedder:
 
     def _load_st(self, device: str, threads: int) -> None:
         import torch  # noqa: F401  (clear error if torch missing)
+        from huggingface_hub import try_to_load_from_cache
         from sentence_transformers import SentenceTransformer
 
         if device == "cpu":
@@ -142,9 +143,23 @@ class Embedder:
                 kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
             except Exception:
                 pass
-        self._local = SentenceTransformer(self.cfg.model, device=device, **kwargs)
-        log.info("RAG embedder | st model=%s device=%s threads=%s",
-                 self.cfg.model, device, threads if device == "cpu" else "-")
+        # Cached model? Load OFFLINE: skips the HF HEAD etag revalidation on
+        # every reload (an idle-governor unload + reload must not depend on
+        # huggingface.co being reachable). First download stays online.
+        cached = try_to_load_from_cache(self.cfg.model, "modules.json")
+        if cached is not None:
+            kwargs["local_files_only"] = True
+        try:
+            self._local = SentenceTransformer(self.cfg.model, device=device, **kwargs)
+        except Exception:
+            if cached is None:
+                raise
+            # stale/incomplete cache: retry online once
+            kwargs.pop("local_files_only", None)
+            self._local = SentenceTransformer(self.cfg.model, device=device, **kwargs)
+        log.info("RAG embedder | st model=%s device=%s threads=%s%s",
+                 self.cfg.model, device, threads if device == "cpu" else "-",
+                 " (offline cache)" if cached is not None else "")
 
     def _load_fastembed(self, providers: list[str], threads: int) -> None:
         from fastembed import TextEmbedding
