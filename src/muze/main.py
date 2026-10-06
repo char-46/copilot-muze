@@ -295,11 +295,19 @@ class App:
         self.skills.reload()
         self.runtime.skills = self.skills
 
-        self.scheduler = Scheduler(self.repo, self.service, self.chatlog)
+        # same-QQ instances share one scheduler (tasks live in the shared
+        # repo; running it twice fired /dream morning twice per boot)
+        if uin in _UIN_SCHED:
+            self.scheduler = _UIN_SCHED[uin]
+            self._owns_scheduler = False
+        else:
+            self.scheduler = Scheduler(self.repo, self.service, self.chatlog)
+            self._owns_scheduler = True
+            _UIN_SCHED[uin] = self.scheduler
+            await self.scheduler.start()
+            await self.scheduler.ensure_daily_digest()
+            await self.scheduler.ensure_morning_digest()
         self.runtime.scheduler = self.scheduler
-        await self.scheduler.start()
-        await self.scheduler.ensure_daily_digest()
-        await self.scheduler.ensure_morning_digest()
 
         self.reloader = Reloader(
             config_path=self.config_path,
@@ -695,33 +703,39 @@ class App:
     async def _maintenance_loop(self) -> None:
         from muze.profiles import refresh_profiles
 
+        # same-QQ instances share one repo/blob store — the heavy body runs
+        # once per QQ; every instance still touches its own seen-marker
+        heavy = self.runtime.self_id not in _UIN_MAINT
+        if heavy:
+            _UIN_MAINT.add(self.runtime.self_id)
         while not self._stop.is_set():
             await asyncio.sleep(600)
-            try:
-                n = await self.repo.expire_actions(self.cfg.control.confirm_timeout_min)
-                if n:
-                    log.info("expired %s pending confirmation(s)", n)
-                gone = await self.repo.retire_gone_media()
-                if gone:
-                    log.info("retired %s permanently-gone media row(s) (404/410)", gone)
-                fixed = await self.media.retry_failed(limit=20)
-                if fixed:
-                    log.info("media retry recovered %s file(s)", fixed)
-                swept, swept_b = self.blobs.sweep_tmp(
-                    getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0)
-                )
-                if swept:
-                    log.info(
-                        "swept %s orphaned download partial(s), %s reclaimed",
-                        swept, f"{swept_b / (1 << 30):.2f}GiB",
+            if heavy:
+                try:
+                    n = await self.repo.expire_actions(self.cfg.control.confirm_timeout_min)
+                    if n:
+                        log.info("expired %s pending confirmation(s)", n)
+                    gone = await self.repo.retire_gone_media()
+                    if gone:
+                        log.info("retired %s permanently-gone media row(s) (404/410)", gone)
+                    fixed = await self.media.retry_failed(limit=20)
+                    if fixed:
+                        log.info("media retry recovered %s file(s)", fixed)
+                    swept, swept_b = self.blobs.sweep_tmp(
+                        getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0)
                     )
-                now = time.time()
-                if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
-                    if now - self._last_profile_refresh >= self.cfg.profiles.interval_min * 60:
-                        self._last_profile_refresh = now
-                        await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
-            except Exception:
-                log.exception("maintenance cycle failed")
+                    if swept:
+                        log.info(
+                            "swept %s orphaned download partial(s), %s reclaimed",
+                            swept, f"{swept_b / (1 << 30):.2f}GiB",
+                        )
+                    now = time.time()
+                    if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
+                        if now - self._last_profile_refresh >= self.cfg.profiles.interval_min * 60:
+                            self._last_profile_refresh = now
+                            await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
+                except Exception:
+                    log.exception("maintenance cycle failed")
             await self._touch_seen()  # keep the last-operation time fresh
 
     async def shutdown(self) -> None:
@@ -762,7 +776,7 @@ class App:
         if rs is not None:
             rs.set()
         scheduler = getattr(self, "scheduler", None)
-        if scheduler is not None:
+        if scheduler is not None and getattr(self, "_owns_scheduler", True):
             await _safe("scheduler.stop", scheduler.stop(), 5)
         if self.backfiller is not None:
             await _safe("backfiller.stop", self.backfiller.stop(), 5)
@@ -790,6 +804,12 @@ FORCE_EXIT_SECONDS = 10  # graceful shutdown deadline after Ctrl-C
 # per-process shared DB connections (see App.startup): same QQ behind two
 # endpoints must not open two competing writers to one muze.db
 _DB_POOL: dict[str, dict] = {}
+
+# per-QQ singletons: two account instances of the SAME QQ (one QQ behind
+# two Milky endpoints) share one repo/db — the scheduler, digest tasks and
+# the heavy maintenance body must run ONCE per QQ, not once per instance
+_UIN_SCHED: dict[int, "Scheduler"] = {}
+_UIN_MAINT: set[int] = set()
 
 
 def _force_exit_after(seconds: float) -> None:

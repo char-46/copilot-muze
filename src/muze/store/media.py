@@ -124,24 +124,37 @@ class MediaStore:
 
     async def normalize_media_paths(self) -> int:
         """One-time (idempotent) rewrite of legacy file_path forms in the
-        account DB to store-relative paths."""
+        account DB to store-relative paths.
+
+        The candidate SELECT filters IN SQL (drive-letter absolutes via
+        substr, the two CWD-relative prefixes) so a steady-state boot scans
+        the table engine-side and materializes ZERO rows; rewrites go out
+        as one executemany (111k rows once took 101s row-by-row)."""
+        t0 = time.monotonic()
         async with self.repo.conn.execute(
-            "SELECT id, file_path FROM media "
-            "WHERE file_path IS NOT NULL AND file_path != ''"
+            "SELECT id, file_path FROM media WHERE file_path IS NOT NULL AND file_path != ''"
+            " AND (substr(file_path, 2, 1) = ':'"
+            "      OR file_path LIKE 'data\\blobs\\%'"
+            "      OR file_path LIKE './data/blobs/%')"
         ) as cur:
             rows = await cur.fetchall()
-        n = 0
+        if not rows:
+            return 0
+        upd: list[tuple[str, int]] = []
         for mid, fp in rows:
             rel = to_store_rel(fp, self.blobs.root)
             if rel is not None and rel != fp:
-                await self.repo.conn.execute(
-                    "UPDATE media SET file_path=? WHERE id=?", (rel, mid)
-                )
-                n += 1
-        if n:
+                upd.append((rel, mid))
+        if upd:
+            await self.repo.conn.executemany(
+                "UPDATE media SET file_path=? WHERE id=?", upd
+            )
             await self.repo.conn.commit()
-            log.info("media: %s legacy path(s) normalized to relative", n)
-        return n
+            log.info(
+                "media: %s legacy path(s) normalized in %.1fs",
+                len(upd), time.monotonic() - t0,
+            )
+        return len(upd)
 
     # ------------------------------------------------------------- planning
     @staticmethod
