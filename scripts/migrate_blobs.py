@@ -46,13 +46,34 @@ def human(n: float) -> str:
 
 def md5_of(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.md5()
-    with open(path, "rb") as fh:
-        while True:
-            b = fh.read(chunk)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
+    last: Exception | None = None
+    for attempt in range(3):  # a bad handle needs a FRESH open, not a re-read
+        try:
+            with open(path, "rb") as fh:
+                while True:
+                    b = fh.read(chunk)
+                    if not b:
+                        break
+                    h.update(b)
+            return h.hexdigest()
+        except OSError as e:
+            last = e
+            h = hashlib.md5()  # discard partial input
+            time.sleep(attempt + 1)
+    raise last  # type: ignore[misc]
+
+
+def retry_io(fn, attempts: int = 3, delay: float = 1.0):
+    """Windows can transiently hand out bad handles (antivirus / sync tools
+    touching the tree mid-walk): retry a few times before giving up."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except OSError as e:
+            last = e
+            time.sleep(delay * (i + 1))
+    raise last  # type: ignore[misc]
 
 
 def build_cache_index(qq_root: Path) -> dict[str, list[Path]]:
@@ -69,26 +90,35 @@ def build_cache_index(qq_root: Path) -> dict[str, list[Path]]:
 
 def migrate_blob(src: Path, dst: Path, cache_idx: dict[str, list[Path]]) -> str:
     """Returns 'skip' (already there), 'hardlink' (deduped vs QQ cache),
-    or 'copy'. A cache candidate counts only with the same md5 embedded in
-    its filename AND the same size."""
-    if dst.exists():
-        return "skip"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    size = src.stat().st_size
-    digest = md5_of(src)
-    for cand in cache_idx.get(digest, ()):
+    'copy', or 'failed:<error>'. A cache candidate counts only with the same
+    md5 embedded in its filename AND the same size."""
+    try:
+        if dst.exists():
+            return "skip"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        size = retry_io(lambda: src.stat().st_size)
+        digest = md5_of(src)
+        for cand in cache_idx.get(digest, ()):
+            try:
+                if retry_io(lambda: cand.stat().st_size) == size:
+                    os.link(cand, dst)
+                    return "hardlink"
+            except OSError:
+                continue
+        retry_io(lambda: shutil.copy2(src, dst))
+        return "copy"
+    except OSError as e:
         try:
-            if cand.stat().st_size == size:
-                os.link(cand, dst)
-                return "hardlink"
+            dst.unlink(missing_ok=True)  # no half-written leftovers
         except OSError:
-            continue
-    shutil.copy2(src, dst)
-    return "copy"
+            pass
+        return f"failed:{e}"
 
 
 def migrate_blobs(old: Path, new: Path, cache_idx: dict[str, list[Path]]) -> dict:
-    stats = {"copy": 0, "hardlink": 0, "skip": 0, "bytes": 0, "saved": 0}
+    stats = {"copy": 0, "hardlink": 0, "skip": 0, "bytes": 0, "saved": 0,
+             "failed": 0}
+    failures: list[str] = []
     inode_map: dict[tuple[int, int], Path] = {}  # old blob inode -> new path
     t0 = time.monotonic()
     total = 0
@@ -102,11 +132,15 @@ def migrate_blobs(old: Path, new: Path, cache_idx: dict[str, list[Path]]) -> dic
             rel = src.relative_to(old)
             dst = new / rel
             how = migrate_blob(src, dst, cache_idx)
+            if how.startswith("failed:"):
+                stats["failed"] += 1
+                failures.append(f"{src} -> {how[7:]}")
+                continue
             stats[how] += 1
-            stats["bytes"] += src.stat().st_size
-            if how == "hardlink":
-                stats["saved"] += src.stat().st_size
             try:
+                stats["bytes"] += src.stat().st_size
+                if how == "hardlink":
+                    stats["saved"] += src.stat().st_size
                 st = src.stat()
                 inode_map[(st.st_ino, st.st_dev)] = dst
             except OSError:
@@ -143,6 +177,7 @@ def migrate_blobs(old: Path, new: Path, cache_idx: dict[str, list[Path]]) -> dic
     stats["names_relinked"] = relinked
     stats["names_copied"] = copied
     stats["files"] = total
+    stats["failures"] = failures
     return stats
 
 
@@ -221,7 +256,12 @@ def main(argv: list[str] | None = None) -> int:
     print("migrating blobs (copy / hardlink-dedup) ...", flush=True)
     stats = migrate_blobs(old, new, cache_idx)
     print(f"  files={stats['files']} copied={stats['copy']} "
-          f"deduped(hardlink)={stats['hardlink']} skipped={stats['skip']}")
+          f"deduped(hardlink)={stats['hardlink']} skipped={stats['skip']} "
+          f"FAILED={stats['failed']}")
+    if stats["failed"]:
+        print("  failures (re-run migrates them; nothing else to do):")
+        for line in stats["failures"][:20]:
+            print(f"    {line}")
     print(f"  moved {human(stats['bytes'])}, dedup saved {human(stats['saved'])}")
     print(f"  names/: {stats['names_relinked']} relinked, "
           f"{stats['names_copied']} copied")
