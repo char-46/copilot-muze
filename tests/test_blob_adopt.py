@@ -45,7 +45,7 @@ async def test_fetch_adopts_local_blob_hardlink(ms):
     src.write_bytes(JPEG)
     row = {"id": 1, "kind": "image", "file_name": "", "file_id": "", "file_hash": ""}
 
-    h, size, dest = await store._fetch_into_blob(to_file_uri(src), row)
+    h, size, dest, _md5 = await store._fetch_into_blob(to_file_uri(src), row)
     assert size == len(JPEG) and dest.exists()
     assert dest.read_bytes() == JPEG
     assert dest.suffix == ".jpg"  # sniffed from magic bytes
@@ -70,7 +70,7 @@ async def test_fetch_adopts_bare_windows_path_and_copies_when_link_denied(ms, mo
         raise OSError("cross-volume")
 
     monkeypatch.setattr(os, "link", deny)
-    _h, size, dest = await store._fetch_into_blob(str(src), row)  # bare path, no file://
+    _h, size, dest, _md5 = await store._fetch_into_blob(str(src), row)  # bare path, no file://
     assert dest.exists() and dest.read_bytes() == JPEG and size == len(JPEG)
 
 
@@ -169,10 +169,9 @@ async def test_download_row_full_path_with_local_url(tmp_path):
     row = await repo.media_by_id(mid)
     out = await store.download_row(row)
     assert out["status"] == "done"
-    assert out["file_path"].startswith(str(tmp_path / "blobs"))
-    from pathlib import Path as _P
-
-    assert _P(out["file_path"]).read_bytes() == JPEG
+    # stored path is store-RELATIVE now; the addressing root resolves it
+    assert out["file_path"].startswith("image/")
+    assert blobs.resolve(out["file_path"]).read_bytes() == JPEG
     await conn.close()
 
 
@@ -232,10 +231,8 @@ async def test_file_hash_adopts_from_qq_cache_no_network(tmp_path):
     )
     out = await store.download_row(await repo.media_by_id(mid))
     assert out["status"] == "done" and out["file_size"] == len(data)
-    from pathlib import Path as _P
-
-    blob = _P(out["file_path"])
-    assert blob.read_bytes() == data and blob.suffix == ".xlsx"
+    blob = blobs.resolve(out["file_path"])
+    assert blob is not None and blob.read_bytes() == data and blob.suffix == ".xlsx"
     found = list((tmp_path / "blobs" / "names").glob("*.xlsx"))
     assert len(found) == 1 and found[0].read_bytes() == data  # original name kept
     await conn.close()

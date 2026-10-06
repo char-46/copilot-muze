@@ -133,6 +133,21 @@ main { flex: 1; overflow: hidden; }
   font-size: 12px; background: var(--bg); padding: 6px 8px; border-radius: 6px;
 }
 
+/* media library grid + lightbox */
+#medialist { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+.mcard { border: 1px solid var(--line); border-radius: 8px; padding: 6px; cursor: pointer; background: var(--bg2); overflow: hidden; }
+.mcard:hover { border-color: var(--acc); }
+.mcard .mthumb { width: 100%; height: 92px; object-fit: cover; border-radius: 6px; display: block; background: var(--bg); }
+.mcard .micon { height: 92px; display: flex; align-items: center; justify-content: center; font-size: 34px; background: var(--bg); border-radius: 6px; }
+.mcard .t { font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mcard .prev { font-size: 10px; }
+#lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.82); z-index: 90; display: flex; align-items: center; justify-content: center; }
+.lbbox { max-width: 92vw; max-height: 92vh; text-align: center; }
+.lbimg { max-width: 92vw; max-height: 80vh; border-radius: 8px; }
+.lbvid { max-width: 92vw; max-height: 80vh; border-radius: 8px; background: #000; }
+.lbname { color: #eee; font-size: 13px; margin-top: 8px; }
+.lbname a { color: #9cf; cursor: pointer; margin: 0 6px; }
+
 .aiempty { margin: auto; text-align: center; color: var(--dim); max-width: 430px; }
 .aiempty .ex {
   display: block; margin: 6px auto; padding: 8px 14px; width: fit-content;

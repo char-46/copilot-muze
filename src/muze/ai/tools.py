@@ -923,6 +923,14 @@ class ToolRunner:
                 out["truncated"] = True
         return out
 
+    def _media_abs(self, row: dict) -> str | None:
+        """Resolve a media row's stored (store-relative) path to absolute."""
+        ms = getattr(self.service.runtime, "media", None)
+        if ms is not None:
+            p = ms.abs_path(row)
+            return str(p) if p else None
+        return row.get("file_path")
+
     async def t_describe_image(self, args: dict) -> dict:
         purpose = str(args.get("purpose", "")).strip() or "详细描述图片内容"
         force = bool(args.get("force"))
@@ -945,7 +953,7 @@ class ToolRunner:
             ):
                 out.append("(跳过) 表情/贴图；如确需识别请带 force=true 再说一次")
                 continue
-            desc = await self.llm.vision_describe(m["file_path"], purpose)
+            desc = await self.llm.vision_describe(self._media_abs(m) or m["file_path"], purpose)
             out.append(desc)
             if m.get("id"):
                 try:  # cache for the next ask
@@ -1020,11 +1028,12 @@ class ToolRunner:
                 return {"error": "未找到媒体（给 media_id，或 scene/peer/message_seq，或 path）"}
             if row["status"] != "done" or not row.get("file_path"):
                 return {"error": f"媒体不可用（status={row['status']}）"}
+            abs_p = self._media_abs(row) or row["file_path"]
             seg = _seg_for_kind(
-                row["kind"], to_file_uri(row["file_path"]), row.get("file_name") or "",
+                row["kind"], to_file_uri(abs_p), row.get("file_name") or "",
                 out_image, out_record, out_video, out_file,
             )
-            preview = f"[{row['kind']}] {row.get('file_name') or Path(row['file_path']).name}"
+            preview = f"[{row['kind']}] {row.get('file_name') or Path(abs_p).name}"
 
         segments = [seg]
         caption = str(args.get("caption", "") or "").strip()
@@ -1056,7 +1065,8 @@ class ToolRunner:
         for m in imgs[:3]:
             out.append(
                 await self.llm.vision_describe(
-                    m["file_path"], "识别并逐字输出图片中的所有文字（保留换行），不要解释。"
+                    self._media_abs(m) or m["file_path"],
+                    "识别并逐字输出图片中的所有文字（保留换行），不要解释。",
                 )
             )
         return {"text": "\n---\n".join(out)}

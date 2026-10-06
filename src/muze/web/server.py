@@ -194,10 +194,15 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
         scene = request.query.get("scene", "").strip() or None
         peer = request.query.get("peer", "").strip()
         limit = int(request.query.get("limit", 60))
+        offset = int(request.query.get("offset", 0))
         rows = await repo.list_media(
-            kind=kind, scene=scene, peer_id=int(peer) if peer else None, limit=limit
+            kind=kind, scene=scene, peer_id=int(peer) if peer else None,
+            limit=limit, offset=offset,
         )
-        return web.json_response({"media": rows})
+        total = await repo.media_count(
+            kind=kind, scene=scene, peer_id=int(peer) if peer else None
+        )
+        return web.json_response({"media": rows, "total": total, "offset": offset})
 
     async def api_rag(request: web.Request) -> web.Response:
         _, _, runtime = pick(request)
@@ -274,15 +279,16 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
         return web.json_response({"matches": rows})
 
     async def api_mediafile(request: web.Request) -> web.Response:
-        _, repo, _ = pick(request)
+        _, repo, runtime = pick(request)
         media_id = int(request.match_info["media_id"])
         row = await repo.media_by_id(media_id)
         if not row or not row["file_path"] or row["status"] != "done":
             return web.json_response({"error": "media unavailable"}, status=404)
-        p = Path(row["file_path"])
-        if not p.exists():
+        ms = getattr(runtime, "media", None)
+        p = ms.abs_path(row) if ms is not None else Path(row["file_path"])
+        if p is None or not Path(p).exists():
             return web.json_response({"error": "file missing"}, status=404)
-        return web.FileResponse(p)
+        return web.FileResponse(Path(p))
 
     async def api_command(request: web.Request) -> web.Response:
         service, _, _ = pick(request)

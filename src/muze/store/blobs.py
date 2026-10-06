@@ -24,13 +24,52 @@ import os
 import re
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import aiosqlite
 
 log = logging.getLogger("muze.blobs")
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def to_store_rel(value: str, root: Path) -> str | None:
+    """Canonical store-relative form ('image/ab/<sha>.jpg', posix slashes)
+    of any legacy stored path, or None when it doesn't address this store.
+
+    Understood legacy forms (the DB once stored whichever was convenient):
+      - absolute path under the CURRENT root
+      - absolute path under an OLD root (anything ...\\blobs\\...)
+      - CWD-relative 'data\\blobs\\...' / './data/blobs/...'
+      - already-canonical 'image/ab/x.jpg'  (returned unchanged)
+    """
+    if not value:
+        return None
+    v = value.replace("\\", "/")
+    root_pos = str(Path(root).resolve()).replace("\\", "/").rstrip("/")
+    if v.startswith("/"):  # absolute posix (never ours, but be safe)
+        return None
+    if len(v) > 2 and v[1] == ":":  # absolute windows path
+        if v.lower().startswith(root_pos.lower() + "/"):
+            rel = v[len(root_pos) + 1:]
+        else:
+            i = v.lower().find("/blobs/")
+            if i < 0:
+                return None
+            rel = v[i + len("/blobs/"):]
+    else:
+        for prefix in ("./data/blobs/", "data/blobs/"):
+            if v.lower().startswith(prefix):
+                rel = v[len(prefix):]
+                break
+        else:
+            if v.startswith("../"):
+                return None
+            return v  # already canonical
+    rel = rel.lstrip("/")
+    if not rel or rel.startswith(".."):
+        return None
+    return rel
 
 
 def safe_name(name: str, fallback: str = "file") -> str:
@@ -68,9 +107,30 @@ class BlobStore:
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA busy_timeout=5000")
             await conn.executescript(_IDX_SCHEMA)
+            try:
+                await conn.execute("ALTER TABLE dedup ADD COLUMN md5 TEXT")
+            except aiosqlite.OperationalError:
+                pass  # column exists
             await conn.commit()
             self._conn = conn
         return self._conn
+
+    # ---------------------------------------------------------- addressing
+    def rel_of(self, path: Path | str) -> str | None:
+        """Store-relative posix form of a path inside this store (else None)."""
+        return to_store_rel(str(path), self.root)
+
+    def resolve(self, ref: str | None) -> Path | None:
+        """Absolute Path for a stored reference (relative preferred; legacy
+        absolute values pass through unchanged — they were written by us)."""
+        if not ref:
+            return None
+        if len(ref) > 1 and ref[1] == ":":
+            return Path(ref)
+        parts = PurePosixPath(ref.replace("\\", "/"))
+        if ".." in parts.parts:
+            return None
+        return self.root.joinpath(*parts.parts)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -87,22 +147,61 @@ class BlobStore:
         if not row:
             return None
         d = dict(row)
-        if not Path(d["file_path"]).exists():
+        p = self.resolve(d["file_path"])
+        if p is None or not p.exists():
             return None  # blob was removed; caller re-downloads
         return d
 
+    async def lookup_md5(self, md5_hex: str) -> dict | None:
+        """Content lookup by md5 (QQ's own hash) — O(1) via the index column,
+        no QQNT cache filename scan needed."""
+        md5_hex = (md5_hex or "").strip().lower()
+        if not md5_hex:
+            return None
+        return await self.lookup(f"md5:{md5_hex}")
+
     async def record(
-        self, key: str, content_hash: str, file_path: str, file_size: int, kind: str
+        self, key: str, content_hash: str, file_path: str, file_size: int, kind: str,
+        md5: str | None = None,
     ) -> None:
         conn = await self._ensure()
+        # the addressing root owns path resolution: store the RELATIVE form
+        # so the store (and its DB rows) survive relocation between volumes
+        rel = self.rel_of(file_path) or str(file_path)
         await conn.execute(
             """
-            INSERT OR REPLACE INTO dedup (key, content_hash, file_path, file_size, kind, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO dedup (key, content_hash, file_path, file_size, kind, md5, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (key, content_hash, file_path, file_size, kind, int(time.time())),
+            (key, content_hash, rel, file_size, kind, (md5 or "").lower() or None, int(time.time())),
         )
+        if md5:
+            await conn.execute(
+                """
+                INSERT OR REPLACE INTO dedup (key, content_hash, file_path, file_size, kind, md5, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (f"md5:{md5.lower()}", content_hash, rel, file_size, kind, md5.lower(), int(time.time())),
+            )
         await conn.commit()
+
+    async def normalize_dedup_paths(self) -> int:
+        """One-time (idempotent) rewrite of legacy path forms in the index."""
+        conn = await self._ensure()
+        async with conn.execute("SELECT key, file_path FROM dedup") as cur:
+            rows = await cur.fetchall()
+        n = 0
+        for key, fp in rows:
+            rel = to_store_rel(fp or "", self.root)
+            if rel is not None and rel != fp:
+                await conn.execute(
+                    "UPDATE dedup SET file_path=? WHERE key=?", (rel, key)
+                )
+                n += 1
+        if n:
+            await conn.commit()
+            log.info("blob index: %s legacy path(s) normalized to relative", n)
+        return n
 
     # -------------------------------------------------------------- paths
     def blob_path(self, kind: str, content_hash: str, ext: str) -> Path:

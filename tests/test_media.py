@@ -254,8 +254,8 @@ async def test_voice_silk_stored_as_playable_wav(tmp_path):
     upd = await store.download_row(row, prefer_url="http://fake/v1")
 
     assert upd["status"] == "done"
-    playable = Path(upd["file_path"])
-    assert playable.suffix == ".wav" and playable.exists()
+    playable = store.abs_path(upd)
+    assert playable is not None and playable.suffix == ".wav" and playable.exists()
     assert playable.read_bytes()[:4] == b"RIFF"  # real WAV container
     # the original silk is preserved alongside the playable wav
     silk_files = list((tmp_path / "blobs" / "record").rglob("*.silk"))
@@ -270,5 +270,6 @@ async def test_voice_amr_stays_amr(tmp_path):
     row = await repo.media_by_id(mid)
     upd = await store.download_row(row, prefer_url="http://fake/a1")
     assert upd["status"] == "done"
-    assert Path(upd["file_path"]).suffix == ".amr"
+    amr = store.abs_path(upd)
+    assert amr is not None and amr.suffix == ".amr"
     await close(store)

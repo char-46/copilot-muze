@@ -34,7 +34,7 @@ from muze.provider.milky.models import (
     Segment,
     VideoSeg,
 )
-from muze.store.blobs import BlobStore, dedup_key, safe_name
+from muze.store.blobs import BlobStore, dedup_key, safe_name, to_store_rel
 from muze.store.repo import Repository
 from muze.store.sniff import sniff_ext
 
@@ -106,6 +106,40 @@ class MediaStore:
         self._qq_index: dict[str, Path] = {}
         self._qq_index_at = 0.0
         self._qq_refresh_at = 0.0
+
+    # ---------------------------------------------------------- addressing
+    def abs_path(self, row_or_ref: dict | str | None) -> Path | None:
+        """Absolute on-disk path for a media row / stored reference. The DB
+        stores store-relative paths; the addressing root resolves them."""
+        if row_or_ref is None:
+            return None
+        ref = (
+            row_or_ref.get("file_path")
+            if isinstance(row_or_ref, dict)
+            else row_or_ref
+        )
+        return self.blobs.resolve(ref)
+
+    async def normalize_media_paths(self) -> int:
+        """One-time (idempotent) rewrite of legacy file_path forms in the
+        account DB to store-relative paths."""
+        async with self.repo.conn.execute(
+            "SELECT id, file_path FROM media "
+            "WHERE file_path IS NOT NULL AND file_path != ''"
+        ) as cur:
+            rows = await cur.fetchall()
+        n = 0
+        for mid, fp in rows:
+            rel = to_store_rel(fp, self.blobs.root)
+            if rel is not None and rel != fp:
+                await self.repo.conn.execute(
+                    "UPDATE media SET file_path=? WHERE id=?", (rel, mid)
+                )
+                n += 1
+        if n:
+            await self.repo.conn.commit()
+            log.info("media: %s legacy path(s) normalized to relative", n)
+        return n
 
     # ------------------------------------------------------------- planning
     @staticmethod
@@ -242,7 +276,8 @@ class MediaStore:
     async def download_row(self, row: dict, *, prefer_url: str | None = None) -> dict:
         """Download one media row into the blob store; updates status."""
         mid = row["id"]
-        if row.get("status") == "done" and row.get("file_path") and Path(row["file_path"]).exists():
+        existing = self.abs_path(row)
+        if row.get("status") == "done" and existing is not None and existing.exists():
             return row
         await self.repo.update_media(mid, status="downloading")
 
@@ -260,8 +295,9 @@ class MediaStore:
             return {**row, "status": "failed", "error": f"url: {e}"}
 
         orig_name = str(row.get("file_name") or "")
+        md5hex = ""
         try:
-            content_hash, size, dest = await self._fetch_into_blob(url, row)
+            content_hash, size, dest, md5hex = await self._fetch_into_blob(url, row)
         except MediaGone as e:
             await self.repo.update_media(mid, status="gone", error=str(e)[:300])
             log.warning("MEDIA gone  #%s kind=%s: %s (server no longer has it)", mid, row["kind"], e)
@@ -278,32 +314,38 @@ class MediaStore:
         # SILK voice: keep the raw clip but expose a playable WAV as the blob
         # consumers download / feed to the agent.
         dest, content_hash, size = await self._maybe_transcode_silk(dest, content_hash, size, row)
+        if dest.suffix.lower() == ".wav":
+            md5hex = ""  # transcoded bytes: the download md5 no longer applies
 
         # the same bytes are usually already in the local client's cache:
         # swap our fresh copy for a hardlink to theirs (one disk copy)
         await self._swap_with_qq_cache(dest)
 
-        return await self._finish_row(row, dest, content_hash, size, orig_name)
+        return await self._finish_row(
+            row, dest, content_hash, size, orig_name, md5=md5hex or None
+        )
 
     async def _finish_row(
-        self, row: dict, dest: Path, content_hash: str, size: int, orig_name: str
+        self, row: dict, dest: Path, content_hash: str, size: int, orig_name: str,
+        md5: str | None = None,
     ) -> dict:
+        rel = self.blobs.rel_of(dest) or str(dest)
         key = dedup_key(row)
         if key:
-            await self.blobs.record(key, content_hash, str(dest), size, row["kind"])
-        await self.blobs.record(f"sha:{content_hash}", content_hash, str(dest), size, row["kind"])
+            await self.blobs.record(key, content_hash, rel, size, row["kind"], md5=md5)
+        await self.blobs.record(f"sha:{content_hash}", content_hash, rel, size, row["kind"], md5=md5)
         named = None
         if orig_name:
             named = await asyncio.to_thread(self.blobs.named_link, dest, orig_name)
         await self.repo.update_media(
-            row["id"], status="done", file_path=str(dest), file_size=size, content_hash=content_hash
+            row["id"], status="done", file_path=rel, file_size=size, content_hash=content_hash
         )
         log.info(
             "MEDIA done #%s kind=%s size=%s blob=%s%s",
             row["id"], row["kind"], size, dest.name,
             f" name={named.name}" if named else "",
         )
-        return {**row, "status": "done", "file_path": str(dest), "file_size": size,
+        return {**row, "status": "done", "file_path": rel, "file_size": size,
                 "content_hash": content_hash}
 
     # ------------------------------------------------ qq client cache
@@ -372,19 +414,28 @@ class MediaStore:
         fh = str(row.get("file_hash") or "").strip().lower()
         if not fh or self.qq_cache is None or not self.qq_cache.is_dir():
             return None
+        # O(1): a previous download of the same bytes recorded its md5
+        hit = await self.blobs.lookup_md5(fh)
+        if hit is not None:
+            p = self.blobs.resolve(hit["file_path"])
+            if p is not None and p.exists():
+                return await self._finish_row(
+                    row, p, hit["content_hash"], hit["file_size"] or p.stat().st_size,
+                    str(row.get("file_name") or p.name), md5=fh,
+                )
         cand = await asyncio.to_thread(self._qq_cache_find, fh, None)
         if cand is None:
             return None
         try:
             if await asyncio.to_thread(self._file_md5, cand) != fh:
                 return None  # filename coincidence, not the same content
-            content_hash, size, dest = await self._link_into_blob(cand, row)
+            content_hash, size, dest, _md5 = await self._link_into_blob(cand, row)
         except Exception as e:
             log.info("MEDIA qq-cache adopt failed (%s): %s", cand.name, e)
             return None
         log.info("MEDIA qq-cache md5-hit %s -> %s (no download)", fh, cand.name)
         return await self._finish_row(row, dest, content_hash, size,
-                                      str(row.get("file_name") or cand.name))
+                                      str(row.get("file_name") or cand.name), md5=fh)
 
     async def _swap_with_qq_cache(self, dest: Path) -> None:
         """Post-download dedup: the QQ client almost always cached the media
@@ -486,6 +537,7 @@ class MediaStore:
         sess = await self.adapter.http.session()  # type: ignore[attr-defined]
         tmp = self.blobs.tmp_path()
         hasher = hashlib.sha256()
+        md5er = hashlib.md5()
         total = 0
         try:
             async with sess.get(url) as resp:
@@ -497,6 +549,7 @@ class MediaStore:
                     async for chunk in resp.content.iter_chunked(1 << 16):
                         fh.write(chunk)
                         hasher.update(chunk)
+                        md5er.update(chunk)
                         total += len(chunk)
         except BaseException:
             # a killed/failed download must not leave its (often huge)
@@ -513,9 +566,9 @@ class MediaStore:
             log.info("MEDIA blob-hit %s (disk copy kept)", dest.name)
         else:
             tmp.replace(dest)
-        return content_hash, total, dest
+        return content_hash, total, dest, md5er.hexdigest()
 
-    async def _link_into_blob(self, src: Path, row: dict) -> tuple[str, int, Path]:
+    async def _link_into_blob(self, src: Path, row: dict) -> tuple[str, int, Path, str]:
         """Adopt a hook-side local file (the QQ client's own cache blob) into
         the blob store: HARDLINK when the filesystem allows it — zero bytes
         copied, and the content survives the client's cache eviction (a
@@ -525,8 +578,9 @@ class MediaStore:
         if not src.is_file():
             raise RuntimeError(f"local source missing: {src}")
 
-        def _read() -> tuple[str, int, bytes]:
+        def _read() -> tuple[str, str, int, bytes]:
             hasher = hashlib.sha256()
+            md5er = hashlib.md5()
             total = 0
             head = b""
             with open(src, "rb") as fh:
@@ -537,14 +591,15 @@ class MediaStore:
                     if not head:
                         head = chunk[:512]
                     hasher.update(chunk)
+                    md5er.update(chunk)
                     total += len(chunk)
-            return hasher.hexdigest(), total, head
+            return hasher.hexdigest(), md5er.hexdigest(), total, head
 
-        content_hash, total, head = await asyncio.to_thread(_read)
+        content_hash, md5hex, total, head = await asyncio.to_thread(_read)
         dest = self.blobs.blob_path(row["kind"], content_hash, self._ext_for(row, "", head))
         if dest.exists():
             log.info("MEDIA blob-hit %s (disk copy kept)", dest.name)
-            return content_hash, total, dest
+            return content_hash, total, dest, md5hex
 
         def _place() -> None:
             try:
@@ -561,7 +616,7 @@ class MediaStore:
                 )
 
         await asyncio.to_thread(_place)
-        return content_hash, total, dest
+        return content_hash, total, dest, md5hex
 
     # --------------------------------------------------------------- retry
     async def retry_failed(self, limit: int = 50) -> int:

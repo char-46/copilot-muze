@@ -1142,31 +1142,94 @@ async function loadProfilesView() {
   }
 }
 
-async function loadMediaView() {
+let mediaOffset = 0;
+const MEDIA_PAGE = 60;
+
+async function loadMediaView(reset = true) {
   const box = $("#medialist");
   const kind = $("#mediaKind").value;
+  if (reset) {
+    mediaOffset = 0;
+    box.innerHTML = "";
+  }
   try {
-    const d = await api("/api/media?limit=80" + (kind ? "&kind=" + encodeURIComponent(kind) : ""));
-    if (!d.media.length) {
+    const d = await api(`/api/media?limit=${MEDIA_PAGE}&offset=${mediaOffset}` +
+      (kind ? "&kind=" + encodeURIComponent(kind) : ""));
+    if (!d.media.length && !mediaOffset) {
       box.innerHTML = '<div class="dim pad">（无媒体）</div>';
       return;
     }
-    box.innerHTML = d.media.map((m) => {
+    mediaOffset += d.media.length;
+    const frag = document.createElement("div");
+    frag.innerHTML = d.media.map((m) => {
       const href = `/api/mediafile/${m.id}?token=${encodeURIComponent(TOKEN)}`;
       const label = m.summary || m.file_name || `${m.kind} #${m.id}`;
-      const size = m.file_size ? (m.file_size / 1024).toFixed(0) + "K" : "";
-      const thumb = m.kind === "image"
-        ? `<img class="mthumb" loading="lazy" src="${withAccount(href)}">` : "";
-      return `<a class="drow md" href="${withAccount(href)}" target="_blank">` +
-        `${thumb}<div class="t">${esc(String(label).slice(0, 50))}</div>` +
-        `<div class="prev dim">${esc(m.scene)}/${esc(m.peer_id)} · ${esc(m.kind)} · ${size} · ${fmtTime(m.time)}</div></a>`;
+      const size = m.file_size ? (m.file_size / 1048576).toFixed(1) + "M" : "";
+      const inner = m.kind === "image"
+        ? `<img class="mthumb" loading="lazy" src="${withAccount(href)}">`
+        : `<div class="micon">${m.kind === "video" ? "🎬" : m.kind === "record" ? "🎙"
+            : m.kind === "face" ? "🙂" : "📄"}</div>`;
+      return `<div class="mcard" data-id="${m.id}" data-kind="${esc(m.kind)}" ` +
+        `data-href="${withAccount(href)}" data-name="${esc(String(label).slice(0, 80))}">` +
+        `${inner}<div class="t">${esc(String(label).slice(0, 40))}</div>` +
+        `<div class="prev dim">${esc(m.scene)}/${esc(m.peer_id)} · ${size} · ${fmtTime(m.time)}</div></div>`;
     }).join("");
+    box.appendChild(frag);
+    let more = $("#mediamore");
+    if (d.total > mediaOffset) {
+      if (!more) {
+        more = document.createElement("button");
+        more.id = "mediamore";
+        more.className = "block";
+        more.textContent = "加载更多";
+        more.onclick = () => loadMediaView(false);
+        box.parentElement.appendChild(more);
+      }
+      more.textContent = `加载更多（${mediaOffset}/${d.total}）`;
+    } else if (more) more.remove();
   } catch (e) {
     box.innerHTML = e.unauthorized ? authHint()
       : '<div class="dim pad">加载失败：' + esc(e.message) + "</div>";
   }
 }
-$("#mediaKind").addEventListener("change", loadMediaView);
+
+function mediaLightbox(card) {
+  closeLightbox();
+  const ov = document.createElement("div");
+  ov.id = "lightbox";
+  ov.onclick = (ev) => { if (ev.target === ov) closeLightbox(); };
+  const href = card.dataset.href;
+  const kind = card.dataset.kind;
+  const name = card.dataset.name;
+  const body = kind === "image"
+    ? `<img class="lbimg" src="${esc(href)}">`
+    : kind === "video"
+      ? `<video class="lbvid" controls autoplay src="${esc(href)}"></video>`
+      : kind === "record"
+        ? `<audio controls autoplay src="${esc(href)}"></audio>`
+        : `<a class="lbdl" href="${esc(href)}" download>⬇ 下载文件</a>`;
+  ov.innerHTML = `<div class="lbbox">${body}` +
+    `<div class="lbname">${esc(name)} <a class="lbopen" href="${esc(href)}" target="_blank">原图/原始文件 ↗</a>` +
+    ` <a class="lbclose">✕ 关闭</a></div></div>`;
+  ov.querySelector(".lbclose").onclick = closeLightbox;
+  document.body.appendChild(ov);
+  document.onkeydown = (ev) => { if (ev.key === "Escape") closeLightbox(); };
+}
+
+function closeLightbox() {
+  const ov = $("#lightbox");
+  if (ov) ov.remove();
+}
+
+$("#medialist").addEventListener("click", (ev) => {
+  const card = ev.target.closest(".mcard");
+  if (card) mediaLightbox(card);
+});
+$("#mediaKind").addEventListener("change", () => {
+  const more = $("#mediamore");
+  if (more) more.remove();
+  loadMediaView(true);
+});
 
 /* ---------------- boot ---------------- */
 convRestore = recall("muze_chat");

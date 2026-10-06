@@ -1512,8 +1512,13 @@ class ControlService:
         done = [r for r in rows if r["status"] == "done" and r["file_path"]]
         if not done:
             return CommandOutcome(f"seq={seq} 没有已下载成功的媒体（共 {len(rows)} 项记录）", is_error=True)
-        paths = [r["file_path"] for r in done]
-        desc = "\n".join(f"{r['kind']} {r['file_name'] or ''} {size_fmt(r['file_size'])} -> {r['file_path']}" for r in done)
+        ms = getattr(self.runtime, "media", None)
+        abs_of = (lambda r: str(ms.abs_path(r)) if ms and ms.abs_path(r) else r["file_path"])
+        paths = [abs_of(r) for r in done]
+        desc = "\n".join(
+            f"{r['kind']} {r['file_name'] or ''} {size_fmt(r['file_size'])} -> {abs_of(r)}"
+            for r in done
+        )
         return CommandOutcome(f"seq={seq} 媒体 {len(done)} 项:\n{desc}", media_paths=paths)
 
     @slash("summary", "/summary <scene/peer> [条数]", "LLM 总结会话（含图片识别）")
@@ -1857,6 +1862,7 @@ class Runtime:
         self.endpoint = None  # live protocol endpoint object, injected by main
         self.llm = None  # LLMClient, injected by main
         self.backfiller = None  # Backfiller, injected by main
+        self.media = None  # MediaStore, injected by main (path addressing)
         self.rag = None  # RagIndexer, injected by main
         self.rag_force = None  # forced indexing task (/rag run)
         self.rag_stop = None  # its stop event

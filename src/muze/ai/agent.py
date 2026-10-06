@@ -1043,8 +1043,12 @@ class Agent:
                     if m.get("summary"):
                         image_notes.append(f"seq={r['message_seq']} 图片: {m['summary']}")
                         break
+                    ms = getattr(self.service.runtime, "media", None)
+                    img_ref = m["file_path"]
+                    if ms is not None and ms.abs_path(m) is not None:
+                        img_ref = str(ms.abs_path(m))
                     desc = await self.llm.vision_describe(
-                        m["file_path"],
+                        img_ref,
                         "概括这张图片：出现的对象/人物、图中文字、与聊天相关的关键细节",
                     )
                     image_notes.append(f"seq={r['message_seq']} 图片: {desc}")

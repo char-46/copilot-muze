@@ -365,11 +365,13 @@ class Repository:
         scene: str | None = None,
         peer_id: int | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict]:
         """Newest-first media library rows (downloaded files only)."""
         sql = (
             "SELECT id, scene, peer_id, message_seq, kind, status, file_name,"
-            " file_size, summary, time FROM media WHERE status='done'"
+            " file_path, file_size, width, height, duration, summary, time"
+            " FROM media WHERE status='done'"
         )
         args: list = []
         if kind:
@@ -381,11 +383,32 @@ class Repository:
         if peer_id is not None:
             sql += " AND peer_id=?"
             args.append(peer_id)
-        sql += " ORDER BY id DESC LIMIT ?"
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
         args.append(max(1, min(int(limit), 500)))
+        args.append(max(0, int(offset)))
         async with self.conn.execute(sql, args) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def media_count(
+        self,
+        kind: str | None = None,
+        scene: str | None = None,
+        peer_id: int | None = None,
+    ) -> int:
+        sql = "SELECT COUNT(*) FROM media WHERE status='done'"
+        args: list = []
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        if scene:
+            sql += " AND scene=?"
+            args.append(scene)
+        if peer_id is not None:
+            sql += " AND peer_id=?"
+            args.append(peer_id)
+        async with self.conn.execute(sql, args) as cur:
+            return (await cur.fetchone())[0]
 
     async def retire_gone_media(self) -> int:
         """One-shot: historical failed rows whose error says the resource is

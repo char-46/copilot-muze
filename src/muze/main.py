@@ -230,6 +230,14 @@ class App:
             transcode_silk=cfg.ingest.media_transcode_silk,
             qq_cache_dir=cfg.ingest.qq_cache_dir,
         )
+        self.runtime.media = self.media
+        # addressing-root normalization: the DB must hold store-relative
+        # paths (legacy absolute / CWD-relative forms are rewritten once)
+        try:
+            await self.media.normalize_media_paths()
+            await self.blobstore.normalize_dedup_paths()
+        except Exception:
+            log.exception("media path normalization failed (continuing)")
         self.pipeline = IngestPipeline(
             self.adapter, self.repo, self.media, cfg, self.chatlog, uin
         )
