@@ -224,7 +224,17 @@ class App:
         if login is not None:
             await self._record_login()  # degraded boot records it on reconnect
 
-        self.blobstore = BlobStore(cfg.storage.blob_root)
+        # multi-root addressing: primary (writable) + read-only fallbacks
+        # (configured old stores, plus the classic <data_dir>/blobs when it
+        # still exists next to a relocated primary)
+        read_roots = [Path(p) for p in getattr(cfg.storage, "blobs_roots", []) or []]
+        legacy = cfg.storage.data_dir / "blobs"
+        try:
+            if legacy.resolve() != cfg.storage.blob_root.resolve() and legacy.is_dir():
+                read_roots.append(legacy)
+        except OSError:
+            pass
+        self.blobstore = BlobStore(cfg.storage.blob_root, read_roots=read_roots)
         self.media = MediaStore(
             self.blobstore, self.adapter, self.repo,
             transcode_silk=cfg.ingest.media_transcode_silk,

@@ -65,6 +65,11 @@ class StorageConfig(BaseModel):
     # shared by muze and the QQ client (muze's name survives QQ's eviction;
     # across volumes a hardlink is impossible and muze falls back to copying)
     blobs_dir: str = ""
+    # extra READ-ONLY fallback roots (an old store kept after a volume
+    # migration, an archive copy): probed in order when a stored reference
+    # is missing under the primary. <data_dir>/blobs is auto-included when
+    # it exists and differs from the primary.
+    blobs_roots: list[str] = Field(default_factory=list)
 
     @property
     def blob_root(self) -> Path:

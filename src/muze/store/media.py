@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -106,6 +107,7 @@ class MediaStore:
         self._qq_index: dict[str, Path] = {}
         self._qq_index_at = 0.0
         self._qq_refresh_at = 0.0
+        self._qq_lock = threading.Lock()
 
     # ---------------------------------------------------------- addressing
     def abs_path(self, row_or_ref: dict | str | None) -> Path | None:
@@ -354,22 +356,25 @@ class MediaStore:
     _QQ_REFRESH_COOLDOWN = 15.0  # refresh-on-miss at most this often
 
     def _qq_cache_index(self, force: bool = False) -> dict[str, Path]:
-        now = time.monotonic()
-        if force or now - self._qq_index_at > self._QQ_INDEX_TTL:
-            idx: dict[str, Path] = {}
-            scanned = 0
-            if self.qq_cache is not None:
-                for root, _dirs, files in os.walk(self.qq_cache):
-                    for fn in files:
-                        scanned += 1
-                        if scanned > self._QQ_INDEX_MAX:
-                            log.info("MEDIA qq-cache index capped at %s entries", self._QQ_INDEX_MAX)
-                            break
-                        idx[fn.lower()] = Path(root) / fn
-            self._qq_index = idx
-            self._qq_index_at = now
-            log.debug("MEDIA qq-cache index: %s entries", len(idx))
-        return self._qq_index
+        # concurrent downloads each run _qq_cache_find in its own worker
+        # thread — the (re)build must be single-flight
+        with self._qq_lock:
+            now = time.monotonic()
+            if force or now - self._qq_index_at > self._QQ_INDEX_TTL:
+                idx: dict[str, Path] = {}
+                scanned = 0
+                if self.qq_cache is not None:
+                    for root, _dirs, files in os.walk(self.qq_cache):
+                        for fn in files:
+                            scanned += 1
+                            if scanned > self._QQ_INDEX_MAX:
+                                log.info("MEDIA qq-cache index capped at %s entries", self._QQ_INDEX_MAX)
+                                break
+                            idx[fn.lower()] = Path(root) / fn
+                self._qq_index = idx
+                self._qq_index_at = now
+                log.debug("MEDIA qq-cache index: %s entries", len(idx))
+            return self._qq_index
 
     def _qq_cache_find(self, md5_hex: str, expect_size: int | None) -> Path | None:
         """Filename-embedded-md5 lookup over the local QQ client's cache
@@ -393,8 +398,11 @@ class MediaStore:
         hit = lookup()
         if hit is not None:
             return hit
-        if time.monotonic() - self._qq_refresh_at >= self._QQ_REFRESH_COOLDOWN:
-            self._qq_refresh_at = time.monotonic()
+        with self._qq_lock:  # single-flight refresh decision
+            refresh = time.monotonic() - self._qq_refresh_at >= self._QQ_REFRESH_COOLDOWN
+            if refresh:
+                self._qq_refresh_at = time.monotonic()
+        if refresh:
             self._qq_cache_index(force=True)
             return lookup()
         return None

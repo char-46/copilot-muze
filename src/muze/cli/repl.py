@@ -84,7 +84,11 @@ def run_cli(argv: list[str]) -> int:
             runtime.instance_name = spec.name
             runtime.endpoint = spec.endpoint
             chatlog = ChatLog()
-            blobs = BlobStore(cfg.storage.blob_root)
+            read_roots = [Path(p) for p in getattr(cfg.storage, "blobs_roots", []) or []]
+            legacy = cfg.storage.data_dir / "blobs"
+            if legacy.is_dir() and str(legacy.resolve()) != str(cfg.storage.blob_root.resolve()):
+                read_roots.append(legacy)
+            blobs = BlobStore(cfg.storage.blob_root, read_roots=read_roots)
             media = MediaStore(
                 blobs, adapter, repo,
                 transcode_silk=cfg.ingest.media_transcode_silk,

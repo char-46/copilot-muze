@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -94,9 +95,25 @@ CREATE TABLE IF NOT EXISTS dedup (
 
 
 class BlobStore:
-    def __init__(self, root: Path | str) -> None:
+    """The addressing root of the media store.
+
+    MULTI-ROOT: `root` is the primary (writable) store; `read_roots` are
+    fallback locations (an old store before a volume migration, an archive
+    copy) probed IN ORDER when a relative reference does not exist under the
+    primary. Writes only ever land in the primary. The QQNT client cache is
+    managed separately by MediaStore (adoption source, not a resolve root —
+    its layout is not content-addressed).
+
+    THREADING: async methods are loop-serialized (single aiosqlite conn);
+    the synchronous helpers called via asyncio.to_thread (named_link, the
+    QQ-cache index, sweep) are guarded with locks where they mutate state.
+    """
+
+    def __init__(self, root: Path | str, read_roots: list[Path | str] = ()) -> None:
         self.root = Path(root)
+        self.read_roots = [Path(r) for r in read_roots]
         self._conn: aiosqlite.Connection | None = None
+        self._link_lock = threading.Lock()
 
     async def _ensure(self) -> aiosqlite.Connection:
         if self._conn is None:
@@ -120,17 +137,38 @@ class BlobStore:
         """Store-relative posix form of a path inside this store (else None)."""
         return to_store_rel(str(path), self.root)
 
+    def _parts(self, ref: str) -> list[str] | None:
+        parts = PurePosixPath(ref.replace("\\", "/"))
+        if parts.is_absolute() or ".." in parts.parts:
+            return None
+        return list(parts.parts)
+
     def resolve(self, ref: str | None) -> Path | None:
-        """Absolute Path for a stored reference (relative preferred; legacy
-        absolute values pass through unchanged — they were written by us)."""
+        """Absolute Path for a stored reference.
+
+        Relative refs resolve against the PRIMARY root first, then each
+        read-only fallback root (old stores) in order; a reference found
+        nowhere returns its primary location (callers decide what a missing
+        blob means). Legacy absolute values pass through unchanged.
+        """
         if not ref:
             return None
         if len(ref) > 1 and ref[1] == ":":
             return Path(ref)
-        parts = PurePosixPath(ref.replace("\\", "/"))
-        if ".." in parts.parts:
+        parts = self._parts(ref)
+        if parts is None:
             return None
-        return self.root.joinpath(*parts.parts)
+        primary = self.root.joinpath(*parts)
+        try:
+            if primary.exists():
+                return primary
+            for alt in self.read_roots:
+                q = alt.joinpath(*parts)
+                if q.exists():
+                    return q
+        except OSError:
+            pass
+        return primary
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -213,7 +251,9 @@ class BlobStore:
         """A human-readable hardlink `names/<original filename>` pointing at
         the content blob (same bytes, two names, one disk copy). A name
         collision with DIFFERENT content gets a short sha suffix; same
-        content is a no-op. Returns None when no usable name / link failed."""
+        content is a no-op. Returns None when no usable name / link failed.
+
+        Concurrent downloads race on the same original filename — guarded."""
         if not (original or "").strip():
             return None
         name = safe_name(original)
@@ -222,16 +262,17 @@ class BlobStore:
         d = self.root / "names"
         target = d / name
         try:
-            d.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                if target.samefile(blob):
-                    return target
-                stem = Path(name).stem
-                suffix = Path(name).suffix
-                target = d / f"{stem}-{blob.stem[:8]}{suffix}"
+            with self._link_lock:
+                d.mkdir(parents=True, exist_ok=True)
                 if target.exists():
-                    return target if target.samefile(blob) else None
-            os.link(blob, target)
+                    if target.samefile(blob):
+                        return target
+                    stem = Path(name).stem
+                    suffix = Path(name).suffix
+                    target = d / f"{stem}-{blob.stem[:8]}{suffix}"
+                    if target.exists():
+                        return target if target.samefile(blob) else None
+                os.link(blob, target)
             return target
         except OSError as e:
             log.debug("named_link %s failed: %s", name, e)
