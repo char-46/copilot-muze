@@ -398,6 +398,8 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
                 "idle": round(s.idle(), 1),
                 "round_chars": s.round_chars,
                 "total_chars": s.total_chars,
+                "live": s.live,
+                "live_reason": s.live_reason,
                 "result": s.result_preview,
                 "events": [
                     {"t": round(t, 1), "kind": k, "detail": d} for t, k, d in s.events

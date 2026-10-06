@@ -713,20 +713,32 @@ class Agent:
         last: Exception | None = None
         for attempt in range(3):
             try:
+                # live progress ALWAYS feeds the session when there is one —
+                # webui-initiated turns have no QQ-reachable front (so no
+                # heartbeat), but their session view still needs bumps and
+                # the streamed-text tail
+                on_chunk = None
+                if session is not None:
+                    def _on_chunk(n: int, piece: str = "", reasoning: bool = False):
+                        session.bump(n)  # progress counters (stall watchdog)
+                        if piece:
+                            session.stream(piece, reasoning)  # webui live tail
+
+                    on_chunk = _on_chunk
                 heartbeat = (
                     ctx is not None
                     and self._progress
                     and ctx.qq_reachable
                 )
                 if not heartbeat:
-                    return await self.llm.chat(messages, tools=tools or SPEC)
+                    return await self.llm.chat(
+                        messages, tools=tools or SPEC, on_chunk=on_chunk
+                    )
                 stop = asyncio.Event()
                 hb = asyncio.create_task(self._heartbeat(ctx, stop, session))
                 try:
-                    if session is None:
-                        return await self.llm.chat(messages, tools=tools or SPEC)
                     return await self.llm.chat(
-                        messages, tools=tools or SPEC, on_chunk=session.bump
+                        messages, tools=tools or SPEC, on_chunk=on_chunk
                     )
                 finally:
                     stop.set()
@@ -881,6 +893,7 @@ class Agent:
         runner = ToolRunner(self.service, self.repo, self.service.adapter, self.llm, ctx)
         stall = self._turn_timeout()
         final_text = ""
+        final_msg: dict | None = None
         step_budget = max_steps if max_steps is not None else self.max_steps
 
         try:
@@ -898,6 +911,7 @@ class Agent:
                     answer = (msg.get("content") or "").strip()
                     session.event("llm", f"第{step}轮完成（{len(answer)} 字）")
                     final_text = answer
+                    final_msg = msg  # kept whole: reasoning_content stays on it
                     break
                 messages.append(msg)
                 # publish the loop state so the webui shows tool calls while
@@ -990,8 +1004,9 @@ class Agent:
             final_text = "(AI 未返回内容)"
         # the final answer must live in the loop history too (webui session
         # view renders exactly these messages; without it the complete output
-        # was invisible except as a 200-char preview)
-        messages.append({"role": "assistant", "content": final_text})
+        # was invisible except as a 200-char preview). The WHOLE final message
+        # is kept so its reasoning_content (💭 view) survives as well.
+        messages.append(final_msg or {"role": "assistant", "content": final_text})
         session.messages = messages[1:]
         session.finish(True, final_text)
         await commit(final_text)

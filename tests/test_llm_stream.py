@@ -56,7 +56,8 @@ async def test_chat_streams_and_accumulates_content_and_tool_calls():
     )
     seen: list[int] = []
     msg = await llm.chat(
-        [{"role": "user", "content": "hi"}], tools=[{"x": 1}], on_chunk=seen.append
+        [{"role": "user", "content": "hi"}], tools=[{"x": 1}],
+        on_chunk=lambda n, piece="", reasoning=False: seen.append(n),
     )
     assert msg["content"] == "你好"
     assert seen == [1, 1]  # every delta fired on_chunk

@@ -49,6 +49,8 @@ class Session:
     last_activity: float = 0.0
     round_chars: int = 0  # chars received in the current model round
     total_chars: int = 0
+    live: str = ""  # rolling tail of the current round's output (webui)
+    live_reason: str = ""  # rolling tail of the current round's thinking
     result_preview: str = ""
     messages: list[dict] = field(default_factory=list)  # loop msgs, system stripped
 
@@ -72,8 +74,19 @@ class Session:
         self.total_chars += chars
         self.updated = self.last_activity = time.time()
 
+    LIVE_TAIL = 4000  # chars of rolling tail kept for the webui live view
+
+    def stream(self, piece: str, reasoning: bool = False) -> None:
+        """Rolling tail of the CURRENT round's streamed output (and thinking),
+        so the webui session view can show live text, not just counters."""
+        attr = "live_reason" if reasoning else "live"
+        setattr(self, attr, (getattr(self, attr) + piece)[-self.LIVE_TAIL:])
+        self.updated = self.last_activity = time.time()
+
     def new_round(self) -> None:
         self.round_chars = 0
+        self.live = ""
+        self.live_reason = ""
 
     def finish(self, ok: bool, preview: str = "") -> None:
         self.status = DONE if ok else ERROR

@@ -30,7 +30,7 @@ class ScriptLLM:
         if isinstance(item, Exception):
             raise item
         if on_chunk and item.get("content"):
-            on_chunk(len(item["content"]))
+            on_chunk(len(item["content"]), item["content"], False)
         return item
 
 
@@ -921,7 +921,7 @@ async def test_reasoning_kept_on_message_and_stripped_from_requests():
                 {"role": "assistant", "content": "旧答", "reasoning_content": "旧思考",
                  "finish_reason": "stop"},
             ],
-            on_chunk=lambda n: chunks.append(n),
+            on_chunk=lambda n, piece="", reasoning=False: chunks.append(n),
         )
     finally:
         monkeypatch_client.undo()
@@ -1035,3 +1035,33 @@ async def test_describe_image_face_conditional_and_cache(env, tmp_path):
                            "purpose": "再确认"},
     ))
     assert calls == [] and "复用" in r["descriptions"][0]
+
+
+async def test_agent_feeds_live_tail_without_qq_front(env, monkeypatch):
+    """webui-initiated turns have NO QQ-reachable ctx (no heartbeat path) —
+    the streamed text must STILL land in session.live for the webui."""
+    service, repo = env
+
+    class FakeRunner:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, name, args):
+            return "{}"
+
+    monkeypatch.setattr("muze.ai.agent.ToolRunner", FakeRunner)
+    llm = ScriptLLM(
+        [
+            {"role": "assistant",
+             "tool_calls": [{"id": "1", "function": {"name": "cli", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "最终答案在此"},
+        ]
+    )
+    llm.cfg = _llm_cfg()
+    agent = Agent(service, repo, llm, ChatLog(), 3)
+    out = await agent.converse("查", _qq_ctx())
+    assert out.text == "最终答案在此"
+    s = agent.sessions.latest(1)[0]
+    assert s.live.endswith("最终答案在此")  # streamed tail visible
+    # the FINAL round's assistant message is kept too (think view coverage)
+    assert s.messages[-1].get("content") == "最终答案在此"

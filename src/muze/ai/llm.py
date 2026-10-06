@@ -168,7 +168,7 @@ class LLMClient:
                         content.append(piece)
                         if on_chunk is not None:
                             try:
-                                on_chunk(len(piece))
+                                on_chunk(len(piece), piece, False)
                             except Exception:
                                 pass
                     # thinking models stream their reasoning separately; it
@@ -179,7 +179,7 @@ class LLMClient:
                         reasoning.append(rpiece)
                         if on_chunk is not None:
                             try:
-                                on_chunk(len(rpiece))
+                                on_chunk(len(rpiece), rpiece, True)
                             except Exception:
                                 pass
                     for tc in delta.tool_calls or []:
