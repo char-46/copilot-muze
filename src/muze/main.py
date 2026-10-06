@@ -224,7 +224,7 @@ class App:
         if login is not None:
             await self._record_login()  # degraded boot records it on reconnect
 
-        self.blobstore = BlobStore(cfg.storage.data_dir / "blobs")
+        self.blobstore = BlobStore(cfg.storage.blob_root)
         self.media = MediaStore(
             self.blobstore, self.adapter, self.repo,
             transcode_silk=cfg.ingest.media_transcode_silk,

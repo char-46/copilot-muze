@@ -6,7 +6,7 @@ from __future__ import annotations
 from muze.ai.sessions import Session
 
 
-def test_session_stream_keeps_rolling_tail():
+def test_session_stream_keeps_full_round_text():
     s = Session(id="a", chat_key="k", prompt="p")
     s.stream("abc")
     s.stream("def")
@@ -15,10 +15,10 @@ def test_session_stream_keeps_rolling_tail():
     s.stream("想了一层", reasoning=True)
     s.stream("又想一层", reasoning=True)
     assert s.live_reason == "想了一层又想一层"
-    # tail is capped: only the last LIVE_TAIL chars survive
-    big = "x" * (Session.LIVE_TAIL + 10)
+    # NOT a rolling tail: the whole round stays (user-facing, round-bounded)
+    big = "x" * 9000
     s.stream(big)
-    assert len(s.live) == Session.LIVE_TAIL
+    assert s.live == "abcdef" + big
     # a new round clears the live buffers
     s.new_round()
     assert s.live == "" and s.live_reason == "" and s.round_chars == 0

@@ -74,13 +74,12 @@ class Session:
         self.total_chars += chars
         self.updated = self.last_activity = time.time()
 
-    LIVE_TAIL = 4000  # chars of rolling tail kept for the webui live view
-
     def stream(self, piece: str, reasoning: bool = False) -> None:
-        """Rolling tail of the CURRENT round's streamed output (and thinking),
-        so the webui session view can show live text, not just counters."""
+        """Full streamed text of the CURRENT round (and thinking), so the
+        webui session view can show live output, not just counters. Cleared
+        by new_round(); the round itself bounds the size."""
         attr = "live_reason" if reasoning else "live"
-        setattr(self, attr, (getattr(self, attr) + piece)[-self.LIVE_TAIL:])
+        setattr(self, attr, getattr(self, attr) + piece)
         self.updated = self.last_activity = time.time()
 
     def new_round(self) -> None:

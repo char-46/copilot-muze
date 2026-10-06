@@ -547,12 +547,16 @@ function renderSession(s) {
       `<div>⏳ 第${s.step || 1}轮进行中 · 本轮已收 <b>${s.round_chars}</b> 字 · 空闲 ${s.idle}s</div>` +
       (chips ? `<div style="margin-top:4px">${chips}</div>` : "") +
       (s.live_reason
-        ? `<details class="tool think" open><summary>💭 思考中…（最新 ${(s.live_reason || "").length}+ 字）</summary>` +
+        ? `<details class="tool think" open><summary>💭 思考中…（已收 ${(s.live_reason || "").length} 字）</summary>` +
           `<div class="thinkbody">${esc(s.live_reason)}</div></details>` : "") +
       (s.live
-        ? `<details class="tool" open><summary>⌨ 本轮输出（最新 ${(s.live || "").length}+ 字）</summary>` +
+        ? `<details class="tool" open><summary>⌨ 本轮输出（已收 ${(s.live || "").length} 字）</summary>` +
           `<pre class="livepre">${esc(s.live)}</pre></details>` : "");
     el.appendChild(z);
+    // live boxes follow the stream: keep them scrolled to the newest text
+    for (const b of z.querySelectorAll("pre.livepre, .thinkbody")) {
+      b.scrollTop = b.scrollHeight;
+    }
   } else if (tl) {
     el.appendChild(tl); // keep the existing <details> (open state preserved)
   } else {

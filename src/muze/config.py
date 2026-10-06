@@ -59,6 +59,16 @@ class AccountsConfig(BaseModel):
 class StorageConfig(BaseModel):
     # root dir; per-account dirs are <data_dir>/<uin>/ (auto after login)
     data_dir: Path = Path("./data")
+    # optional separate home for the shared content-addressed blob store.
+    # Put it on the SAME VOLUME as ingest.qq_cache_dir (e.g. both on D:) and
+    # every adopted QQNT cache hit becomes a HARDLINK — one physical copy
+    # shared by muze and the QQ client (muze's name survives QQ's eviction;
+    # across volumes a hardlink is impossible and muze falls back to copying)
+    blobs_dir: str = ""
+
+    @property
+    def blob_root(self) -> Path:
+        return Path(self.blobs_dir).resolve() if self.blobs_dir else self.data_dir / "blobs"
 
     @property
     def logs_dir(self) -> Path:

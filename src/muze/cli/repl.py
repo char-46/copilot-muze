@@ -84,7 +84,7 @@ def run_cli(argv: list[str]) -> int:
             runtime.instance_name = spec.name
             runtime.endpoint = spec.endpoint
             chatlog = ChatLog()
-            blobs = BlobStore(cfg.storage.data_dir / "blobs")
+            blobs = BlobStore(cfg.storage.blob_root)
             media = MediaStore(
                 blobs, adapter, repo,
                 transcode_silk=cfg.ingest.media_transcode_silk,
