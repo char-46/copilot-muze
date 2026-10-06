@@ -96,6 +96,9 @@ class IngestConfig(BaseModel):
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
     media_download_concurrency: int = 3
     media_transcode_silk: bool = True
+    # in-flight download leftovers (.part) older than this are swept by the
+    # maintenance loop — orphaned partials of killed downloads (one was 118GB)
+    media_tmp_max_age_sec: float = 21600.0  # 6h
     # local QQ client cache dir (QQNT's nt_data etc.): best-effort media
     # dedup/adoption — file rows match by QQ's md5 file_hash, images/videos
     # by md5-embedded cache filenames; empty disables all of it

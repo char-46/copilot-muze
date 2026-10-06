@@ -142,6 +142,27 @@ class BlobStore:
         self.root.joinpath("tmp").mkdir(parents=True, exist_ok=True)
         return self.root / "tmp" / f"{uuid.uuid4().hex}.part"
 
+    def sweep_tmp(self, max_age_sec: float) -> tuple[int, int]:
+        """Delete in-flight download leftovers older than max_age_sec (a
+        crashed process can't clean up after itself; live downloads are
+        younger than any sane threshold). Returns (files, bytes) reclaimed."""
+        cutoff = time.time() - max_age_sec
+        files = bytes_ = 0
+        tmp = self.root / "tmp"
+        if not tmp.is_dir():
+            return 0, 0
+        for p in tmp.iterdir():
+            try:
+                if not p.is_file() or p.stat().st_mtime > cutoff:
+                    continue
+                size = p.stat().st_size
+                p.unlink()
+                files += 1
+                bytes_ += size
+            except OSError:
+                pass
+        return files, bytes_
+
 
 def dedup_key(row: dict) -> str | None:
     """Pre-download dedup key for a planned media row, if any."""

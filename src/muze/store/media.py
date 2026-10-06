@@ -15,6 +15,7 @@ and the bytes survive the client's cache cleanup.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -486,16 +487,23 @@ class MediaStore:
         tmp = self.blobs.tmp_path()
         hasher = hashlib.sha256()
         total = 0
-        async with sess.get(url) as resp:
-            if resp.status in (404, 410):
-                raise MediaGone(f"HTTP {resp.status}")
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status}")
-            with open(tmp, "wb") as fh:
-                async for chunk in resp.content.iter_chunked(1 << 16):
-                    fh.write(chunk)
-                    hasher.update(chunk)
-                    total += len(chunk)
+        try:
+            async with sess.get(url) as resp:
+                if resp.status in (404, 410):
+                    raise MediaGone(f"HTTP {resp.status}")
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                with open(tmp, "wb") as fh:
+                    async for chunk in resp.content.iter_chunked(1 << 16):
+                        fh.write(chunk)
+                        hasher.update(chunk)
+                        total += len(chunk)
+        except BaseException:
+            # a killed/failed download must not leave its (often huge)
+            # partial .part behind — 118GB of orphans accumulated this way
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
         with open(tmp, "rb") as fh:
             head = fh.read(512)
         content_hash = hasher.hexdigest()

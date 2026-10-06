@@ -57,7 +57,12 @@ def setup_logging(log_cfg: LogConfig, storage_cfg: StorageConfig) -> Path:
     console.setFormatter(fmt)
     root.addHandler(console)
 
-    filehandler = logging.FileHandler(log_path, encoding="utf-8")  # append forever
+    # rotating: full LLM payloads made muze.log grow to 551MB in two days
+    from logging.handlers import RotatingFileHandler
+
+    filehandler = RotatingFileHandler(
+        log_path, maxBytes=50 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     filehandler.setFormatter(fmt)
     root.addHandler(filehandler)
 

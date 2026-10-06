@@ -563,7 +563,8 @@ class ToolRunner:
         except Exception as e:
             log.warning("tool %s failed: %s", name, e)
             payload = json.dumps({"error": str(e), "now": _now_iso()}, ensure_ascii=False)
-        log.info("LLM tool  | %s(%s) -> %s", name, _args_brief(args), payload[:4000])
+        log.info("LLM tool  | %s(%s) -> %.600s", name, _args_brief(args), payload)
+        log.debug("LLM tool full | %s(%s) -> %s", name, _args_brief(args), payload)
         return payload
 
     def _describe(self, name: str, args: dict) -> str:

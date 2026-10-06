@@ -81,6 +81,63 @@ async def test_fetch_missing_local_source_raises(ms):
         await store._fetch_into_blob(str(tmp_path / "nope.jpg"), row)
 
 
+async def test_failed_download_leaves_no_partial_behind(ms):
+    """A download that dies mid-stream must clean its .part up — orphaned
+    partials of huge group files accumulated to 118GB before this rule."""
+    store, tmp_path = ms
+    row = {"id": 4, "kind": "video", "file_name": "", "file_id": "", "file_hash": ""}
+
+    class _Body:
+        @staticmethod
+        async def iter_chunked(_n):
+            yield b"x" * 4096
+            raise RuntimeError("connection dropped")
+
+    class _Resp:
+        status = 200
+        content = _Body()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        @staticmethod
+        def get(_url):
+            return _Resp()
+
+    class _Http:
+        @staticmethod
+        async def session():
+            return _Sess()
+
+    store.adapter.http = _Http()
+    with pytest.raises(RuntimeError):
+        await store._fetch_into_blob("https://example.com/v.mp4", row)
+    leftovers = list((tmp_path / "blobs" / "tmp").glob("*"))
+    assert leftovers == []
+
+
+def test_sweep_tmp_removes_only_stale_partials(tmp_path):
+    import os
+
+    blobs = BlobStore(tmp_path / "b")
+    old = blobs.tmp_path()
+    old.write_bytes(b"o" * 100)
+    fresh = blobs.tmp_path()
+    fresh.write_bytes(b"n" * 5)
+    os.utime(old, (0, 0))  # epoch: ancient
+
+    files, nbytes = blobs.sweep_tmp(3600)
+    assert (files, nbytes) == (1, 100)
+    assert not old.exists() and fresh.exists()
+
+    # second sweep is a no-op (fresh file under the age threshold)
+    assert blobs.sweep_tmp(3600) == (0, 0)
+
+
 async def test_download_row_full_path_with_local_url(tmp_path):
     """get_resource_temp_url answering a client-cache path end to end."""
 

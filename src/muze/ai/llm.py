@@ -128,10 +128,19 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        # INFO gets a size sketch only — full payloads at DEBUG (a 16-step
+        # subagent re-sends the whole history every step; full dumps made
+        # the log balloon by hundreds of MB)
+        sketch = ",".join(
+            f"{m.get('role')}:{len(str(m.get('content') or ''))}"
+            + (f"+{len(m.get('tool_calls') or [])}call" if m.get("tool_calls") else "")
+            for m in messages
+        )
         log.info(
             "LLM req  | model=%s tools=%s msgs=%s | %s",
-            kwargs["model"], len(tools or []), len(messages), _j(messages),
+            kwargs["model"], len(tools or []), len(messages), sketch,
         )
+        log.debug("LLM req full | %s", _j(messages))
         try:
             stream = await client.chat.completions.create(**kwargs)
         except Exception as e:
@@ -201,9 +210,10 @@ class LLMClient:
         if tool_calls:
             msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
         log.info(
-            "LLM resp | usage=%s finish=%s | %s",
+            "LLM resp | usage=%s finish=%s | %.500s",
             _j(usage_d), finish, _j(msg),
         )
+        log.debug("LLM resp full | %s", _j(msg))
         return msg
 
     async def vision_describe(self, image_path: str | Path, question: str) -> str:

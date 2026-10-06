@@ -689,6 +689,14 @@ class App:
                 fixed = await self.media.retry_failed(limit=20)
                 if fixed:
                     log.info("media retry recovered %s file(s)", fixed)
+                swept, swept_b = self.blobs.sweep_tmp(
+                    getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0)
+                )
+                if swept:
+                    log.info(
+                        "swept %s orphaned download partial(s), %s reclaimed",
+                        swept, f"{swept_b / (1 << 30):.2f}GiB",
+                    )
                 now = time.time()
                 if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
                     if now - self._last_profile_refresh >= self.cfg.profiles.interval_min * 60:
