@@ -724,6 +724,16 @@ class App:
                     swept, swept_b = self.blobs.sweep_tmp(
                         getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0)
                     )
+                    # read-only fallback roots (an old store after a volume
+                    # move) get their tmp swept too — no process writes there
+                    # anymore, so any .part left behind is abandoned
+                    for alt in self.blobs.read_roots:
+                        s2, b2 = self.blobs.sweep_root_tmp(
+                            alt,
+                            getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0),
+                        )
+                        swept += s2
+                        swept_b += b2
                     if swept:
                         log.info(
                             "swept %s orphaned download partial(s), %s reclaimed",

@@ -286,9 +286,14 @@ class BlobStore:
         """Delete in-flight download leftovers older than max_age_sec (a
         crashed process can't clean up after itself; live downloads are
         younger than any sane threshold). Returns (files, bytes) reclaimed."""
+        return self.sweep_root_tmp(self.root, max_age_sec)
+
+    def sweep_root_tmp(self, root: Path, max_age_sec: float) -> tuple[int, int]:
+        """sweep_tmp against an arbitrary root (read-only fallback stores:
+        nothing writes there anymore, any leftover .part is abandoned)."""
         cutoff = time.time() - max_age_sec
         files = bytes_ = 0
-        tmp = self.root / "tmp"
+        tmp = root / "tmp"
         if not tmp.is_dir():
             return 0, 0
         for p in tmp.iterdir():

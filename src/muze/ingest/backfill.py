@@ -28,6 +28,36 @@ from muze.store.repo import Repository
 
 log = logging.getLogger("muze.backfill")
 
+# ------------------------------------------------------------------ dedup
+# One QQ behind several endpoints (main + milky-2) shares ONE repo: several
+# Backfillers may live in this process over the same data. Pulls are deduped:
+#  - per-CONVERSATION claims: a second in-flight pull of the same conv skips
+#    (rows would upsert-dedupe anyway; the claim saves the network pull and
+#    keeps the saved bf cursor from being written by two pagers at once)
+#  - per-DB run state: an automatic (background) full run skips when a
+#    sibling backfiller over the SAME repo is already pulling or just ran
+_PULL_CLAIMS: dict[tuple[str, int], float] = {}  # (scene, peer) -> expiry
+_CLAIM_TTL = 600.0  # safety expiry: a crashed holder can't block forever
+_RUN_STATE: dict[int, dict] = {}  # id(repo.conn) -> {"running", "last_run_at"}
+_RUN_FRESH_SEC = 120.0  # a sibling's recent full run covers a new one
+
+
+def _claim_pull(conv: tuple[str, int]) -> bool:
+    """True when this caller may pull the conversation now."""
+    now = time.monotonic()
+    if _PULL_CLAIMS.get(conv, 0.0) > now:
+        return False
+    _PULL_CLAIMS[conv] = now + _CLAIM_TTL
+    return True
+
+
+def _release_pull(conv: tuple[str, int]) -> None:
+    _PULL_CLAIMS.pop(conv, None)
+
+
+def _run_state(conn: object) -> dict:
+    return _RUN_STATE.setdefault(id(conn), {"running": False, "last_run_at": 0.0})
+
 
 class Backfiller:
     def __init__(
@@ -87,6 +117,29 @@ class Backfiller:
 
     # ------------------------------------------------------------- worker
     async def _backfill_conversation(
+        self,
+        scene: str,
+        peer_id: int,
+        reporter=None,
+        force: bool = False,
+        since_ts: float | None = None,
+    ) -> int:
+        conv = (scene, peer_id)
+        if not _claim_pull(conv):
+            log.info(
+                "backfill %s skipped: another pull of this conversation is "
+                "in flight (shared-store dedup)",
+                conv_id(scene, peer_id),
+            )
+            return 0
+        try:
+            return await self._backfill_conversation_inner(
+                scene, peer_id, reporter=reporter, force=force, since_ts=since_ts
+            )
+        finally:
+            _release_pull(conv)
+
+    async def _backfill_conversation_inner(
         self,
         scene: str,
         peer_id: int,
@@ -221,11 +274,27 @@ class Backfiller:
         reporter: ProgressReporter | None = None,
         force: bool = False,
         since_ts: float | None = None,
+        background: bool = False,
     ) -> int | None:
+        st = _run_state(self.repo.conn)
+        if background and not force and since_ts is None:
+            # automatic runs (boot roam, periodic rescan) are shared-store:
+            # skip when a sibling backfiller is pulling or just covered it
+            now = time.monotonic()
+            if st["running"]:
+                log.info("backfill run skipped: sibling instance already pulling this store")
+                return None
+            if now - st["last_run_at"] < _RUN_FRESH_SEC:
+                log.info(
+                    "backfill run skipped: sibling ran %.0fs ago (coverage shared)",
+                    now - st["last_run_at"],
+                )
+                return None
         if self.running:
             log.info("backfill already running; skipping")
             return None
         self.running = True
+        st["running"] = True
         own_reporter = reporter is None
         if reporter is None:
             # Owned reporter: a background pull has no front to report to until
@@ -281,6 +350,8 @@ class Backfiller:
         finally:
             self._reporter = None
             self.running = False
+            st["running"] = False
+            st["last_run_at"] = time.monotonic()
 
     def subscribe(self, emit, key: str | None = None) -> bool:
         """Attach a late delivery target to the currently-running pull.
@@ -352,6 +423,20 @@ class Backfiller:
 
     async def deep_pull(self, scene: str, peer_id: int, pages: int, reporter=None) -> int:
         """Ignore the watermark and pull up to `pages` pages into the store."""
+        conv = (scene, peer_id)
+        if not _claim_pull(conv):
+            log.info(
+                "deep pull %s skipped: another pull of this conversation is "
+                "in flight (shared-store dedup)",
+                conv_id(scene, peer_id),
+            )
+            return 0
+        try:
+            return await self._deep_pull_inner(scene, peer_id, pages, reporter=reporter)
+        finally:
+            _release_pull(conv)
+
+    async def _deep_pull_inner(self, scene: str, peer_id: int, pages: int, reporter=None) -> int:
         bf = self.cfg.ingest.backfill
         caps = self.adapter.caps
         cursor: int | None = None
@@ -390,7 +475,7 @@ class Backfiller:
     async def start_background(self) -> None:
         bf = self.cfg.ingest.backfill
         if bf.on_start:
-            self._task = asyncio.create_task(self.run_once())
+            self._task = asyncio.create_task(self.run_once(background=True))
         if bf.rescan_interval_min > 0:
             self._rescan_task = asyncio.create_task(self._rescan_loop())
 
@@ -403,7 +488,7 @@ class Backfiller:
             try:
                 targets = await self._rescan_targets()
                 if targets:
-                    await self.run_once(targets)
+                    await self.run_once(targets, background=True)
             except Exception as e:
                 log.warning("rescan failed: %s", e)
 
