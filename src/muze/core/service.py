@@ -1077,12 +1077,46 @@ class ControlService:
     async def cmd_version(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(get_version())
 
+    @slash("cost", "/cost [today|month|all]", "LLM 用量与费用（模型定价含峰谷；无定价模型只计 token）", scope="app")
+    async def cmd_cost(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        llm = self.agent.llm if self.agent is not None else None
+        if llm is None or llm.costs is None:
+            return CommandOutcome.err("LLM 未装配或未启用记账")
+        import datetime as _dt
+
+        scope = (args[0].lower() if args else "today")
+        today = _dt.date.today()
+        prefix = {"today": today.isoformat(), "month": today.strftime("%Y-%m"), "all": ""}.get(scope)
+        if prefix is None:
+            return CommandOutcome.err("用法: /cost [today|month|all]")
+        rows = llm.costs.summary(prefix)
+        if not rows:
+            return CommandOutcome(f"{scope}: 暂无用量记录")
+        lines = [f"LLM 用量（{scope}）:"]
+        total = 0.0
+        has_free = False
+        for m, r in sorted(rows.items(), key=lambda kv: -(kv[1][5] or 0)):
+            p_tok, c_tok, img, audio_s, calls, cost = r
+            bits = f"{m}: {p_tok:,}入/{c_tok:,}出 tok, {calls}次"
+            if img:
+                bits += f", 图{img}"
+            if audio_s:
+                bits += f", 音频{audio_s / 60:.1f}min"
+            if cost:
+                bits += f" -> ¥{cost:.4f}"
+                total += cost
+            else:
+                has_free = True
+            lines.append(bits)
+        lines.append(f"合计: ¥{total:.4f}" + ("（无定价模型仅计 token）" if has_free else ""))
+        return CommandOutcome("\n".join(lines))
+
     @slash("balance", "/balance [模型名]", "查询各 LLM 端点的账户余额（llm.models 注册项）", scope="app")
     async def cmd_balance(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         llm = self.agent.llm if self.agent is not None else None
         if llm is None:
             return CommandOutcome.err("LLM 未装配")
-        entries = llm.cfg.effective_models()
+        entries = llm._entries()
         names = [a for a in args if a in entries] or list(entries)
         if not names:
             return CommandOutcome("llm.models 为空（旧式单端点配置，无可查条目）")

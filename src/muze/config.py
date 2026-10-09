@@ -207,6 +207,7 @@ class ModelCaps(BaseModel):
 
     vision: bool = False  # accepts image_url content parts
     tools: bool = True  # accepts OpenAI-style tool_calls
+    asr: bool = False  # accepts audio transcription requests
     cheap: bool = False  # hint: prefer for bulk scoring/OCR/value passes
 
 
@@ -245,6 +246,9 @@ class LLMConfig(BaseModel):
     vision: LLMEndpoint = Field(default_factory=LLMEndpoint)  # legacy "vision" entry
     models: dict[str, ModelEntry] = Field(default_factory=dict)
     roles: dict[str, list[str]] = Field(default_factory=dict)
+    # python model catalog (capability declarations + pricing functions):
+    # a user models.py; "" = <storage.data_dir>/models.py, "off" disables.
+    catalog: str = ""
     prefix: str = "::"  # wake prefix for direct LLM chat (customizable)
 
     @pydantic.field_validator("models", "roles", mode="before")

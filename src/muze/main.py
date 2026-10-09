@@ -255,7 +255,7 @@ class App:
         self.runtime.backfiller = self.backfiller
 
         self.service = ControlService(cfg, self.adapter, self.repo, self.chatlog, self.runtime)
-        self.llm = LLMClient(cfg.llm)
+        self.llm = LLMClient(cfg.llm, data_dir=cfg.storage.data_dir)
         self.agent = Agent(
             self.service, self.repo, self.llm, self.chatlog, cfg.llm.agent_max_steps
         )
@@ -761,7 +761,7 @@ class App:
                 await self.repo.update_media(m["id"], status="done", summary="")
                 continue
             try:
-                text = (await asr.transcribe(p)).strip()
+                text = (await asr.transcribe(p, duration_sec=dur)).strip()
             except Exception as e:
                 log.warning("asr failed for %s: %s", m.get("file_path"), e)
                 continue  # transient-looking: retried on a later pass

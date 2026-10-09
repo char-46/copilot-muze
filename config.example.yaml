@@ -120,23 +120,26 @@ llm:
     api_key: ""
     model: ""                 # e.g. glm-4v-plus
 
-  # --- multi-model registry (optional; the chat/vision entries above keep
-  # working as the implicit "chat"/"vision" entries when models is empty).
-  # Each entry is independently rate-limited; roles map a purpose to an
-  # ordered fallback chain of names (first healthy entry answers).
+  # --- multi-model registry. Two layers:
+  #   1) the PYTHON catalog (preferred for anything with pricing/caps):
+  #      <data_dir>/models.py — capability declarations (vision/tools/asr)
+  #      and PRICING FUNCTIONS (peak/off-peak 峰谷, per-image, per-audio-minute).
+  #      Copy models.example.py. Entries activate once a key is supplied
+  #      here (llm.models.<name>.api_key) or via MUZE_KEY_<NAME>.
+  #   2) plain entries below (no pricing; caps/rpm inline) — still fully
+  #      supported, and they override catalog fields of the same name.
   models:
     # deepseek:
-    #   base_url: https://api.deepseek.com
-    #   api_key: ""
-    #   model: deepseek-chat
+    #   api_key: ""              # the only required field for a catalog entry
     #   rpm: 30               # requests/min cap, process-wide (0 = off)
     #   max_concurrency: 4    # in-flight cap (0 = off)
-    #   caps: {tools: true, vision: false, cheap: false}
+    #   # caps/base_url/model default to the catalog's; override as needed
     # glm-v:
     #   base_url: https://open.bigmodel.cn/api/paas/v4/
     #   api_key: ""
     #   model: glm-4v-plus
     #   caps: {vision: true}
+  catalog: ""                  # "" -> <data_dir>/models.py; a path; or "off"
   roles:
     # chat:   [chat]              # the agent / converse loop
     # vision: [glm-v, chat]       # image understanding

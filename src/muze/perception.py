@@ -34,7 +34,12 @@ _RISK_WORDS = ("风控", "冻结", "frozen", "risk", "blocked", "too many", "频
 # ------------------------------------------------------------------- ASR
 def _asr_api_entry(llm: LLMClient):
     chain = llm.resolve("asr")
-    return chain[0][1] if chain else None
+    if not chain:
+        return None
+    # prefer entries that DECLARE audio capability (catalog caps.asr),
+    # e.g. MiMo's ASR-capable ids; any endpoint still works as a fallback
+    declared = [(n, e) for n, e in chain if getattr(e.caps, "asr", False)]
+    return (declared or chain)[0][1]
 
 
 def _faster_whisper():
@@ -80,16 +85,18 @@ class AsrChain:
             return "local", ""
         return "", "auto: 无可用 ASR 后端（配置 api 角色或安装 faster-whisper）"
 
-    async def transcribe(self, wav_path: str | Path) -> str:
+    async def transcribe(self, wav_path: str | Path, duration_sec: float = 0.0) -> str:
         provider, note = self.resolve()
         if not provider:
             raise RuntimeError(note or "ASR 不可用")
         if provider == "api":
-            return await self._transcribe_api(Path(wav_path))
+            return await self._transcribe_api(Path(wav_path), duration_sec)
         return await self._transcribe_local(Path(wav_path))
 
-    async def _transcribe_api(self, p: Path) -> str:
-        e = _asr_api_entry(self.llm)
+    async def _transcribe_api(self, p: Path, duration_sec: float = 0.0) -> str:
+        chain = self.llm.resolve("asr")
+        declared = [(n, e) for n, e in chain if getattr(e.caps, "asr", False)]
+        name, e = (declared or chain)[0]
         base = e.base_url.rstrip("/")
         async with httpx.AsyncClient(timeout=120) as hc:
             with open(p, "rb") as f:
@@ -105,7 +112,14 @@ class AsrChain:
                 )
         if r.status_code != 200:
             raise RuntimeError(f"asr api {r.status_code}: {r.text[:200]}")
-        return (r.json().get("text") or "").strip()
+        text = (r.json().get("text") or "").strip()
+        # ledger: audio length drives the per-minute price when declared
+        rec = getattr(self.llm, "record_usage", None)
+        if rec is not None:
+            from muze.model_catalog import Usage
+
+            rec(name, Usage(audio_sec=float(duration_sec or 0.0)))
+        return text
 
     async def _transcribe_local(self, p: Path) -> str:
         WhisperModel = _faster_whisper()

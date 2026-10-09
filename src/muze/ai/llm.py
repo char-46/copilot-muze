@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -21,7 +22,8 @@ from pathlib import Path
 import httpx
 from openai import AsyncOpenAI, Timeout
 
-from muze.config import LLMConfig, ModelEntry
+from muze.config import LLMConfig, ModelCaps, ModelEntry
+from muze.model_catalog import Usage
 
 log = logging.getLogger("muze.llm")
 
@@ -49,6 +51,15 @@ MIME_BY_EXT = {
     ".webp": "image/webp",
     ".bmp": "image/bmp",
 }
+
+
+def _count_images(messages: list[dict]) -> int:
+    n = 0
+    for m in messages:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            n += sum(1 for part in c if isinstance(part, dict) and part.get("type") == "image_url")
+    return n
 
 
 class _Limiter:
@@ -89,16 +100,42 @@ class _Limiter:
 
 
 class LLMClient:
-    def __init__(self, cfg: LLMConfig) -> None:
+    def __init__(self, cfg: LLMConfig, data_dir: str = "") -> None:
         self.cfg = cfg
         self._chat: AsyncOpenAI | None = None
         self._vision: AsyncOpenAI | None = None
         self._clients: dict[str, AsyncOpenAI] = {}
         self._limiters: dict[str, _Limiter] = {}
+        self.catalog: dict[str, ModelSpec] = {}
+        self._pricing: dict[str, object] = {}
+        from muze.model_catalog import CostTracker
+
+        self.costs: CostTracker | None = (
+            CostTracker(Path(data_dir) / "costs.json") if data_dir else None
+        )
+        self._data_dir = data_dir
+        self._load_catalog()
+
+    def _load_catalog(self) -> None:
+        from muze.model_catalog import load_user_catalog
+
+        self.catalog = {}
+        self._pricing = {}
+        cat = (self.cfg.catalog or "").strip()
+        if cat.lower() == "off":
+            return
+        path = cat or (
+            str(Path(self._data_dir) / "models.py") if self._data_dir else ""
+        )
+        if not path:
+            return
+        self.catalog = load_user_catalog(path)
+        for name, spec in self.catalog.items():
+            self._pricing[name] = spec.pricing
 
     @property
     def configured(self) -> bool:
-        return bool(self.cfg.effective_models())
+        return bool(self._entries())
 
     def apply_config(self, cfg: LLMConfig) -> None:
         """Hot-reload support: swap config, drop cached clients."""
@@ -107,12 +144,55 @@ class LLMClient:
         self._vision = None
         self._clients = {}
         self._limiters = {}
+        self._load_catalog()
 
     # ------------------------------------------------------------ registry
+    def _entries(self) -> dict[str, ModelEntry]:
+        """The full registry: yaml models + legacy endpoints + the python
+        catalog (whose entries need a key from yaml `llm.models.<name>`
+        or MUZE_KEY_<NAME>; keyless catalog entries stay dormant)."""
+        out = dict(self.cfg.effective_models())
+        for name, spec in self.catalog.items():
+            if not (spec.base_url and spec.model):
+                continue
+            ov = self.cfg.models.get(name)
+            key = (ov.api_key if ov and ov.api_key else "") or os.environ.get(
+                f"MUZE_KEY_{name.upper()}", ""
+            )
+            if not key:
+                continue
+            out[name] = ModelEntry(
+                base_url=(ov.base_url if ov and ov.base_url else spec.base_url),
+                api_key=key,
+                model=(ov.model if ov and ov.model else spec.model),
+                temperature=(
+                    ov.temperature
+                    if ov and ov.temperature is not None
+                    else spec.temperature
+                ),
+                timeout=(
+                    ov.timeout if ov and ov.timeout != 120.0 else spec.timeout
+                ),
+                caps=(
+                    ov.caps
+                    if ov and ov.caps != ModelCaps()
+                    else spec.caps
+                ),
+                rpm=(ov.rpm if ov and ov.rpm else spec.rpm),
+                max_concurrency=(
+                    ov.max_concurrency if ov and ov.max_concurrency
+                    else spec.max_concurrency
+                ),
+            )
+        return {
+            n: e for n, e in out.items()
+            if e.base_url and e.api_key and e.model
+        }
+
     def resolve(self, role: str) -> list[tuple[str, ModelEntry]]:
         """Ordered (name, entry) fallback chain for a role; unknown names
         and unconfigured entries are dropped."""
-        entries = self.cfg.effective_models()
+        entries = self._entries()
         out: list[tuple[str, ModelEntry]] = []
         seen: set[str] = set()
         for name in self.cfg.role_chain(role):
@@ -309,7 +389,35 @@ class LLMClient:
             _j(usage_d), finish, _j(msg),
         )
         log.debug("LLM resp full | %s", _j(msg))
+        self.record_usage(
+            name,
+            Usage(
+                prompt_tokens=int(usage_d.get("prompt_tokens") or 0),
+                completion_tokens=int(usage_d.get("completion_tokens") or 0),
+                images=_count_images(messages),
+            ),
+        )
         return msg
+
+    # ------------------------------------------------------------ ledger
+    def record_usage(self, name: str, usage, when=None) -> None:
+        """Cost bookkeeping: usage + computed price into the ledger.
+        Never raises — accounting must not take down a live answer."""
+        if self.costs is None:
+            return
+        try:
+            from muze.model_catalog import Pricing
+
+            pricing = self._pricing.get(name)
+            cost = None
+            if pricing is not None:
+                if isinstance(pricing, Pricing):
+                    cost = pricing.cost(usage, when)
+                elif callable(pricing):
+                    cost = float(pricing(usage, when))
+            self.costs.record(name, usage, cost, when)
+        except Exception:
+            log.debug("cost recording failed for %s", name, exc_info=True)
 
     async def vision_describe(self, image_path: str | Path, question: str) -> str:
         """Ask a vision-capable model about a local image file.
@@ -368,6 +476,14 @@ class LLMClient:
             usage = getattr(resp, "usage", None)
             usage_d = usage.model_dump() if usage else {}
             log.info("LLM resp | usage=%s vision | %s", _j(usage_d), _j(text))
+            self.record_usage(
+                name,
+                Usage(
+                    prompt_tokens=int(usage_d.get("prompt_tokens") or 0),
+                    completion_tokens=int(usage_d.get("completion_tokens") or 0),
+                    images=1,
+                ),
+            )
             return text
         raise last_err if last_err else RuntimeError("no vision model")
 
@@ -379,7 +495,7 @@ class LLMClient:
         SiliconFlow, Moonshot, then the one-api/new-api dashboard API that
         most OpenAI-compatible aggregators expose).
         """
-        e = self.cfg.effective_models().get(name)
+        e = self._entries().get(name)
         if not e or not e.base_url:
             return {"model": name, "ok": False, "error": "未配置"}
         base = e.base_url.rstrip("/")

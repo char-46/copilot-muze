@@ -95,7 +95,7 @@ def run_cli(argv: list[str]) -> int:
                 qq_cache_dir=cfg.ingest.qq_cache_dir,
             )
             service = ControlService(cfg, adapter, repo, chatlog, runtime)
-            llm = LLMClient(cfg.llm)
+            llm = LLMClient(cfg.llm, data_dir=cfg.storage.data_dir)
             service.agent = Agent(service, repo, llm, chatlog, cfg.llm.agent_max_steps)
 
             from muze.skills import SkillStore
