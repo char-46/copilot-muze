@@ -54,8 +54,49 @@ ingest:
     rescan_interval_min: 30   # periodic rescan (catches self-sent + missed events); 0 = off
     rescan_active_window_h: 24  # rescan only conversations active within this window
     reconnect_gap_sec: 60     # after a drop longer than this, reconnect triggers an immediate catch-up pull
+    # --- anti-ban pacing ---
+    jitter_pct: 0.5           # randomize page/conv delays by +-50% (bot fingerprint avoidance)
+    daily_page_budget: 4000   # whole-process page pulls per day; 0 = off. Spent budget stops
+                              # pulls until tomorrow (manual /sync force bypasses)
+    fail_streak_limit: 5      # consecutive failed pages before ALL pulls back off
+    risk_backoff_sec: 900     # backoff step; doubles per additional trip...
+    risk_backoff_max_sec: 86400  # ...up to a day. Errors that smell like risk control
+                              # (风控/冻结/too many...) trip the backoff IMMEDIATELY
   media_download_concurrency: 3
   media_transcode_silk: true  # decode SILK voice to a playable .wav (raw .silk kept too)
+
+  # --- perception (background, never blocks ingestion) ---
+  asr:
+    enabled: true
+    provider: auto            # auto | api | local | qq | "" (off)
+                              # api  -> llm.models entry routed via llm.roles.asr
+                              #         (any OpenAI-compatible /audio/transcriptions:
+                              #          whisper-1, SenseVoice, ...)
+                              # local-> faster-whisper on CPU (optional dep:
+                              #          uv add faster-whisper)
+                              # qq   -> reserved: the protocol side has no
+                              #          transcription API today
+                              # auto -> api if configured, else local, else off
+    language: zh
+    max_per_pass: 8           # clips transcribed per enrichment pass
+    local_model: small        # faster-whisper size (tiny/base/small/...)
+    min_duration_sec: 1.0     # shorter clips are skipped
+  ocr:
+    enabled: true
+    provider: auto            # auto | local | llm | "" (off)
+                              # local-> rapidocr-onnxruntime (optional dep:
+                              #          uv add rapidocr-onnxruntime)
+                              # llm  -> the ocr role chain (multimodal reads it)
+                              # auto -> local if importable, else llm
+    max_per_pass: 8           # images per pass
+    min_text_chars: 4         # shorter results = "no text" (photos stay photos)
+  value:
+    enabled: true             # cheap model scores messages 0..3 (value role)
+    batch_size: 40            # messages per LLM call
+    per_pass: 200             # per loop pass
+    lookback_days: 3          # only recent history gets scored
+    rag_min_value: 1          # RAG chat windows skip messages scored below this
+                              # (NULL=unjudged keeps indexing; 0 = filter off)
 
 control:
   controller: [10000]         # controller QQ uins allowed to command the copilot (who)

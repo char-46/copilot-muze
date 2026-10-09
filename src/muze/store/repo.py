@@ -359,6 +359,61 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def media_pending_enrichment(
+        self, kinds: list[str], limit: int = 20
+    ) -> list[dict]:
+        """Done media of the given kinds with no summary yet — the
+        perception pass (ASR for voice, OCR for images) works this queue."""
+        qs = ",".join("?" for _ in kinds)
+        async with self.conn.execute(
+            f"SELECT * FROM media WHERE status='done' AND kind IN ({qs}) "
+            "AND summary IS NULL AND file_path IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (*kinds, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def message_text(self, scene: str, peer_id: int, message_seq: int) -> str:
+        async with self.conn.execute(
+            "SELECT text_content FROM messages WHERE scene=? AND peer_id=? AND message_seq=?",
+            (scene, peer_id, message_seq),
+        ) as cur:
+            row = await cur.fetchone()
+        return (row[0] if row else "") or ""
+
+    async def update_message_text(
+        self, scene: str, peer_id: int, message_seq: int, text: str
+    ) -> None:
+        await self.conn.execute(
+            "UPDATE messages SET text_content=? WHERE scene=? AND peer_id=? AND message_seq=?",
+            (text, scene, peer_id, message_seq),
+        )
+        await self.conn.commit()
+
+    async def set_message_values(self, rows: list[tuple[int, int]]) -> None:
+        """Batch-persist value scores: [(message rowid, score 0..3)]."""
+        await self.conn.executemany(
+            "UPDATE messages SET value=? WHERE rowid=?",
+            [(score, rid) for rid, score in rows],
+        )
+        await self.conn.commit()
+
+    async def messages_unjudged(
+        self, lookback_days: int, limit: int = 200
+    ) -> list[dict]:
+        """Recent text messages the value scorer has not judged yet,
+        oldest first (they are the furthest from falling out of window)."""
+        cutoff = _now() - lookback_days * 86400
+        async with self.conn.execute(
+            "SELECT rowid AS _rid, scene, peer_id, message_seq, sender_id, text_content "
+            "FROM messages WHERE value IS NULL AND text_content IS NOT NULL "
+            "AND TRIM(text_content) != '' AND time >= ? ORDER BY rowid ASC LIMIT ?",
+            (cutoff, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def list_media(
         self,
         kind: str | None = None,

@@ -297,9 +297,22 @@ class RagIndexer:
             docs: list[dict] = []
             window: list[dict] = []
             size = 0
+            # value filter (ingest.value.rag_min_value): messages an LLM
+            # explicitly scored BELOW the threshold are noise — greetings,
+            # stickers, emoji spam — and never enter the vector space.
+            # NULL (unjudged) keeps the old behavior: value recognition is
+            # an optimization, not a gate.
+            minv = 0
+            try:
+                minv = int(self.cfg.ingest.value.rag_min_value or 0)
+            except Exception:
+                minv = 0
             for m in msgs:
                 text = (m.get("text_content") or "").strip()
                 if not text:
+                    continue
+                v = m.get("value")
+                if minv > 0 and v is not None and int(v) < minv:
                     continue
                 window.append(m)
                 size += len(text)

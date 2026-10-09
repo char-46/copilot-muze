@@ -16,8 +16,12 @@ silent hole below ``last_seq`` (which previously required ``/sync force``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import random
 import time
+from datetime import date as _date
+from pathlib import Path
 
 from muze.chatlog import ChatLog, conv_id
 from muze.config import MuzeConfig, is_control_conversation
@@ -27,6 +31,74 @@ from muze.provider.base import ProtocolAdapter, ProtocolError
 from muze.store.repo import Repository
 
 log = logging.getLogger("muze.backfill")
+
+# ------------------------------------------------- anti-ban pacing (shared)
+# History pulls are the main account-risk surface. Three shared guards:
+#  - jitter: randomized page/conv delays (a metronome-exact rate is the
+#    classic bot fingerprint)
+#  - daily page budget: persisted in <data_dir>/pull_budget.json, shared by
+#    every Backfiller over the store (and across restarts)
+#  - risk backoff: consecutive failed pages — or an error that smells like
+#    risk control (风控/冻结/frequency...) — pause ALL pulls process-wide,
+#    doubling per additional trip up to a day
+_RISK_WORDS = ("风控", "冻结", "frozen", "risk", "blocked", "too many", "频率", "频繁")
+_FAIL_STREAK = 0
+_RISK_UNTIL = 0.0
+_RISK_NEXT_SEC = 0.0
+
+
+def _jittered(base: float, jitter_pct: float) -> float:
+    j = max(0.0, min(0.95, float(jitter_pct or 0)))
+    return max(0.0, float(base) * (1.0 + random.uniform(-j, j)))
+
+
+def _note_pull_success() -> None:
+    global _FAIL_STREAK, _RISK_NEXT_SEC
+    _FAIL_STREAK = 0
+    _RISK_NEXT_SEC = 0.0
+
+
+def _note_pull_failure(bf, err_text: str = "") -> float:
+    """Register a failed page; returns the cooldown started (0 = none)."""
+    global _FAIL_STREAK, _RISK_UNTIL, _RISK_NEXT_SEC
+    _FAIL_STREAK += 1
+    t = str(err_text or "").lower()
+    risky = any(w in t for w in _RISK_WORDS)
+    if risky or _FAIL_STREAK >= bf.fail_streak_limit:
+        step = bf.risk_backoff_sec if _RISK_NEXT_SEC <= 0 else _RISK_NEXT_SEC * 2
+        step = min(step, bf.risk_backoff_max_sec)
+        _RISK_NEXT_SEC = step
+        _RISK_UNTIL = time.monotonic() + step
+        _FAIL_STREAK = 0
+        return step
+    return 0.0
+
+
+def _risk_paused() -> tuple[bool, float]:
+    left = _RISK_UNTIL - time.monotonic()
+    return (left > 0.0, max(0.0, left))
+
+
+async def _budget_take(data_dir: str, pages: int = 1) -> int:
+    """Count `pages` against today's pull budget; returns today's total."""
+    path = Path(data_dir) / "pull_budget.json"
+
+    def _op() -> int:
+        today = _date.today().isoformat()
+        try:
+            d = json.loads(path.read_text("utf-8"))
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        if d.get("date") != today:
+            d = {"date": today, "pages": 0}
+        d["pages"] = int(d.get("pages") or 0) + int(pages)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(d), "utf-8")
+        return d["pages"]
+
+    return await asyncio.to_thread(_op)
 
 # ------------------------------------------------------------------ dedup
 # One QQ behind several endpoints (main + milky-2) shares ONE repo: several
@@ -191,6 +263,22 @@ class Backfiller:
         )
 
         while pages < bf.max_pages_per_conv and not self._stop.is_set():
+            paused, left = _risk_paused()
+            if paused:
+                log.warning(
+                    "backfill %s skipped: risk-control backoff active (%.0fs left)",
+                    conv_id(scene, peer_id), left,
+                )
+                break
+            if bf.daily_page_budget > 0 and not force:
+                used = await _budget_take(self.cfg.storage.data_dir, 1)
+                if used > bf.daily_page_budget:
+                    log.info(
+                        "backfill %s stopped: daily page budget %s spent (%s used); "
+                        "pulls resume tomorrow (manual /sync force bypasses)",
+                        conv_id(scene, peer_id), bf.daily_page_budget, used,
+                    )
+                    break
             try:
                 if caps.history_start_seq and cursor is not None:
                     res = await self.adapter.get_history_messages(
@@ -199,8 +287,16 @@ class Backfiller:
                 else:
                     res = await self.adapter.get_history_messages(scene, peer_id, limit=bf.page_limit)
             except ProtocolError as e:
-                log.warning("backfill %s failed: %s", conv_id(scene, peer_id), e)
+                step = _note_pull_failure(bf, str(e))
+                if step:
+                    log.warning(
+                        "backfill %s failed (%s); ALL pulls pause %.0fs (risk backoff)",
+                        conv_id(scene, peer_id), e, step,
+                    )
+                else:
+                    log.warning("backfill %s failed: %s", conv_id(scene, peer_id), e)
                 break
+            _note_pull_success()
 
             pages += 1
             page_new = 0
@@ -248,7 +344,7 @@ class Backfiller:
             await self.repo.set_bf_state(
                 scene, peer_id, cursor=cursor, target=stop_watermark, since=since
             )
-            await asyncio.sleep(bf.page_delay)
+            await asyncio.sleep(_jittered(bf.page_delay, bf.jitter_pct))
 
         if done:
             await self.repo.clear_bf_state(scene, peer_id)
@@ -334,7 +430,12 @@ class Backfiller:
                         await reporter.maybe_tick()
                     except Exception as e:
                         log.warning("backfill conv %s crashed: %s", conv_id(scene, peer), e)
-                    await asyncio.sleep(self.cfg.ingest.backfill.conv_delay)
+                    await asyncio.sleep(
+                        _jittered(
+                            self.cfg.ingest.backfill.conv_delay,
+                            self.cfg.ingest.backfill.jitter_pct,
+                        )
+                    )
 
             await asyncio.gather(*(worker() for _ in range(concurrency)))
             new_total = counts["new"]
@@ -411,7 +512,7 @@ class Backfiller:
             if cursor is not None and res.next_message_seq >= cursor:
                 break  # pager cannot go further on this protocol side
             cursor = res.next_message_seq
-            await asyncio.sleep(bf.page_delay)
+            await asyncio.sleep(_jittered(bf.page_delay, bf.jitter_pct))
         return {
             "pages": fetched,
             "seen": seen,
@@ -443,6 +544,13 @@ class Backfiller:
         new = 0
         fetched = 0
         while fetched < pages and not self._stop.is_set():
+            paused, left = _risk_paused()
+            if paused:
+                log.warning(
+                    "deep pull %s stopped: risk-control backoff (%.0fs left)",
+                    conv_id(scene, peer_id), left,
+                )
+                break
             try:
                 if caps.history_start_seq and cursor is not None:
                     res = await self.adapter.get_history_messages(
@@ -451,8 +559,14 @@ class Backfiller:
                 else:
                     res = await self.adapter.get_history_messages(scene, peer_id, limit=bf.page_limit)
             except ProtocolError as e:
-                log.warning("deep pull %s failed: %s", conv_id(scene, peer_id), e)
+                step = _note_pull_failure(bf, str(e))
+                log.warning(
+                    "deep pull %s failed: %s%s",
+                    conv_id(scene, peer_id), e,
+                    f" (risk backoff {step:.0}s)" if step else "",
+                )
                 break
+            _note_pull_success()
             fetched += 1
             page_new = 0
             for m in res.messages:
@@ -467,7 +581,7 @@ class Backfiller:
             if cursor is not None and res.next_message_seq >= cursor:
                 break
             cursor = res.next_message_seq
-            await asyncio.sleep(bf.page_delay)
+            await asyncio.sleep(_jittered(bf.page_delay, bf.jitter_pct))
         log.info("deep pull %s: %s new in %s pages", conv_id(scene, peer_id), new, fetched)
         return new
 

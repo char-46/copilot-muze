@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+import pydantic
 from pydantic import BaseModel, Field, ValidationError
 
 
@@ -103,6 +104,67 @@ class BackfillConfig(BaseModel):
     rescan_active_window_h: float = 24.0
     reconnect_gap_sec: float = 60.0  # min offline gap before a reconnect
     # triggers an immediate catch-up pull (smaller blips wait for rescan)
+    # --- pull pacing / account-safety (anti-ban) ---
+    # randomize page/conv delays by +-this fraction (0 = fixed cadence):
+    # a metronome-exact request rate is the classic bot fingerprint
+    jitter_pct: float = 0.5
+    # whole-process page budget per day (0 = off). Roaming pulls are the
+    # main risk-control surface; once the budget is spent, pulls stop until
+    # the next local day (manual /sync force still works)
+    daily_page_budget: int = 4000
+    # consecutive failed pages before all pulls back off (suspected risk
+    # control); the cooldown doubles per additional streak up to a day
+    fail_streak_limit: int = 5
+    risk_backoff_sec: float = 900.0
+    risk_backoff_max_sec: float = 86400.0
+
+
+class AsrConfig(BaseModel):
+    """Voice transcription chain: api | local | qq | auto | "" (off).
+
+    - api: any OpenAI-compatible /audio/transcriptions endpoint (whisper-1,
+      SenseVoice, ...) — configured as an llm.models entry routed via the
+      llm.roles "asr" chain
+    - local: faster-whisper on CPU (optional dependency, installed separately)
+    - qq: the protocol side itself — Milky/LLBot exposes NO transcription
+      API today, so this is a reserved stub that reports unsupported
+    - auto: api when configured, else local when importable, else off
+    """
+
+    enabled: bool = True
+    provider: str = "auto"  # auto | api | local | qq | ""
+    language: str = "zh"
+    max_per_pass: int = 8  # clips transcribed per enrichment pass
+    local_model: str = "small"  # faster-whisper model size
+    min_duration_sec: float = 1.0  # shorter clips are not worth a call
+
+
+class OcrConfig(BaseModel):
+    """Image text extraction chain: local | llm | auto | "" (off).
+
+    - local: rapidocr-onnxruntime (optional dependency) — fast, CPU, free
+    - llm: the ocr role chain (multimodal model reads the image verbatim)
+    - auto: local when importable, else llm
+    """
+
+    enabled: bool = True
+    provider: str = "auto"  # auto | local | llm | ""
+    max_per_pass: int = 8  # images OCRed per enrichment pass
+    min_text_chars: int = 4  # shorter OCR results are treated as "no text"
+
+
+class ValueConfig(BaseModel):
+    """Message value recognition: a cheap model scores archived messages
+    0..3 so RAG chat indexing (and future prioritization) can skip noise.
+
+    0 = greeting/sticker/no information  1 = small talk  2 = facts/plans/
+    opinions/questions  3 = important (contacts, dates, decisions)."""
+
+    enabled: bool = True
+    batch_size: int = 40  # messages scored per LLM call
+    per_pass: int = 200  # max messages judged per loop pass
+    lookback_days: int = 3  # only recent history gets scored
+    rag_min_value: int = 1  # chat windows need a message >= this (0 = off)
 
 
 class IngestConfig(BaseModel):
@@ -118,6 +180,9 @@ class IngestConfig(BaseModel):
     # dedup/adoption — file rows match by QQ's md5 file_hash, images/videos
     # by md5-embedded cache filenames; empty disables all of it
     qq_cache_dir: str = ""
+    asr: AsrConfig = Field(default_factory=AsrConfig)
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
+    value: ValueConfig = Field(default_factory=ValueConfig)
 
 
 class ControlConfig(BaseModel):
@@ -181,6 +246,13 @@ class LLMConfig(BaseModel):
     models: dict[str, ModelEntry] = Field(default_factory=dict)
     roles: dict[str, list[str]] = Field(default_factory=dict)
     prefix: str = "::"  # wake prefix for direct LLM chat (customizable)
+
+    @pydantic.field_validator("models", "roles", mode="before")
+    @classmethod
+    def _none_means_empty(cls, v):
+        # `models:` with only commented examples parses as YAML null
+        return {} if v is None else v
+
     agent_max_steps: int = 48
     turn_timeout_sec: float = 300.0  # STALL cap: a tool round stuck this long
     # is aborted; there is no wall-clock cap on slow-but-progressing turns
@@ -288,6 +360,11 @@ class RagEmbedding(BaseModel):
     vram_evict_pct: float = 85.0  # system-wide VRAM usage >= this evicts a GPU-resident model to RAM (0=off)
     cpu_max_threads: int = 4  # cap for CPU inference (dynamic below this)
     unload_idle_sec: float = 1800.0  # free the local model after this idle (0=never)
+    # busy unload: a machine grinding at these levels doesn't just skip
+    # indexing — the resident model is dropped entirely (RAM/VRAM back);
+    # it reloads on demand once pressure passes. 0 disables either check.
+    busy_unload_cpu_pct: float = 90.0
+    busy_unload_gpu_util: float = 95.0
 
 
 class RagConfig(BaseModel):

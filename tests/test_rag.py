@@ -133,6 +133,53 @@ async def test_rag_chat_windows_optin(repo):
     assert "加班" in hits[0]["text"]
 
 
+async def test_rag_chat_value_filter_skips_noise(repo):
+    """Messages the value scorer marked 0 (寒暄/表情) never enter the vector
+    space; NULL (unjudged) keeps the old behavior."""
+    from muze.provider.milky.models import IncomingMessage
+
+    def mk(seq, text):
+        return IncomingMessage.from_raw(
+            {
+                "message_scene": "group",
+                "peer_id": 8,
+                "message_seq": seq,
+                "sender_id": 42,
+                "time": 1790000000 + seq,
+                "segments": [{"type": "text", "data": {"text": text}}],
+            }
+        )
+
+    for seq, text, val in [
+        (1, "哈哈哈哈", 0),  # noise -> dropped
+        (2, "明天上午十点签合同", 2),  # informational -> kept
+        (3, "收到请回复", None),  # unjudged -> kept (value is no gate)
+    ]:
+        await repo.upsert_message(mk(seq, text), text, "event")
+        if val is not None:
+            async with repo.conn.execute(
+                "SELECT rowid FROM messages WHERE scene='group' AND peer_id=8 "
+                "AND message_seq=?",
+                (seq,),
+            ) as cur:
+                (rid,) = await cur.fetchone()
+            await repo.set_message_values([(rid, val)])
+
+    cfg = MuzeConfig()
+    cfg.rag.enabled = True
+    cfg.rag.chat = True
+    cfg.ingest.value.rag_min_value = 1
+    vec = VecStore(repo)
+    await vec.setup()
+    indexer = RagIndexer(repo, vec, FakeEmbedder(), cfg)
+    await indexer.run_once()
+
+    hit = (await indexer.search("合同", k=5, scene="group", peer_id=8))[0]
+    assert "签合同" in hit["text"]
+    assert "哈哈哈哈" not in hit["text"]
+    assert "收到请回复" in hit["text"]  # unjudged survives the filter
+
+
 async def test_rag_chat_covers_all_conversations_no_starvation(repo):
     """Regression: _index_chat used to visit only the 300 most-recently-active
     conversations (list_conversations' cap ordered by last_active_at DESC) ——

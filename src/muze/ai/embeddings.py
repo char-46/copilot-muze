@@ -43,6 +43,8 @@ class Embedder:
         self._fails = 0
         self._cooldown_until = 0.0
         self._last_use = 0.0
+        self._last_busy_unload = 0.0  # debounce for busy-unload vs reload churn
+        self._BUSY_RELOAD_GRACE = 180.0  # seconds a busy-unloaded model stays down
 
     # ------------------------------------------------------------ status
     @property
@@ -98,6 +100,9 @@ class Embedder:
         if not self._local_enabled:
             return
         if self._local is not None and not force:
+            return
+        if time.monotonic() - self._last_busy_unload < self._BUSY_RELOAD_GRACE:
+            # freshly unloaded under load: don't reload into the same storm
             return
         device = self.cfg.device
         if device == "auto":
@@ -194,6 +199,42 @@ class Embedder:
             return True
 
     # ------------------------------------------------- vram stewardship
+    async def unload_if_busy(self, governor=None) -> str | None:
+        """Sustained machine load (user gaming / compiling / another model):
+        unlike the idle gates — which merely skip indexing — this FREES the
+        resident model's RAM/VRAM entirely. It reloads on demand after a
+        grace period once pressure passes (prepare's debounce). Returns the
+        "why" string when an unload happened."""
+        if self._local is None or governor is None:
+            return None
+        why: list[str] = []
+        cpu_thr = float(self.cfg.busy_unload_cpu_pct or 0)
+        gpu_thr = float(self.cfg.busy_unload_gpu_util or 0)
+        if cpu_thr > 0:
+            try:
+                cpu = governor.cpu_busy()
+            except Exception:
+                cpu = None
+            if cpu is not None and cpu >= cpu_thr:
+                why.append(f"cpu {cpu:.0f}%>={cpu_thr:.0f}%")
+        if gpu_thr > 0:
+            try:
+                gpu = governor.gpu_util()
+            except Exception:
+                gpu = None
+            if gpu is not None and gpu >= gpu_thr:
+                why.append(f"gpu {gpu:.0f}%>={gpu_thr:.0f}%")
+        if not why:
+            return None
+        async with self._lock:
+            if self._local is None:
+                return None
+            self._local = None
+            self._device = ""
+            self._last_busy_unload = time.monotonic()
+            log.info("RAG embedder unloaded under load (%s)", " & ".join(why))
+            return " & ".join(why)
+
     async def evict_if_vram_pressure(self, governor=None) -> str | None:
         """System-wide VRAM pressure (a game started, another app's model,
         ...): get OUR model off the GPU right now. sentence-transformers

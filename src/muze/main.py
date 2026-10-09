@@ -292,6 +292,8 @@ class App:
         self._last_profile_refresh = 0.0
         self._enrich_task = None
         self._vram_task = None
+        self._perception_task = None
+        self._value_task = None
 
         # skills / scheduler / reloader
         from muze.reloader import Reloader
@@ -458,6 +460,8 @@ class App:
         self._enrich_task = asyncio.create_task(self._startup_enrich())
         self._rag_task = asyncio.create_task(self._rag_loop())
         self._vram_task = asyncio.create_task(self._vram_steward_loop())
+        self._perception_task = asyncio.create_task(self._perception_loop())
+        self._value_task = asyncio.create_task(self._value_loop())
         if os.environ.get("MUZE_SUPERVISOR_PID"):
             self._sup_task = asyncio.create_task(self._supervisor_watch())
         if spawn_console:
@@ -703,10 +707,149 @@ class App:
             try:
                 await rag.embedder.evict_if_vram_pressure(rag.governor)
                 await rag.embedder.promote_to_gpu_if_fits(rag.governor)
+                await rag.embedder.unload_if_busy(rag.governor)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("vram steward pass failed")
+
+    async def _perception_loop(self) -> None:
+        """Background ASR + OCR enrichment. Voice clips get transcripts
+        written into the message text; text-bearing images get an OCR
+        summary (media.summary, reused by the agent and the webui). A few
+        per pass, forever — best-effort, never blocks ingestion."""
+        import re
+
+        from muze.perception import AsrChain, OcrChain
+
+        acfg, ocfg = self.cfg.ingest.asr, self.cfg.ingest.ocr
+        asr = AsrChain(acfg, self.llm) if acfg.enabled else None
+        ocr = OcrChain(ocfg, self.llm) if ocfg.enabled else None
+        voice_re = re.compile(r"\[语音:[\d.]+s?\]")
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=120)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                done = 0
+                if asr is not None:
+                    done += await self._asr_pass(asr, voice_re)
+                if ocr is not None:
+                    done += await self._ocr_pass(ocr)
+                if done:
+                    log.info("[%s] perception pass: %s media enriched", self.spec.name, done)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("perception pass failed")
+
+    async def _asr_pass(self, asr, voice_re) -> int:
+        acfg = self.cfg.ingest.asr
+        rows = await self.repo.media_pending_enrichment(["record"], acfg.max_per_pass)
+        n = 0
+        for m in rows:
+            if self._stop.is_set():
+                break
+            dur = float(m.get("duration") or 0)
+            if dur and dur < acfg.min_duration_sec:
+                await self.repo.update_media(m["id"], status="done", summary="")
+                continue
+            p = self.media.abs_path(m) if self.media is not None else None
+            if p is None or not p.exists():
+                await self.repo.update_media(m["id"], status="done", summary="")
+                continue
+            try:
+                text = (await asr.transcribe(p)).strip()
+            except Exception as e:
+                log.warning("asr failed for %s: %s", m.get("file_path"), e)
+                continue  # transient-looking: retried on a later pass
+            if not text:
+                await self.repo.update_media(m["id"], status="done", summary="")
+                continue
+            await self.repo.update_media(
+                m["id"], status="done", summary=("[转写] " + text)[:500]
+            )
+            old = await self.repo.message_text(m["scene"], m["peer_id"], m["message_seq"])
+            if old:
+                new = voice_re.sub(lambda _: f"[语音转写] {text}", old, count=1)
+                if new == old:  # no placeholder (mixed-content message)
+                    new = old + f"\n[语音转写] {text}"
+                await self.repo.update_message_text(
+                    m["scene"], m["peer_id"], m["message_seq"], new
+                )
+            n += 1
+        return n
+
+    async def _ocr_pass(self, ocr) -> int:
+        ocfg = self.cfg.ingest.ocr
+        rows = await self.repo.media_pending_enrichment(["image"], ocfg.max_per_pass)
+        n = 0
+        for m in rows:
+            if self._stop.is_set():
+                break
+            p = self.media.abs_path(m) if self.media is not None else None
+            if p is None or not p.exists():
+                await self.repo.update_media(m["id"], status="done", summary="")
+                continue
+            try:
+                text = (await ocr.extract_text(p)).strip()
+            except Exception as e:
+                log.warning("ocr failed for %s: %s", m.get("file_path"), e)
+                continue
+            if len(text) >= ocfg.min_text_chars:
+                await self.repo.update_media(
+                    m["id"], status="done", summary=("OCR: " + text)[:500]
+                )
+                n += 1
+            else:
+                # checked, no meaningful text (a photo stays a photo); don't
+                # re-check — an LLM caption may still fill summary later
+                await self.repo.update_media(m["id"], status="done", summary="")
+        return n
+
+    async def _value_loop(self) -> None:
+        """Message value recognition: a cheap model scores recent archived
+        messages 0..3; explicit-zero messages are skipped by RAG chat
+        indexing (noise never enters the vector space)."""
+        from muze.perception import ValueScorer
+
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=180)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                vcfg = self.cfg.ingest.value
+                if not vcfg.enabled:
+                    continue
+                scorer = ValueScorer(vcfg, self.llm)
+                if not scorer.available():
+                    continue
+                rows = await self.repo.messages_unjudged(
+                    vcfg.lookback_days, vcfg.per_pass
+                )
+                if not rows:
+                    continue
+                total = 0
+                for i in range(0, len(rows), vcfg.batch_size):
+                    batch = rows[i:i + vcfg.batch_size]
+                    try:
+                        scored = await scorer.score(batch)
+                    except Exception as e:
+                        log.warning("value scoring batch failed: %s", e)
+                        break
+                    if scored:
+                        await self.repo.set_message_values(scored)
+                        total += len(scored)
+                if total:
+                    log.info("[%s] value scoring: %s messages judged", self.spec.name, total)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("value scoring pass failed")
 
     async def _maintenance_loop(self) -> None:
         from muze.profiles import refresh_profiles
@@ -787,6 +930,10 @@ class App:
             self._rag_task.cancel()
         if getattr(self, "_vram_task", None) is not None:
             self._vram_task.cancel()
+        if getattr(self, "_perception_task", None) is not None:
+            self._perception_task.cancel()
+        if getattr(self, "_value_task", None) is not None:
+            self._value_task.cancel()
         rf = getattr(self.runtime, "rag_force", None)
         if rf is not None and not rf.done():
             rf.cancel()
