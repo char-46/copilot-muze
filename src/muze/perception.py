@@ -233,28 +233,24 @@ class ValueScorer:
     def available(self) -> bool:
         return bool(self.llm.resolve("value"))
 
-    async def score(self, rows: list[dict]) -> list[tuple[int, int]]:
-        """rows: repo.messages_unjudged dicts (with _rid). Returns
-        [(_rid, score)] for every parseable line; unmentioned rows are
-        NOT returned (caller may re-judge them later)."""
-        if not rows:
-            return []
+    @staticmethod
+    def build_prompt(rows: list[dict]) -> str:
         lines = "\n".join(
             f"{i+1}\t{(r.get('text_content') or '').strip()[:200]}"
             for i, r in enumerate(rows)
         )
-        msg = await self.llm.chat(
-            [{"role": "user", "content": _VALUE_PROMPT.format(lines=lines)}],
-            role="value",
-        )
-        text = (msg.get("content") or "").strip()
-        m = _JSON_RE.search(text)
+        return _VALUE_PROMPT.format(lines=lines)
+
+    @staticmethod
+    def parse_scores(rows: list[dict], text: str) -> list[tuple[int, int]]:
+        """Model reply -> [(_rid, score)]; unmentioned/unparseable dropped."""
+        m = _JSON_RE.search(text or "")
         if not m:
-            raise ValueError(f"value scoring: no JSON in reply: {text[:120]}")
+            raise ValueError(f"value scoring: no JSON in reply: {(text or '')[:120]}")
         try:
             parsed = json.loads(m.group(0))
         except json.JSONDecodeError as e:
-            raise ValueError(f"value scoring: bad JSON ({e}): {text[:120]}") from e
+            raise ValueError(f"value scoring: bad JSON ({e}): {(text or '')[:120]}") from e
         out: list[tuple[int, int]] = []
         for k, v in parsed.items():
             try:
@@ -265,3 +261,14 @@ class ValueScorer:
             if 0 <= idx < len(rows) and 0 <= score <= 3:
                 out.append((rows[idx]["_rid"], score))
         return out
+
+    async def score(self, rows: list[dict]) -> list[tuple[int, int]]:
+        """rows: repo.messages_unjudged dicts (with _rid). Returns
+        [(_rid, score)] for every parseable line; unmentioned rows are
+        NOT returned (caller may re-judge them later)."""
+        if not rows:
+            return []
+        msg = await self.llm.chat(
+            [{"role": "user", "content": self.build_prompt(rows)}], role="value"
+        )
+        return self.parse_scores(rows, msg.get("content") or "")

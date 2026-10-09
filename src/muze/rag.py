@@ -312,7 +312,8 @@ class RagIndexer:
                 if not text:
                     continue
                 v = m.get("value")
-                if minv > 0 and v is not None and int(v) < minv:
+                # -1 = value scoring in flight (a batch job owns it)
+                if minv > 0 and v is not None and 0 <= int(v) < minv:
                     continue
                 window.append(m)
                 size += len(text)

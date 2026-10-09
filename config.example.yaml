@@ -140,6 +140,22 @@ llm:
     #   model: glm-4v-plus
     #   caps: {vision: true}
   catalog: ""                  # "" -> <data_dir>/models.py; a path; or "off"
+
+  # --- async Batch API lane (llm.batch): ~50% cheaper (Pricing.batch_factor),
+  # answered within 24h. For delay-tolerant loads only — currently value
+  # scoring: with >= min_requests unjudged messages, one /v1/batch job
+  # replaces the inline scoring rounds (rows marked value=-1 while in
+  # flight; a dead job auto-resets them to the inline path). Interactive
+  # turns NEVER batch. Provider must support /v1/batch + /v1/files
+  # (OpenAI, DeepSeek, SiliconFlow, GLM async all do).
+  batch:
+    enabled: false
+    min_requests: 50          # inline below this backlog, batch above
+    max_requests: 2000        # one batch file's request cap
+    poll_interval_sec: 600    # completion polling cadence
+    completion_window: 24h
+    role: value               # role chain used for batch submissions
+
   roles:
     # chat:   [chat]              # the agent / converse loop
     # vision: [glm-v, chat]       # image understanding

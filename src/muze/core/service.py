@@ -1931,6 +1931,7 @@ class Runtime:
         self.backfiller = None  # Backfiller, injected by main
         self.media = None  # MediaStore, injected by main (path addressing)
         self.rag = None  # RagIndexer, injected by main
+        self.batch = None  # BatchRunner (async /v1/batch lane), injected by main
         self.rag_force = None  # forced indexing task (/rag run)
         self.rag_stop = None  # its stop event
         self.log_path = ""

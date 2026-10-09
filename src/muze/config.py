@@ -241,6 +241,20 @@ DEFAULT_ROLE_CHAINS: dict[str, list[str]] = {
 }
 
 
+class BatchConfig(BaseModel):
+    """Async /v1/batch jobs (OpenAI-compatible; DeepSeek/GLM/SiliconFlow all
+    speak it): ~50% cheaper, results within a 24h window. Meant for the
+    delay-tolerant background loads (value scoring, nightly digest, OCR) —
+    interactive turns NEVER go through batch."""
+
+    enabled: bool = False
+    min_requests: int = 50  # don't bother below this many pending requests
+    max_requests: int = 2000  # provider caps a batch file (50000 OpenAI)
+    poll_interval_sec: float = 600.0
+    completion_window: str = "24h"
+    role: str = "value"  # role chain used for batch submissions
+
+
 class LLMConfig(BaseModel):
     chat: LLMEndpoint = Field(default_factory=LLMEndpoint)  # legacy "chat" entry
     vision: LLMEndpoint = Field(default_factory=LLMEndpoint)  # legacy "vision" entry
@@ -249,6 +263,7 @@ class LLMConfig(BaseModel):
     # python model catalog (capability declarations + pricing functions):
     # a user models.py; "" = <storage.data_dir>/models.py, "off" disables.
     catalog: str = ""
+    batch: BatchConfig = Field(default_factory=BatchConfig)
     prefix: str = "::"  # wake prefix for direct LLM chat (customizable)
 
     @pydantic.field_validator("models", "roles", mode="before")

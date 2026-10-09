@@ -93,8 +93,9 @@ class PeakOffPeak:
 class Pricing:
     """Per-model price sheet (CNY). All fields optional.
 
-    cost(usage, when) = tokens*rate*peak_factor + images*flat + audio*flat
-    (modality flats are NOT time-discounted; only token prices are).
+    cost(usage, when) = tokens*rate*peak_factor*[batch_factor] +
+    images*flat + audio*flat (modality flats are NOT time-discounted;
+    only token prices are — batch jobs discount tokens only as well).
     """
 
     input_per_mtok: float = 0.0
@@ -103,12 +104,15 @@ class Pricing:
     audio_per_minute: float = 0.0
     currency: str = "CNY"
     peak: PeakOffPeak | None = None
+    batch_factor: float = 0.5  # async /v1/batch jobs (OpenAI & DeepSeek: 50%)
 
-    def cost(self, usage: Usage, when=None) -> float:
+    def cost(self, usage: Usage, when=None, batch: bool = False) -> float:
         import datetime as _dt
 
         when = when or _dt.datetime.now()
         f = self.peak.factor_at(when) if self.peak else 1.0
+        if batch:
+            f *= self.batch_factor
         tok = (
             usage.prompt_tokens / 1e6 * self.input_per_mtok
             + usage.completion_tokens / 1e6 * self.output_per_mtok
@@ -139,12 +143,12 @@ class ModelSpec:
     pricing: Pricing | PriceFn | None = None
     note: str = ""
 
-    def price_of(self, usage: Usage, when=None) -> float | None:
+    def price_of(self, usage: Usage, when=None, batch: bool = False) -> float | None:
         if self.pricing is None:
             return None
         if callable(self.pricing) and not isinstance(self.pricing, Pricing):
             return float(self.pricing(usage, when))
-        return self.pricing.cost(usage, when)
+        return self.pricing.cost(usage, when, batch=batch)
 
 
 def load_user_catalog(path: str | Path) -> dict[str, ModelSpec]:

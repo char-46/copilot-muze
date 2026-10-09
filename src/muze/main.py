@@ -114,6 +114,7 @@ class App:
         self.media = None
         self.pipeline = None
         self.backfiller = None
+        self.batch = None  # async /v1/batch lane, created in setup()
         self.service = None
         self.account_dir: Path | None = None
         self.degraded = False  # booted from a remembered uin; protocol side down
@@ -295,6 +296,18 @@ class App:
         self._perception_task = None
         self._value_task = None
 
+        # async Batch API lane (value scoring etc.): ~50% cheaper, 24h window
+        self.batch = None
+        if cfg.llm.batch.enabled:
+            from muze.batch import BatchRunner
+
+            self.batch = BatchRunner(
+                self.llm,
+                cfg.llm.batch,
+                Path(cfg.storage.data_dir) / "batch_state.json",
+            )
+            self.runtime.batch = self.batch
+
         # skills / scheduler / reloader
         from muze.reloader import Reloader
         from muze.scheduler import Scheduler
@@ -462,6 +475,10 @@ class App:
         self._vram_task = asyncio.create_task(self._vram_steward_loop())
         self._perception_task = asyncio.create_task(self._perception_loop())
         self._value_task = asyncio.create_task(self._value_loop())
+        if self.batch is not None:
+            self.batch.register_handler("value", self._apply_value_batch)
+            self.batch.register_reset("value", self._reset_value_batch)
+            await self.batch.start()
         if os.environ.get("MUZE_SUPERVISOR_PID"):
             self._sup_task = asyncio.create_task(self._supervisor_watch())
         if spawn_console:
@@ -812,7 +829,9 @@ class App:
     async def _value_loop(self) -> None:
         """Message value recognition: a cheap model scores recent archived
         messages 0..3; explicit-zero messages are skipped by RAG chat
-        indexing (noise never enters the vector space)."""
+        indexing (noise never enters the vector space). With llm.batch
+        enabled and enough backlog, scoring goes through the async Batch
+        API (half price, answered within 24h) instead of inline calls."""
         from muze.perception import ValueScorer
 
         while not self._stop.is_set():
@@ -831,8 +850,15 @@ class App:
                 rows = await self.repo.messages_unjudged(
                     vcfg.lookback_days, vcfg.per_pass
                 )
+                if self.batch is not None:
+                    pending = self.batch.pending_rowids("value")
+                    rows = [r for r in rows if r["_rid"] not in pending]
                 if not rows:
                     continue
+                bcfg = self.cfg.llm.batch
+                if self.batch is not None and len(rows) >= bcfg.min_requests:
+                    if await self._submit_value_batch(rows):
+                        continue
                 total = 0
                 for i in range(0, len(rows), vcfg.batch_size):
                     batch = rows[i:i + vcfg.batch_size]
@@ -850,6 +876,65 @@ class App:
                 raise
             except Exception:
                 log.exception("value scoring pass failed")
+
+    async def _submit_value_batch(self, rows: list[dict]) -> bool:
+        """Group rows into scoring calls and submit one async batch job.
+        Rows are marked value=-1 (in flight) so they aren't resubmitted or
+        indexed meanwhile; the reset hook un-marks if the job dies."""
+        from muze.perception import ValueScorer
+
+        vcfg = self.cfg.ingest.value
+        bcfg = self.cfg.llm.batch
+        items: list[dict] = []
+        rowids: list[int] = []
+        for gi in range(0, len(rows), vcfg.batch_size):
+            grp = rows[gi:gi + vcfg.batch_size]
+            items.append(
+                {
+                    "custom_id": str(gi // vcfg.batch_size),
+                    "messages": [
+                        {"role": "user", "content": ValueScorer.build_prompt(grp)}
+                    ],
+                    "rows": [
+                        {"_rid": r["_rid"], "message_seq": r["message_seq"]}
+                        for r in grp
+                    ],
+                }
+            )
+            rowids.extend(int(r["_rid"]) for r in grp)
+        bid = await self.batch.submit(bcfg.role, "value", items, rowids)
+        if not bid:
+            return False
+        await self.repo.set_message_values([(rid, -1) for rid in rowids])
+        log.info(
+            "[%s] value scoring via batch %s: %s messages in %s calls",
+            self.spec.name, bid, len(rowids), len(items),
+        )
+        return True
+
+    async def _apply_value_batch(self, ctx_items: list[dict], results: dict[str, dict]) -> None:
+        from muze.perception import ValueScorer
+
+        for it in ctx_items:
+            body = results.get(str(it.get("custom_id"))) or {}
+            if "error" in body or not body:
+                continue
+            try:
+                text = body["choices"][0]["message"]["content"] or ""
+            except Exception:
+                continue
+            try:
+                scored = ValueScorer.parse_scores(it.get("rows") or [], text)
+            except ValueError as e:
+                log.warning("batch value parse failed: %s", e)
+                continue
+            if scored:
+                await self.repo.set_message_values(scored)
+
+    async def _reset_value_batch(self, rowids, _results) -> None:
+        """Job died: un-mark its rows so the inline scorer picks them up."""
+        if rowids:
+            await self.repo.set_message_values([(int(r), None) for r in rowids])
 
     async def _maintenance_loop(self) -> None:
         from muze.profiles import refresh_profiles
@@ -945,6 +1030,8 @@ class App:
             await _safe("scheduler.stop", scheduler.stop(), 5)
         if self.backfiller is not None:
             await _safe("backfiller.stop", self.backfiller.stop(), 5)
+        if self.batch is not None:
+            await _safe("batch.stop", self.batch.stop(), 5)
         if self.pipeline is not None:
             await _safe("drain_media", self.pipeline.drain_media(timeout=5), 7)
         if getattr(self, "agent", None) is not None:
