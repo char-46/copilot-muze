@@ -269,10 +269,18 @@ class App:
         self.vec = VecStore(self.repo)
         await self.vec.setup()
         emb = cfg.rag.embedding
-        if not emb.base_url:
-            emb.base_url = cfg.llm.chat.base_url
-        if not emb.api_key:
-            emb.api_key = cfg.llm.chat.api_key
+        if not emb.base_url or not emb.api_key:
+            # remote fallback endpoint: reuse the chat role's first entry
+            # (legacy llm.chat or the multi-model registry, whichever is set)
+            chat_chain = [e for _, e in self.llm.resolve("chat")]
+            if not emb.base_url:
+                emb.base_url = cfg.llm.chat.base_url or (
+                    chat_chain[0].base_url if chat_chain else ""
+                )
+            if not emb.api_key:
+                emb.api_key = cfg.llm.chat.api_key or (
+                    chat_chain[0].api_key if chat_chain else ""
+                )
         self.embedder = _shared_embedder(emb)
         self.governor = ResourceGovernor(cfg.rag)
         self.rag = RagIndexer(
@@ -616,8 +624,8 @@ class App:
         # `::` turns run ASYNC: acknowledge with a session id right away and
         # let the background task deliver the answer, so one slow LLM reply
         # never blocks other conversations (per-chat serialization inside).
-        if is_llm_invocation(text) and self.service.agent is not None:
-            session = self.service.agent.submit(strip_llm_prefix(text), ctx)
+        if is_llm_invocation(text, self.cfg.llm.prefix) and self.service.agent is not None:
+            session = self.service.agent.submit(strip_llm_prefix(text, self.cfg.llm.prefix), ctx)
             await svc.deliver(
                 ctx,
                 CommandOutcome(f"#{session.id} 已受理；/sess {session.id} 查看进度"),

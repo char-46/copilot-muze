@@ -128,13 +128,22 @@ def slash(
     return deco
 
 
-def is_llm_invocation(text: str) -> bool:
-    """LLM messages start with two colons (half/full width): `::` or `：：`."""
-    return len(text) >= 2 and text[0] in ":：" and text[1] in ":："
+def is_llm_invocation(text: str, prefix: str = "::") -> bool:
+    """LLM messages start with the configured wake prefix (llm.prefix).
+    The default all-colon prefix also matches its full-width lookalike
+    (`::` / `：：` and even mixed) so phone inputs keep working."""
+    if not prefix or len(text) < len(prefix):
+        return False
+    if set(prefix) <= {":"}:
+        wide = {":": ":：", "：": ":："}
+        return all(text[i] in wide.get(prefix[i], prefix[i]) for i in range(len(prefix)))
+    return text.startswith(prefix)
 
 
-def strip_llm_prefix(text: str) -> str:
-    return text[2:].strip()
+def strip_llm_prefix(text: str, prefix: str = "::") -> str:
+    if is_llm_invocation(text, prefix):
+        return text[len(prefix):].strip()
+    return text.strip()
 
 
 @dataclass
@@ -290,12 +299,14 @@ class ControlService:
         if text.startswith("/") or (text.startswith(".") and len(text) > 1):
             return await self.run_command(text, ctx)
 
-        # `::` (two colons, half/full width) -> the ONLY way to reach the LLM;
-        # plain chatter never triggers the agent (command/LLM isolation).
-        if is_llm_invocation(text):
-            prompt = strip_llm_prefix(text)
+        # the wake prefix (llm.prefix, default `::` two colons) -> the ONLY
+        # way to reach the LLM; plain chatter never triggers the agent
+        # (command/LLM isolation).
+        pfx = self.cfg.llm.prefix
+        if is_llm_invocation(text, pfx):
+            prompt = strip_llm_prefix(text, pfx)
             if not prompt:
-                return CommandOutcome.err(":: 后面要有内容")
+                return CommandOutcome.err(f"{pfx} 后面要有内容")
             if self.agent is None:
                 return CommandOutcome.err(
                     "未配置 LLM（llm.chat.base_url/api_key/model）；命令仍可用，/help 查看"
@@ -305,7 +316,9 @@ class ControlService:
                 return await self.cmd_sess(["go"], ctx)
             return await self.agent.converse(prompt, ctx)
 
-        return CommandOutcome.err("未响应：命令以 / 或 . 开头；发给 AI 的内容以 :: 开头（两个冒号）")
+        return CommandOutcome.err(
+            f"未响应：命令以 / 或 . 开头；发给 AI 的内容以 {pfx} 开头"
+        )
 
     # ------------------------------------------------------------- sending
     async def deliver(self, ctx: ControlContext, outcome: CommandOutcome) -> None:
@@ -1063,6 +1076,26 @@ class ControlService:
     @slash("version", "/version", "版本与构建信息", scope="app")
     async def cmd_version(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(get_version())
+
+    @slash("balance", "/balance [模型名]", "查询各 LLM 端点的账户余额（llm.models 注册项）", scope="app")
+    async def cmd_balance(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        llm = self.agent.llm if self.agent is not None else None
+        if llm is None:
+            return CommandOutcome.err("LLM 未装配")
+        entries = llm.cfg.effective_models()
+        names = [a for a in args if a in entries] or list(entries)
+        if not names:
+            return CommandOutcome("llm.models 为空（旧式单端点配置，无可查条目）")
+        lines = []
+        for n in names:
+            r = await llm.get_balance(n)
+            e = entries[n]
+            host = e.base_url.split("//", 1)[-1].split("/")[0]
+            if r.get("ok"):
+                lines.append(f"{n} ({e.model} @ {host}): {r['balance']}")
+            else:
+                lines.append(f"{n} ({e.model} @ {host}): {r.get('error', '查询失败')}")
+        return CommandOutcome("\n".join(lines))
 
     @slash("status", "/status", "运行状态、版本、能力、统计")
     async def cmd_status(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
@@ -1840,7 +1873,7 @@ class ControlService:
         if not self.is_controller(scene, peer_id, sender_id):
             return False
         is_cmd = text.startswith("/") or (text.startswith(".") and len(text) > 1)
-        is_llm = is_llm_invocation(text)
+        is_llm = is_llm_invocation(text, self.cfg.llm.prefix)
         if not (is_cmd or is_llm):
             return False
         if scene == "friend":

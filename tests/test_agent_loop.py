@@ -911,7 +911,7 @@ async def test_reasoning_kept_on_message_and_stripped_from_requests():
         return FakeClient()
 
     monkeypatch_client = pytest.MonkeyPatch()
-    monkeypatch_client.setattr(llm, "_chat_client", fake_client)
+    monkeypatch_client.setattr(llm, "_clients", {"chat": fake_client()})
     try:
         chunks: list[int] = []
         msg = await llm.chat(

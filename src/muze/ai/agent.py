@@ -765,8 +765,8 @@ class Agent:
         # strips it in service.execute, but other fronts (webui AI tab) call
         # converse directly, so strip defensively here too.
         text = (text or "").strip()
-        if is_llm_invocation(text):
-            text = strip_llm_prefix(text)
+        if is_llm_invocation(text, self.service.cfg.llm.prefix):
+            text = strip_llm_prefix(text, self.service.cfg.llm.prefix)
         if not text:
             return CommandOutcome.err("空输入")
         if session is None:

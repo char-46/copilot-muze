@@ -78,6 +78,33 @@ llm:
     base_url: ""              # empty -> reuse chat.base_url / chat.api_key
     api_key: ""
     model: ""                 # e.g. glm-4v-plus
+
+  # --- multi-model registry (optional; the chat/vision entries above keep
+  # working as the implicit "chat"/"vision" entries when models is empty).
+  # Each entry is independently rate-limited; roles map a purpose to an
+  # ordered fallback chain of names (first healthy entry answers).
+  models:
+    # deepseek:
+    #   base_url: https://api.deepseek.com
+    #   api_key: ""
+    #   model: deepseek-chat
+    #   rpm: 30               # requests/min cap, process-wide (0 = off)
+    #   max_concurrency: 4    # in-flight cap (0 = off)
+    #   caps: {tools: true, vision: false, cheap: false}
+    # glm-v:
+    #   base_url: https://open.bigmodel.cn/api/paas/v4/
+    #   api_key: ""
+    #   model: glm-4v-plus
+    #   caps: {vision: true}
+  roles:
+    # chat:   [chat]              # the agent / converse loop
+    # vision: [glm-v, chat]       # image understanding
+    # value:  [cheap, chat]       # bulk scoring (message value recognition)
+    # digest: [cheap, chat]       # nightly dreaming / profiles
+    # ocr:    [ocr, glm-v, chat]  # future ocr chain
+    # asr:    [asr]               # future asr chain
+  prefix: "::"                # wake prefix for LLM chat (half/full-width colons both match)
+
   agent_max_steps: 48        # tool-calling rounds per run; hitting it SUSPENDS the turn (resume with /sess go)
   turn_timeout_sec: 300      # STALL cap: a tool round stuck this long is aborted (slow-but-progressing turns are never cut)
   max_concurrent_turns: 4    # turns talking to the model at once (per account); a chat can hold several :: sessions

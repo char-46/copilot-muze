@@ -136,9 +136,51 @@ class LLMEndpoint(BaseModel):
     # (slow-but-producing output never times out; a stuck connection does)
 
 
+class ModelCaps(BaseModel):
+    """What one registered model can do (routes roles, avoids sending
+    tool_calls to a model that chokes on them)."""
+
+    vision: bool = False  # accepts image_url content parts
+    tools: bool = True  # accepts OpenAI-style tool_calls
+    cheap: bool = False  # hint: prefer for bulk scoring/OCR/value passes
+
+
+class ModelEntry(BaseModel):
+    """A named, independently rate-limited LLM endpoint.
+
+    `models` is a registry of these; `roles` maps a purpose (chat, vision,
+    value, digest, ...) to an ordered fallback chain of names.
+    """
+
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    temperature: float | None = None
+    timeout: float = 120.0  # stream stall timeout: max silence between chunks
+    # (slow-but-producing output never times out; a stuck connection does)
+    caps: ModelCaps = Field(default_factory=ModelCaps)
+    rpm: int = 0  # requests/minute cap across the whole process (0 = off)
+    max_concurrency: int = 0  # in-flight request cap (0 = off)
+
+
+# role -> fallback chain used when llm.roles doesn't mention the role;
+# missing names are dropped at resolve time, so defaults stay safe
+DEFAULT_ROLE_CHAINS: dict[str, list[str]] = {
+    "chat": ["chat"],
+    "vision": ["vision", "chat"],
+    "value": ["value", "cheap", "chat"],
+    "digest": ["digest", "cheap", "chat"],
+    "ocr": ["ocr", "vision", "chat"],
+    "asr": ["asr"],
+}
+
+
 class LLMConfig(BaseModel):
-    chat: LLMEndpoint = Field(default_factory=LLMEndpoint)
-    vision: LLMEndpoint = Field(default_factory=LLMEndpoint)
+    chat: LLMEndpoint = Field(default_factory=LLMEndpoint)  # legacy "chat" entry
+    vision: LLMEndpoint = Field(default_factory=LLMEndpoint)  # legacy "vision" entry
+    models: dict[str, ModelEntry] = Field(default_factory=dict)
+    roles: dict[str, list[str]] = Field(default_factory=dict)
+    prefix: str = "::"  # wake prefix for direct LLM chat (customizable)
     agent_max_steps: int = 48
     turn_timeout_sec: float = 300.0  # STALL cap: a tool round stuck this long
     # is aborted; there is no wall-clock cap on slow-but-progressing turns
@@ -156,7 +198,33 @@ class LLMConfig(BaseModel):
     @property
     def vision_enabled(self) -> bool:
         vision_model = self.vision.model or self.chat.model
-        return bool(vision_model)
+        return bool(vision_model) or any(
+            m.caps.vision for m in self.models.values() if m.model
+        )
+
+    def effective_models(self) -> dict[str, ModelEntry]:
+        """The registry as the client sees it: explicit `models`, with the
+        legacy chat/vision endpoints synthesizing their entries when absent
+        (so an old config keeps working untouched)."""
+        out: dict[str, ModelEntry] = {}
+        if self.chat.model and (self.chat.base_url or self.chat.api_key):
+            out["chat"] = ModelEntry(**self.chat.model_dump())
+        if self.vision.model:
+            out["vision"] = ModelEntry(
+                **self.vision.model_dump(), caps=ModelCaps(vision=True)
+            )
+        for name, m in self.models.items():
+            out[name] = m
+        return out
+
+    def role_chain(self, role: str) -> list[str]:
+        """Ordered model names for a role: explicit roles.<role> first, then
+        the built-in default; names not in the registry resolve to nothing
+        and are dropped by the client."""
+        names = self.roles.get(role)
+        if names:
+            return list(names)
+        return DEFAULT_ROLE_CHAINS.get(role, ["chat"])
 
 
 class WebConfig(BaseModel):
