@@ -386,3 +386,7 @@ editing `config.yaml` and running `/reload`.
 ```bash
 uv run pytest -q
 ```
+
+## License
+
+GPL-3.0-or-later — see [LICENSE](LICENSE).

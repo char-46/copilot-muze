@@ -355,3 +355,7 @@ WebUI 有 **Settings** 标签页（分组表单；密钥保持打码，除非你
 ```bash
 uv run pytest -q
 ```
+
+## 许可证
+
+GPL-3.0-or-later，详见 [LICENSE](LICENSE)。
