@@ -356,14 +356,27 @@ WebUI 有 **Settings** 标签页（分组表单；密钥保持打码，除非你
 都不需要公网 IP。控制面就是 WebUI（`POST /api/command` 与 CLI 命令面 1:1），
 由一条经中继机的 ssh 反向隧道承载。
 
-muze 盒上一次性准备（生成仅可转发的密钥，中继拿不到 shell）：
+**中继机上一次性配置**（之后无论接多少台盒子都永不再动）：
+
+```bash
+mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys <<'EOF'
+restrict,port-forwarding,command="/bin/false",permitopen="127.0.0.1:1",permitlisten="127.0.0.1:*" ssh-ed25519 AAAA... muze-debug-tunnel
+EOF
+```
+
+仅可转发：无 shell、无 pty、无 `-L` 跳板，且所有转发端口只绑中继*回环*
+（公网零新增监听，扫描只会超时）。对应私钥保留一份，复制到每台 muze
+盒子 `data/.ssh/muze_tunnel` 即可。
+
+**每台 muze 盒**——放密钥、认领端口段、（可选）开 sshd 供 shell：
 
 ```powershell
-ssh-keygen -t ed25519 -N "" -C muze-debug-tunnel -f data\.ssh\muze_tunnel
-# 将 .pub 内容以【单行】追加到中继的 authorized_keys：
-#   restrict,port-forwarding,command="/bin/false",
-#   permitopen="127.0.0.1:1",permitlisten="127.0.0.1:18300" ssh-ed25519 AAAA...
-# （无 shell、无 pty、无跳板，中继侧绑定被钉死在回环 18300）
+# 1. 密钥（本盒认领 1830x 段；第二台用 1831x……）
+mkdir data\.ssh; copy <muze_tunnel> data\.ssh\
+# 2. 可选：让开发机能 shell 进本盒（管理员 PowerShell）：
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd; Set-Service sshd -StartupType Automatic
+# 把开发机公钥加入 C:\ProgramData\ssh\administrators_authorized_keys
 ```
 
 然后在 `config.yaml`：
@@ -372,24 +385,28 @@ ssh-keygen -t ed25519 -N "" -C muze-debug-tunnel -f data\.ssh\muze_tunnel
 web:
   tunnel:                     # 由 serve 托管：保活 `ssh -N -R` 子进程
     enabled: true
-    host: relay.example.com   # 中继上现成的 sshd 承担全部工作
-    user: root
+    host: relay.example.com
     key_file: data/.ssh/muze_tunnel
-    remote_port: 18300        # 必须等于上面 permitlisten 钉的端口
+    forwards:
+      - local_port: 8300      # webui（muze cli --remote）
+        remote_port: 18300
+      - local_port: 22        # 本盒 sshd（开发机 shell）
+        remote_port: 18301
 ```
 
-开发机侧：
+**开发机侧：**
 
 ```powershell
-ssh -L 8300:127.0.0.1:18300 root@relay.example.com   # 跳板，保持打开
-muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>
+ssh -L 8300:127.0.0.1:18300 -L 2222:127.0.0.1:18301 root@relay.example.com
+muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>   # REPL
+ssh -p 2222 <盒上用户>@127.0.0.1                                        # shell
 ```
 
 `--remote` 驱动的是*运行中的*实例（同样的命令、同样的 `::` 会话、实时状态），
 而非在本地再嵌入一份；token 也可走 `MUZE_REMOTE_TOKEN` 或开发机
-`config.yaml` 的 `remote:` 段。凭据层层独立：中继不出现新的公网监听
-（转发端口只绑其回环）、隧道密钥只能转发到那一个钉死端口、WebUI 本身
-还要 bearer token。
+`config.yaml` 的 `remote:` 段。凭据层层独立：中继不出现新的公网监听、
+隧道密钥只能转发（在中继上永远拿不到 shell）、盒上 sshd 要自己的钥匙、
+WebUI 本身还要 bearer token。
 
 ## 测试
 

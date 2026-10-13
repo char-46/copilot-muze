@@ -20,7 +20,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from muze.config import TunnelConfig
+from muze.config import TunnelConfig, TunnelForward
 
 log = logging.getLogger("muze.tunnel")
 
@@ -30,14 +30,23 @@ STABLE_AFTER = 600.0  # a connection that lived this long resets the backoff
 
 
 class SshTunnel:
-    """Keeps one `ssh -N -R` child alive for the process lifetime."""
+    """Keeps one `ssh -N -R ...` child alive for the process lifetime.
+
+    By default it forwards just the webui; a `forwards:` table can add more
+    services of this box (e.g. sshd for dev shells through the relay).
+    """
 
     def __init__(self, cfg: TunnelConfig, web_port: int, data_dir: Path):
         if not cfg.host:
             raise ValueError("web.tunnel.enabled but web.tunnel.host is empty")
         self.cfg = cfg
         self.web_port = web_port
-        self.remote_port = cfg.remote_port or web_port
+        self.forwards: list[TunnelForward] = list(cfg.forwards) or [
+            TunnelForward(local_port=web_port, remote_port=cfg.remote_port or web_port)
+        ]
+        remotes = [f.remote_port for f in self.forwards]
+        if len(remotes) != len(set(remotes)):
+            raise ValueError(f"web.tunnel.forwards: duplicate remote ports {remotes}")
         self.key_file = Path(cfg.key_file) if cfg.key_file else data_dir / ".ssh" / "muze_tunnel"
         self._task: asyncio.Task | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -46,16 +55,17 @@ class SshTunnel:
     def command(self) -> list[str]:
         if not self.key_file.is_file():
             raise FileNotFoundError(
-                f"tunnel key not found: {self.key_file} — generate one "
-                '(ssh-keygen -t ed25519 -N "" -f <key>) and install its '
-                "public half on the relay as a single authorized_keys line "
-                'like: restrict,port-forwarding,command="/bin/false",'
-                'permitopen="127.0.0.1:1",permitlisten="127.0.0.1:<remote_port>" '
-                "<pubkey> — forward-only, no shell, no pty, no pivot, and the "
-                "relay bind pinned to one loopback port (must equal "
-                "remote_port here)"
+                f"tunnel key not found: {self.key_file} — the relay is "
+                "configured ONCE with a shared forward-only key; copy that "
+                "private key to this path (generating a new one would need "
+                "a fresh relay-side authorized_keys line: "
+                'restrict,port-forwarding,command="/bin/false",'
+                'permitopen="127.0.0.1:1",permitlisten="127.0.0.1:*" '
+                "<pubkey> — forward-only, no shell, no pty, no pivot, "
+                "loopback-only binds; each box claims its own remote_port "
+                "range so tunnels never collide)"
             )
-        return [
+        cmd = [
             "ssh", "-N", "-T",
             "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes",
@@ -66,17 +76,22 @@ class SshTunnel:
             "-o", "ConnectTimeout=15",
             "-i", str(self.key_file),
             "-p", str(self.cfg.port),
-            "-R",
-            f"{self.cfg.remote_host}:{self.remote_port}:127.0.0.1:{self.web_port}",
-            f"{self.cfg.user}@{self.cfg.host}",
         ]
+        for f in self.forwards:
+            cmd += [
+                "-R",
+                f"{self.cfg.remote_host}:{f.remote_port}:{f.local_host}:{f.local_port}",
+            ]
+        cmd.append(f"{self.cfg.user}@{self.cfg.host}")
+        return cmd
 
     async def start(self) -> None:
         cmd = self.command()  # fail fast on missing key/config
-        log.info(
-            "ssh tunnel: relay %s:%s <- 127.0.0.1:%s (webui)",
-            self.cfg.host, self.remote_port, self.web_port,
-        )
+        for f in self.forwards:
+            log.info(
+                "ssh tunnel: relay %s:%s <- %s:%s", self.cfg.host, f.remote_port,
+                f.local_host, f.local_port,
+            )
         self._task = asyncio.create_task(self._supervise(cmd))
 
     async def _supervise(self, cmd: list[str]) -> None:

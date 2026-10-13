@@ -6,13 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from muze.config import TunnelConfig, WebConfig
+from muze.config import TunnelConfig, TunnelForward, WebConfig
 from muze.tunnel import SshTunnel
 
 
 def test_tunnel_config_defaults():
     t = TunnelConfig()
     assert t.enabled is False and t.host == "" and t.user == "root"
+    assert t.forwards == [] and t.remote_port == 0
     w = WebConfig()
     assert w.tunnel.enabled is False
     assert w.port == 8300
@@ -23,28 +24,42 @@ def test_tunnel_requires_host():
         SshTunnel(TunnelConfig(enabled=True), 8300, Path("/tmp/x"))
 
 
-def test_tunnel_remote_port_defaults_to_web_port(tmp_path):
+def _mkkey(tmp_path: Path) -> Path:
     key = tmp_path / ".ssh" / "muze_tunnel"
     key.parent.mkdir(parents=True)
     key.write_text("fake")
-    tun = SshTunnel(
-        TunnelConfig(enabled=True, host="relay.example.com"), 8300, tmp_path
-    )
-    assert tun.remote_port == 8300
-    assert tun.key_file == key
+    return key
 
-    tun2 = SshTunnel(
-        TunnelConfig(enabled=True, host="r", remote_port=18000), 8300, tmp_path
+
+def test_tunnel_webui_only_default(tmp_path):
+    _mkkey(tmp_path)
+    tun = SshTunnel(TunnelConfig(enabled=True, host="r"), 8300, tmp_path)
+    assert [ (f.local_port, f.remote_port) for f in tun.forwards ] == [(8300, 8300)]
+    tun2 = SshTunnel(TunnelConfig(enabled=True, host="r", remote_port=18000), 8300, tmp_path)
+    assert tun2.forwards[0].remote_port == 18000
+
+
+def test_tunnel_duplicate_remote_ports_rejected(tmp_path):
+    _mkkey(tmp_path)
+    cfg = TunnelConfig(
+        enabled=True, host="r",
+        forwards=[
+            TunnelForward(local_port=8300, remote_port=18300),
+            TunnelForward(local_port=22, remote_port=18300),
+        ],
     )
-    assert tun2.remote_port == 18000
+    with pytest.raises(ValueError, match="duplicate remote ports"):
+        SshTunnel(cfg, 8300, tmp_path)
 
 
 def test_tunnel_command_shape(tmp_path):
-    key = tmp_path / "k"
-    key.write_text("fake")
+    _mkkey(tmp_path)
     cfg = TunnelConfig(
         enabled=True, host="relay.example.com", port=2222, user="op",
-        key_file=str(key), remote_port=18000,
+        forwards=[
+            TunnelForward(local_port=8300, remote_port=18300),
+            TunnelForward(local_port=22, remote_port=18301),
+        ],
     )
     tun = SshTunnel(cfg, 8300, tmp_path)
     cmd = tun.command()
@@ -52,9 +67,9 @@ def test_tunnel_command_shape(tmp_path):
     for opt in ("BatchMode=yes", "IdentitiesOnly=yes", "ExitOnForwardFailure=yes",
                 "ServerAliveInterval=30", "StrictHostKeyChecking=accept-new"):
         assert opt in cmd
-    assert "-R" in cmd
-    r = cmd[cmd.index("-R") + 1]
-    assert r == "127.0.0.1:18000:127.0.0.1:8300"
+    rs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-R"]
+    assert rs == ["127.0.0.1:18300:127.0.0.1:8300",
+                  "127.0.0.1:18301:127.0.0.1:22"]
     assert cmd[cmd.index("-p") + 1] == "2222"
     assert cmd[-1] == "op@relay.example.com"
 
