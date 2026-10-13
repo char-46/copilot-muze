@@ -86,7 +86,11 @@ if ($Wheel) {
 } elseif (-not $SkipPull) {
     if (Test-Path (Join-Path $Repo ".git")) {
         Write-Step "git fetch --tags..."
-        git -C $Repo fetch --tags --force --prune 2>&1 | Out-Null
+        # NB: no 2>&1 on native git calls -- under PS 5.1 + EAP=Stop a
+        # redirected stderr line becomes an ErrorRecord that kills the
+        # script mid-update (git checkout's "HEAD is now at ..." goes to
+        # stderr). Unredirected, stderr just prints.
+        git -C $Repo fetch --tags --force --prune
         if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
         # coming back from wheel mode: drop parked project files so the
         # checkout --force below restores the real ones
@@ -114,7 +118,7 @@ if ($Wheel) {
             if (-not $Tag) { throw "no v* tags found in the repository" }
         }
         Write-Step "git checkout --force $Tag (local edits to tracked files are discarded)"
-        git -C $Repo checkout --force $Tag 2>&1 | Write-Host
+        git -C $Repo checkout --force $Tag
         if ($LASTEXITCODE -ne 0) { throw "git checkout $Tag failed" }
     } else {
         Write-Warning "not a git checkout; skipping code update (deps only)"
