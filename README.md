@@ -388,42 +388,59 @@ sides only make *outbound* connections, so neither needs a public IP. The
 webui is the control plane (`POST /api/command` maps 1:1 to the CLI command
 surface); an ssh reverse tunnel through any reachable relay carries it.
 
-One-time, on the muze box (generates a forward-only key; the relay never
-gains shell access):
+**One-time, on the relay** (never touched again, no matter how many boxes):
 
-```powershell
-ssh-keygen -t ed25519 -N "" -C muze-debug-tunnel -f data\.ssh\muze_tunnel
-# append the .pub half to the relay's authorized_keys as ONE line:
-#   restrict,port-forwarding,command="/bin/false",
-#   permitopen="127.0.0.1:1",permitlisten="127.0.0.1:18300" ssh-ed25519 AAAA...
-# (no shell, no pty, no pivot, and the relay bind pinned to loopback:18300)
+```bash
+mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys <<'EOF'
+restrict,port-forwarding,command="/bin/false",permitopen="127.0.0.1:1",permitlisten="127.0.0.1:*" ssh-ed25519 AAAA... muze-debug-tunnel
+EOF
 ```
 
-Then in `config.yaml`:
+Forward-only: no shell, no pty, no `-L` pivoting, and every forwarded
+listener binds the relay's *loopback* (nothing new is publicly reachable;
+a public probe just times out). Keep the matching private key once and copy
+it to every muze box as `data/.ssh/muze_tunnel`.
+
+**Per muze box** — drop the key, claim a port range, enable sshd for shells:
+
+```powershell
+# 1. key (box claims the 1830x range; box2 takes 1831x, ...)
+mkdir data\.ssh; copy <muze_tunnel> data\.ssh\
+# 2. optional, shells into this box (admin PowerShell):
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd; Set-Service sshd -StartupType Automatic
+# add your dev pubkey to C:\ProgramData\ssh\administrators_authorized_keys
+```
+
+and in `config.yaml`:
 
 ```yaml
 web:
   tunnel:                     # managed by serve: keeps `ssh -N -R` alive
     enabled: true
-    host: relay.example.com   # sshd on the relay does all the work
-    user: root
+    host: relay.example.com
     key_file: data/.ssh/muze_tunnel
-    remote_port: 18300        # must equal the permitlisten pin above
+    forwards:
+      - local_port: 8300      # webui (muze cli --remote)
+        remote_port: 18300
+      - local_port: 22        # this box's sshd (dev shells)
+        remote_port: 18301
 ```
 
-From the dev machine:
+**From the dev machine:**
 
 ```powershell
-ssh -L 8300:127.0.0.1:18300 root@relay.example.com   # hop, keep open
-muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>
+ssh -L 8300:127.0.0.1:18300 -L 2222:127.0.0.1:18301 root@relay.example.com
+muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>   # REPL
+ssh -p 2222 <box-user>@127.0.0.1                                        # shell
 ```
 
 `--remote` drives the *running* instance (same commands, same `::` agent
 turns, live state) instead of embedding a second one; token also via
 `MUZE_REMOTE_TOKEN` or the `remote:` section of the dev machine's
-`config.yaml`. Layered credentials: the relay sees no new public listener
-(the forwarded port binds its loopback), the tunnel key can only forward to
-that one pinned port, and the webui itself requires its bearer token.
+`config.yaml`. Layered credentials: the relay sees no new public listener,
+the tunnel key can only forward (never a shell on the relay), sshd on the
+box wants its own key, and the webui requires its bearer token.
 
 ## Tests
 

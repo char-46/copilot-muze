@@ -318,16 +318,27 @@ class LLMConfig(BaseModel):
         return DEFAULT_ROLE_CHAINS.get(role, ["chat"])
 
 
+class TunnelForward(BaseModel):
+    """One relay-forwarded port: relay loopback:remote_port -> this box
+    local_host:local_port (webui, sshd, ...)."""
+
+    local_port: int
+    remote_port: int
+    local_host: str = "127.0.0.1"
+
+
 class TunnelConfig(BaseModel):
-    """SSH reverse tunnel exposing the webui through a relay box, so an
-    operator on a dev machine (possibly without a route to this host) can
-    remote-debug via `muze cli --remote`.
+    """SSH reverse tunnel exposing services of this box through a relay box,
+    so an operator on a dev machine (possibly without a route to this host)
+    can remote-debug: webui for `muze cli --remote`, sshd for shells.
 
     Security posture: the relay only receives an *outbound* ssh connection
-    from here; the forwarded listener binds loopback *on the relay*, so no
+    from here; every forwarded listener binds loopback *on the relay*, so no
     new public port appears anywhere. Use a dedicated key restricted in the
-    relay's authorized_keys to `restrict,port-forwarding` (no pty, no
-    commands) — a stolen key then only ever reaches the token-guarded webui.
+    relay's authorized_keys to
+    `restrict,port-forwarding,command="/bin/false",permitopen="127.0.0.1:1",
+    permitlisten="127.0.0.1:P1,127.0.0.1:P2,..."` — every remote_port in
+    `forwards` (and `remote_port`) must appear in the permitlisten pin list.
     """
 
     enabled: bool = False
@@ -335,8 +346,9 @@ class TunnelConfig(BaseModel):
     port: int = 22
     user: str = "root"
     key_file: str = ""  # default: <data_dir>/.ssh/muze_tunnel (create by hand)
-    remote_host: str = "127.0.0.1"  # bind address on the relay
-    remote_port: int = 0  # 0 = same as web.port
+    remote_host: str = "127.0.0.1"  # bind address for every forward on the relay
+    remote_port: int = 0  # webui forward when `forwards` is empty; 0 = web.port
+    forwards: list[TunnelForward] = []  # extra/complete forward table
 
 
 class WebConfig(BaseModel):

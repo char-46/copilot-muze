@@ -184,17 +184,21 @@ web:                          # app-level: one webui serves every account
                               # (a random one changes on every restart and must be re-copied
                               #  from the log -- old log lines then stop working)
   # tunnel:                   # ssh reverse tunnel through a relay box, for
-  #   enabled: true           # `muze cli --remote` from a dev machine that has
-  #   host: relay.example.com # no route here. The relay binds the forwarded
-  #   port: 22                # port on ITS loopback only -> no new public
-  #   user: root              # listener anywhere. Install a dedicated key on
-  #   key_file: ""            # the relay as ONE authorized_keys line:
+  #   enabled: true           # `muze cli --remote` + shells + port
+  #   host: relay.example.com # forwarding from a dev machine with no route
+  #   port: 22                # here. The relay is configured ONCE: install
+  #   user: root              # the shared key's public half as ONE
+  #   key_file: ""            # authorized_keys line:
   #   remote_host: 127.0.0.1  #   restrict,port-forwarding,command="/bin/false",
   #   remote_port: 18300      #   permitopen="127.0.0.1:1",
-                              #   permitlisten="127.0.0.1:18300" <pubkey>
-                              # (forward-only: no shell/pty/pivot; the pinned
-                              #  port MUST equal remote_port; key default:
-                              #  <data_dir>/.ssh/muze_tunnel)
+  #   forwards:               #   permitlisten="127.0.0.1:*" <pubkey>
+  #     - local_port: 8300    # (forward-only: no shell/pty/pivot, loopback
+  #       remote_port: 18300  #  binds only). EVERY box then reuses the SAME
+  #     - local_port: 22      # private key (default: <data_dir>/.ssh/
+  #       remote_port: 18301  #  muze_tunnel) and claims its OWN remote_port
+                              #  range (box1: 1830x, box2: 1831x, ...) so
+                              #  tunnels never collide. forwards:[]
+                              #  defaults to webui-only via remote_port.
 
 # remote:                     # DEV MACHINE side of `muze cli --remote` (args
 #   url: http://127.0.0.1:8300   # and MUZE_REMOTE_* env win over this section)
