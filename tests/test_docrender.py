@@ -1,6 +1,7 @@
 """Document rendering (markdown -> PDF -> PNG): markdown detection,
-byte-level output checks, user-font drop-in. The PyMuPDF Story engine
-bundles CJK fallback fonts, so no font setup is required."""
+byte-level output checks, user-font drop-in. reportlab subset-embeds the
+user/system CJK TTF (STSong-Light CID fallback is not embedded, only
+referenced), so PDF sizes vary by font path."""
 
 import shutil
 from pathlib import Path
@@ -30,7 +31,7 @@ def test_render_pdf_bytes(tmp_path):
         pytest.skip("render deps missing")
     pdf = R.render_pdf("# 报告\n\n- 甲项\n- 乙项\n\n正文 **加粗**。", tmp_path)
     assert pdf[:5] == b"%PDF-"
-    assert len(pdf) > 10000  # CJK font subset embedded
+    assert len(pdf) > 2000  # real content (TTF subset ~tens of KB, CID ~3KB)
 
 
 def test_render_pdf_plain_text(tmp_path):

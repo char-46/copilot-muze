@@ -389,4 +389,4 @@ uv run pytest -q
 
 ## License
 
-GPL-3.0-or-later — see [LICENSE](LICENSE).
+CC BY-SA 4.0 — see [LICENSE](LICENSE).

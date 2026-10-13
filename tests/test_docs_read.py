@@ -37,12 +37,28 @@ def _make_pptx(p: Path):
 
 
 def _make_pdf(p: Path):
-    import pymupdf
+    from reportlab.pdfgen.canvas import Canvas
 
-    doc = pymupdf.Document()
-    doc.new_page().insert_text((72, 72), "invoice no 42")
-    doc.save(p)
-    doc.close()
+    c = Canvas(str(p))
+    c.setFont("Helvetica", 12)
+    c.drawString(72, 720, "invoice no 42")
+    c.save()
+
+
+def _make_7z(p: Path, d: Path):
+    import shutil
+    import subprocess
+
+    backend = shutil.which("7z") or next(
+        (c for c in (r"C:\Program Files\7-Zip\7z.exe",
+                     r"C:\Program Files (x86)\7-Zip\7z.exe")
+         if Path(c).is_file()), None)
+    if not backend:
+        pytest.skip("7-Zip not installed (7z/rar archive backend)")
+    (d / "a.txt").write_text("七压缩正文", encoding="utf-8")
+    r = subprocess.run([backend, "a", "-bso0", "-bse0", str(p), "a.txt"],
+                       cwd=d, capture_output=True, timeout=60)
+    assert r.returncode == 0, r.stderr.decode(errors="replace")[:200]
 
 
 def test_xlsx(d):
@@ -94,11 +110,7 @@ def test_zip_listing_entry_and_binary_member(d):
 
 
 def test_sevenzip_entry(d):
-    import py7zr
-
-    (d / "a.txt").write_text("七压缩正文", encoding="utf-8")
-    with py7zr.SevenZipFile(d / "t.7z", "w") as z:
-        z.write(d / "a.txt", "a.txt")
+    _make_7z(d / "t.7z", d)
     assert "七压缩正文" in read_document(d / "t.7z", entry="a.txt")
     assert "a.txt" in read_document(d / "t.7z")  # listing
 

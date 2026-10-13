@@ -3,14 +3,11 @@ name = "copilot-muze"
 description = "Personal QQ copilot: message archive, roaming backfill, multimodal assistant. Speaks the Milky protocol (LLBot / Lagrange.Milky) and reserves a provider seam for raw Lagrange."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "GPL-3.0-or-later" }
+license = { text = "CC-BY-SA-4.0" }
 authors = [{ name = "muze" }]
-classifiers = [
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
-]
 # Pre-release is bumped per feature commit; build metadata (git sha, build time)
 # is appended at runtime by muze.version.get_version().
-version = "0.1.0a116"
+version = "0.1.0a117"
 dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
@@ -20,15 +17,13 @@ dependencies = [
     "httpx>=0.27",
     "python-docx>=1.1",
     "pillow>=12.3.0",
-    "pilk>=0.2.4",
     "sqlite-vec>=0.1.9",
     "markdown>=3.6",
-    "pymupdf>=1.24",
-    "fonttools>=4.50",
+    "reportlab>=4.0",
+    "pypdfium2>=4.28",
     "openpyxl>=3.1",
     "xlrd>=2.0",
     "python-pptx>=0.6",
-    "py7zr>=0.21",
     "rarfile>=4.2",
 ]
 

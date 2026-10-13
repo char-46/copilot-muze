@@ -358,4 +358,4 @@ uv run pytest -q
 
 ## 许可证
 
-GPL-3.0-or-later，详见 [LICENSE](LICENSE)。
+CC BY-SA 4.0，详见 [LICENSE](LICENSE)。

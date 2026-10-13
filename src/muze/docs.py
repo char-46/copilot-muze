@@ -97,16 +97,28 @@ def _read_docx(path: Path) -> str:
 
 
 def _read_pdf(p: Path) -> str:
-    import pymupdf
+    import pypdfium2 as pdfium
 
+    try:
+        doc = pdfium.PdfDocument(str(p))
+    except Exception as e:  # noqa: BLE001 - pdfium raises PdfiumError
+        msg = str(e)
+        if "password" in msg.lower() or "password" in repr(e).lower():
+            raise ValueError("PDF 已加密，无法读取") from e
+        raise ValueError(f"PDF 读取失败: {msg[:120]}") from e
     out: list[str] = []
-    with pymupdf.Document(str(p)) as doc:
-        if doc.needs_pass:
-            raise ValueError("PDF 已加密，无法读取")
+    try:
         for i, page in enumerate(doc):
-            out.append(f"--- 第{i + 1}页 ---\n{page.get_text().strip()}")
+            tp = page.get_textpage()
+            try:
+                out.append(f"--- 第{i + 1}页 ---\n{tp.get_text_range().strip()}")
+            finally:
+                tp.close()
+                page.close()
             if sum(len(x) for x in out) > MAX_DOC_CHARS:
                 break
+    finally:
+        doc.close()
     return "\n\n".join(out)
 
 
@@ -258,29 +270,6 @@ def _zip_read(p: Path, name: str) -> bytes:
             return f.read(MAX_FETCH_BYTES)
 
 
-def _sz_entries(p: Path) -> list[tuple[str, int]]:
-    import py7zr
-
-    with py7zr.SevenZipFile(str(p)) as z:
-        return [(i.filename, i.uncompressed) for i in z.list()]
-
-
-def _sz_read(p: Path, name: str) -> bytes:
-    import shutil
-    import tempfile
-
-    import py7zr
-
-    tmp = Path(tempfile.mkdtemp(prefix="muze7z-"))
-    try:
-        with py7zr.SevenZipFile(str(p)) as z:
-            z.extract(targets=[name], path=str(tmp))
-        out = next(tmp.rglob(Path(name).name))
-        return out.read_bytes()[:MAX_FETCH_BYTES]
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
 def _rar_backend() -> str | None:
     """7z.exe is the practical rar backend on Windows."""
     import os
@@ -300,7 +289,7 @@ def _rar_backend() -> str | None:
 def _rar_entries(p: Path) -> list[tuple[str, int]]:
     backend = _rar_backend()
     if not backend:
-        raise ValueError("读取 .rar 需要安装 7-Zip（或把压缩包转存为 zip/7z 后重试）")
+        raise ValueError("读取 .rar/.7z 需要安装 7-Zip（或把压缩包转存为 zip 后重试）")
     import subprocess
 
     r = subprocess.run(
@@ -319,13 +308,16 @@ def _rar_entries(p: Path) -> list[tuple[str, int]]:
             except ValueError:
                 out.append((name, 0))
             name = ""
-    return out[1:] if out else []  # [0] is the archive itself
+    # [0] is the archive itself when the header block carries a Size line
+    # (.rar does, .7z does not) — drop it by identity, not position.
+    arch = (str(p), p.name)
+    return [(n, s) for n, s in out if n not in arch]
 
 
 def _rar_read(p: Path, name: str) -> bytes:
     backend = _rar_backend()
     if not backend:
-        raise ValueError("读取 .rar 需要安装 7-Zip（或把压缩包转存为 zip/7z 后重试）")
+        raise ValueError("读取 .rar/.7z 需要安装 7-Zip（或把压缩包转存为 zip 后重试）")
     import subprocess
 
     r = subprocess.run(
@@ -357,7 +349,7 @@ def _archive_kind(ext: str):
     if ext in (".zip",):
         return _zip_entries, _zip_read
     if ext in (".7z",):
-        return _sz_entries, _sz_read
+        return _rar_entries, _rar_read  # same system 7z.exe backend as .rar
     if ext in (".rar",):
         return _rar_entries, _rar_read
     if ext in (".tar", ".tgz", ".txz", ".gz", ".bz2", ".xz"):

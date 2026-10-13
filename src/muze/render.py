@@ -5,12 +5,14 @@ Used for two outbound reply forms:
   (QQ plain text carries no formatting);
 - /topdf & /sess getpdf export documents as PDF files.
 
-Pipeline: markdown -> HTML (python-markdown) -> PDF (PyMuPDF Story, the C
-MuPDF layout engine with bundled CJK fallback fonts — no font setup needed,
-~30ms per page) -> PNG (PyMuPDF raster, pages stitched vertically with PIL).
+Pipeline: markdown -> HTML (python-markdown) -> flowables (reportlab
+Platypus; a user TTF from data/fonts/ wins, else a system CJK TTF is
+subset-embedded on Windows, else the non-embedded STSong-Light CID face) ->
+PDF -> PNG (pypdfium2 raster, pages stitched vertically with PIL).
 
-A user font (Maple Mono / LXGW WenKai / any .ttf dropped into data/fonts/)
-still wins: it is passed to Story via an Archive + @font-face.
+Every rendering dependency here is permissively licensed (BSD-3 /
+Apache-2.0); the former PyMuPDF (AGPL) pipeline was retired during the
+CC BY-SA 4.0 relicensing.
 """
 
 from __future__ import annotations
@@ -18,18 +20,35 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 import re
+import sys
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 log = logging.getLogger("muze.render")
 
 try:  # pragma: no cover - trivial import guard
     import markdown as _md
-    import pymupdf
+    import pypdfium2 as pdfium
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (
+        HRFlowable,
+        Paragraph,
+        SimpleDocTemplate,
+        Table,
+        TableStyle,
+        XPreformatted,
+    )
 
     RENDER_OK = True
 except Exception:  # pragma: no cover
-    _md = pymupdf = None
+    _md = pdfium = None
     RENDER_OK = False
 
 # user-dropped font files win (first pattern match is used, any role)
@@ -89,45 +108,196 @@ def _esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-_BASE_CSS = """
-body { font-size: 12px; }
-h1 { font-size: 1.6em; font-weight: bold; }
-h2 { font-size: 1.35em; font-weight: bold; }
-h3 { font-size: 1.15em; font-weight: bold; }
-pre { background-color: #f0f0f0; font-family: sans-serif; }
-code { font-family: sans-serif; }
-blockquote { color: #444444; margin-left: 1em; }
-"""
+# ------------------------------------------------------------------ fonts
+# pick order: user TTF -> system CJK TTF (Windows) -> STSong-Light CID face
+# (non-embedded; rasterizers substitute a local CJK font) -> Helvetica.
+_SYS_TTF = [
+    r"C:\Windows\Fonts\Deng.ttf",
+    r"C:\Windows\Fonts\simkai.ttf",
+    r"C:\Windows\Fonts\simfang.ttf",
+]
+_font_cache: dict[str, str] = {}  # key (font path or "") -> registered name
 
 
-def _story_pdf(html_body: str, font: Path | None) -> bytes:
-    css = _BASE_CSS
-    arch = None
-    if font is not None:
-        css = (
-            f"@font-face {{ font-family: muzefont; src: url({font.name}); }}\n"
-            "body { font-family: muzefont; font-size: 12px; }\n"
-            "h1 { font-size: 1.6em; font-weight: bold; }\n"
-            "h2 { font-size: 1.35em; font-weight: bold; }\n"
-            "h3 { font-size: 1.15em; font-weight: bold; }\n"
-            "pre { background-color: #f0f0f0; font-family: muzefont; }\n"
-            "code { font-family: muzefont; }\n"
-            "blockquote { color: #444444; margin-left: 1em; }\n"
+def _pick_font(font: Path | None) -> str:
+    key = str(font.resolve()) if font is not None else ""
+    if key in _font_cache:
+        return _font_cache[key]
+    src = font
+    if src is None and sys.platform == "win32":
+        src = next((Path(c) for c in _SYS_TTF if os.path.isfile(c)), None)
+    name = None
+    if src is not None:
+        try:
+            pdfmetrics.registerFont(TTFont("muzefont", str(src)))
+            name = "muzefont"
+        except Exception as e:
+            log.warning("font %s unusable (%s); trying CID fallback", src.name, e)
+    if name is None:
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+            name = "STSong-Light"
+        except Exception:  # pragma: no cover - reportlab always has CID fonts
+            name = "Helvetica"
+    _font_cache[key] = name
+    return name
+
+
+def _styles(f: str) -> dict[str, ParagraphStyle]:
+    kw = dict(fontName=f, fontSize=12, leading=18, wordWrap="CJK")
+    body = ParagraphStyle("body", spaceAfter=6, **kw)
+    return {
+        "body": body,
+        "h1": ParagraphStyle("h1", parent=body, fontSize=19, leading=28,
+                             spaceBefore=16, spaceAfter=8),
+        "h2": ParagraphStyle("h2", parent=body, fontSize=16, leading=24,
+                             spaceBefore=12, spaceAfter=6),
+        "h3": ParagraphStyle("h3", parent=body, fontSize=14, leading=21,
+                             spaceBefore=10, spaceAfter=5),
+        "quote": ParagraphStyle("quote", parent=body, leftIndent=16,
+                                textColor=HexColor("#444444")),
+        "code": ParagraphStyle("code", parent=body, fontSize=11, leading=16,
+                               backColor=HexColor("#f0f0f0"), borderPadding=6,
+                               leftIndent=6, spaceBefore=4, spaceAfter=8),
+        "li0": ParagraphStyle("li0", parent=body, leftIndent=20, bulletIndent=4),
+        "cell": ParagraphStyle("cell", parent=body, fontSize=11, leading=16,
+                               spaceAfter=0),
+    }
+
+
+# ------------------------------------------------- html -> reportlab markup
+def _esc_attr(text: str) -> str:
+    return _esc(text).replace('"', "&quot;")
+
+
+def _inline(el) -> str:
+    """Element -> reportlab Paragraph inline markup (b/i/font/a/br)."""
+    tag = el.tag.split("}")[-1] if isinstance(el.tag, str) else ""
+    text = _esc(el.text or "")
+    kids = "".join(_inline(c) for c in el)
+    if tag in ("strong", "b"):
+        body = f"<b>{text}{kids}</b>"
+    elif tag in ("em", "i"):
+        body = f"<i>{text}{kids}</i>"
+    elif tag == "code":
+        body = f"<font>{text}{kids}</font>"
+    elif tag == "br":
+        body = "<br/>"
+    elif tag == "a":
+        href = _esc_attr(el.get("href", ""))
+        body = f'<a href="{href}" color="#1155cc">{text}{kids}</a>'
+    elif tag in ("img",):  # images are not supported in replies
+        body = ""
+    else:
+        body = f"{text}{kids}"
+    return body + _esc(el.tail or "")
+
+
+def _table_flowable(el, st: dict) -> Table | None:
+    rows: list[list[Paragraph]] = []
+    for tr in el.iter("tr"):
+        row = [Paragraph(_inline(c), st["cell"])
+               for c in tr if c.tag in ("td", "th")]
+        if row:
+            rows.append(row)
+    if not rows:
+        return None
+    usable = A4[0] - 80 - 12
+    colw = [usable / len(rows[0])] * len(rows[0])
+    t = Table(rows, colWidths=colw, repeatRows=1, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#999999")),
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor("#eeeeee")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return t
+
+
+def _list_items(el, st: dict, depth: int, ordered: bool) -> list:
+    out: list = []
+    idx = 0
+    for li in el:
+        if not isinstance(li.tag, str) or li.tag.split("}")[-1] != "li":
+            continue
+        idx += 1
+        parts = [_esc(li.text or "")]
+        nested: list = []
+        for c in li:
+            ctag = c.tag.split("}")[-1] if isinstance(c.tag, str) else ""
+            if ctag in ("ul", "ol"):
+                nested.extend(_list_items(c, st, depth + 1, ctag == "ol"))
+            else:
+                parts.append(_inline(c))
+        style = ParagraphStyle(
+            f"li{depth}", parent=st["li0"],
+            leftIndent=st["li0"].leftIndent + depth * 16,
+            bulletIndent=st["li0"].bulletIndent + depth * 16,
         )
-        arch = pymupdf.Archive(str(font.parent))
-    story = pymupdf.Story(html=f"<html><body>{html_body}</body></html>",
-                          user_css=css, archive=arch)
+        out.append(Paragraph("".join(parts), style,
+                             bulletText=f"{idx}." if ordered else "\u2022"))
+        out.extend(nested)
+    return out
+
+
+def _flowables(el, st: dict) -> list:
+    out: list = []
+    for c in el:
+        tag = c.tag.split("}")[-1] if isinstance(c.tag, str) else ""
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            out.append(Paragraph(_inline(c), st.get(tag, st["h3"])))
+        elif tag == "p":
+            out.append(Paragraph(_inline(c), st["body"]))
+        elif tag in ("ul", "ol"):
+            out.extend(_list_items(c, st, 0, tag == "ol"))
+        elif tag == "pre":
+            out.append(XPreformatted("".join(c.itertext()) or " ", st["code"]))
+        elif tag == "blockquote":
+            for sub in c:
+                stag = sub.tag.split("}")[-1] if isinstance(sub.tag, str) else ""
+                if stag == "p":
+                    out.append(Paragraph(_inline(sub), st["quote"]))
+                elif stag in ("ul", "ol"):
+                    out.extend(_list_items(sub, st, 0, stag == "ol"))
+                else:
+                    txt = _inline(sub) if stag else _esc(sub.text or "")
+                    if txt:
+                        out.append(Paragraph(txt, st["quote"]))
+        elif tag == "table":
+            t = _table_flowable(c, st)
+            if t is not None:
+                out.append(t)
+        elif tag == "hr":
+            out.append(HRFlowable(width="100%", thickness=0.6,
+                                  color=HexColor("#bbbbbb"),
+                                  spaceBefore=8, spaceAfter=8))
+        elif tag == "div":
+            out.extend(_flowables(c, st))
+        else:
+            txt = _inline(c)
+            if txt:
+                out.append(Paragraph(txt, st["body"]))
+    return out
+
+
+def _flow_pdf(html_body: str, font: Path | None) -> bytes:
+    f = _pick_font(font)
+    st = _styles(f)
+    try:
+        root = ET.fromstring(f"<muzebody>{html_body}</muzebody>")
+        story = _flowables(root, st)
+    except ET.ParseError as e:  # raw non-XHTML html slipped through
+        log.warning("html parse failed (%s); rendering as plain text", e)
+        story = [Paragraph(_esc(html_body), st["body"])]
     buf = io.BytesIO()
-    writer = pymupdf.DocumentWriter(buf)
-    mediabox = pymupdf.paper_rect("a4")
-    where = mediabox + (40, 40, -40, -40)
-    more = 1
-    while more:
-        dev = writer.begin_page(mediabox)
-        more, _ = story.place(where)
-        story.draw(dev)
-        writer.end_page()
-    writer.close()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=40, rightMargin=40,
+                            topMargin=40, bottomMargin=40,
+                            title="muze", author="muze")
+    doc.build(story)
     return buf.getvalue()
 
 
@@ -147,15 +317,9 @@ def render_pdf(
     if markdown:
         html_body = markdown_to_html(text)
     else:
-        html_body = "<p>" + _esc(text or "").replace("\n", "<br>") + "</p>"
+        html_body = "<p>" + _esc(text or "").replace("\n", "<br />") + "</p>"
     font = find_user_font(font_dir, font_override)
-    pdf = _story_pdf(html_body, font)
-    try:  # shrink the embedded fallback font (no-op without fonttools)
-        doc = pymupdf.Document(stream=pdf, filetype="pdf")
-        doc.subset_fonts()
-        return doc.tobytes()
-    except Exception:
-        return pdf
+    return _flow_pdf(html_body, font)
 
 
 def render_png(
@@ -172,12 +336,13 @@ def render_png(
         return None
     try:
         pdf = render_pdf(text, font_dir, markdown=markdown, font_override=font_override)
-        doc = pymupdf.Document(stream=pdf, filetype="pdf")
+        doc = pdfium.PdfDocument(pdf)
         n = min(len(doc), max_pages)
         if n <= 0:
             return None
-        dpi = int(72 * max(1.0, scale))
-        imgs = [doc[i].get_pixmap(dpi=dpi).pil_image() for i in range(n)]
+        s = max(1.0, scale)
+        imgs = [doc[i].render(scale=s).to_pil().convert("RGB") for i in range(n)]
+        doc.close()
         if len(imgs) == 1:
             out = imgs[0]
         else:
