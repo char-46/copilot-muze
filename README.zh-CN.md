@@ -350,6 +350,47 @@ uv run muze cfg set web.port 8301       # 改文件（重写 YAML，注释丢失
 WebUI 有 **Settings** 标签页（分组表单；密钥保持打码，除非你输入新值），
 改动即时生效 —— 持久化请编辑 `config.yaml` 后运行 `/reload`。
 
+## 远程调试（中继机）
+
+在没有路由到目标机的开发机上调试运行中的实例——两侧都只有*出站*连接，
+都不需要公网 IP。控制面就是 WebUI（`POST /api/command` 与 CLI 命令面 1:1），
+由一条经中继机的 ssh 反向隧道承载。
+
+muze 盒上一次性准备（生成仅可转发的密钥，中继拿不到 shell）：
+
+```powershell
+ssh-keygen -t ed25519 -N "" -C muze-debug-tunnel -f data\.ssh\muze_tunnel
+# 将 .pub 内容以【单行】追加到中继的 authorized_keys：
+#   restrict,port-forwarding,command="/bin/false",
+#   permitopen="127.0.0.1:1",permitlisten="127.0.0.1:18300" ssh-ed25519 AAAA...
+# （无 shell、无 pty、无跳板，中继侧绑定被钉死在回环 18300）
+```
+
+然后在 `config.yaml`：
+
+```yaml
+web:
+  tunnel:                     # 由 serve 托管：保活 `ssh -N -R` 子进程
+    enabled: true
+    host: relay.example.com   # 中继上现成的 sshd 承担全部工作
+    user: root
+    key_file: data/.ssh/muze_tunnel
+    remote_port: 18300        # 必须等于上面 permitlisten 钉的端口
+```
+
+开发机侧：
+
+```powershell
+ssh -L 8300:127.0.0.1:18300 root@relay.example.com   # 跳板，保持打开
+muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>
+```
+
+`--remote` 驱动的是*运行中的*实例（同样的命令、同样的 `::` 会话、实时状态），
+而非在本地再嵌入一份；token 也可走 `MUZE_REMOTE_TOKEN` 或开发机
+`config.yaml` 的 `remote:` 段。凭据层层独立：中继不出现新的公网监听
+（转发端口只绑其回环）、隧道密钥只能转发到那一个钉死端口、WebUI 本身
+还要 bearer token。
+
 ## 测试
 
 ```bash

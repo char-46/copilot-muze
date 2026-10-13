@@ -381,6 +381,50 @@ The WebUI has a **Settings** tab (grouped form; secrets stay masked unless
 you type a new value) that applies changes at runtime — persist them by
 editing `config.yaml` and running `/reload`.
 
+## Remote debugging (relay box)
+
+Debug a running instance from a dev machine that has no route to it — both
+sides only make *outbound* connections, so neither needs a public IP. The
+webui is the control plane (`POST /api/command` maps 1:1 to the CLI command
+surface); an ssh reverse tunnel through any reachable relay carries it.
+
+One-time, on the muze box (generates a forward-only key; the relay never
+gains shell access):
+
+```powershell
+ssh-keygen -t ed25519 -N "" -C muze-debug-tunnel -f data\.ssh\muze_tunnel
+# append the .pub half to the relay's authorized_keys as ONE line:
+#   restrict,port-forwarding,command="/bin/false",
+#   permitopen="127.0.0.1:1",permitlisten="127.0.0.1:18300" ssh-ed25519 AAAA...
+# (no shell, no pty, no pivot, and the relay bind pinned to loopback:18300)
+```
+
+Then in `config.yaml`:
+
+```yaml
+web:
+  tunnel:                     # managed by serve: keeps `ssh -N -R` alive
+    enabled: true
+    host: relay.example.com   # sshd on the relay does all the work
+    user: root
+    key_file: data/.ssh/muze_tunnel
+    remote_port: 18300        # must equal the permitlisten pin above
+```
+
+From the dev machine:
+
+```powershell
+ssh -L 8300:127.0.0.1:18300 root@relay.example.com   # hop, keep open
+muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>
+```
+
+`--remote` drives the *running* instance (same commands, same `::` agent
+turns, live state) instead of embedding a second one; token also via
+`MUZE_REMOTE_TOKEN` or the `remote:` section of the dev machine's
+`config.yaml`. Layered credentials: the relay sees no new public listener
+(the forwarded port binds its loopback), the tunnel key can only forward to
+that one pinned port, and the webui itself requires its bearer token.
+
 ## Tests
 
 ```bash

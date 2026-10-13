@@ -389,7 +389,7 @@ wheels = [
 
 [[package]]
 name = "copilot-muze"
-version = "0.1.0a117"
+version = "0.1.0a118"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

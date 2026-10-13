@@ -1193,6 +1193,7 @@ async def _bootstrap(apps: list[App]) -> None:
     exit code is aggregated in run_main.
     """
     web_runner = None
+    tunnel = None
     registry: dict[str, ControlService] = {}
     try:
         for i, app in enumerate(apps):
@@ -1211,6 +1212,18 @@ async def _bootstrap(apps: list[App]) -> None:
             web_runner, _token = await start_web(
                 apps[0].cfg.web, accounts, apps[0].chatlog
             )
+            if apps[0].cfg.web.tunnel.enabled:
+                from muze.tunnel import SshTunnel
+
+                try:
+                    tunnel = SshTunnel(
+                        apps[0].cfg.web.tunnel,
+                        apps[0].cfg.web.port,
+                        apps[0].cfg.storage.data_dir,
+                    )
+                    await tunnel.start()
+                except Exception:
+                    log.exception("ssh tunnel failed to start; continuing without it")
 
         log.info("running %s account(s): %s", len(apps), ", ".join(registry))
         tasks = [
@@ -1236,6 +1249,11 @@ async def _bootstrap(apps: list[App]) -> None:
             if exc:
                 log.error("account task crashed: %s", exc)
     finally:
+        if tunnel is not None:
+            try:
+                await tunnel.stop()
+            except Exception:
+                log.exception("tunnel cleanup failed")
         if web_runner is not None:
             try:
                 await asyncio.wait_for(web_runner.cleanup(), timeout=5)
