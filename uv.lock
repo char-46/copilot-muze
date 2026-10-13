@@ -630,12 +630,13 @@ wheels = [
 
 [[package]]
 name = "copilot-muze"
-version = "0.1.0a115"
+version = "0.1.0a116"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "fonttools" },
+    { name = "httpx" },
     { name = "markdown" },
     { name = "openai" },
     { name = "openpyxl" },
@@ -677,6 +678,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "fastembed", marker = "extra == 'rag-onnx'", specifier = ">=0.3" },
     { name = "fonttools", specifier = ">=4.50" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "markdown", specifier = ">=3.6" },
     { name = "nvidia-ml-py", marker = "extra == 'rag-local'", specifier = ">=12" },
     { name = "openai", specifier = ">=1.40" },
