@@ -318,6 +318,27 @@ class LLMConfig(BaseModel):
         return DEFAULT_ROLE_CHAINS.get(role, ["chat"])
 
 
+class TunnelConfig(BaseModel):
+    """SSH reverse tunnel exposing the webui through a relay box, so an
+    operator on a dev machine (possibly without a route to this host) can
+    remote-debug via `muze cli --remote`.
+
+    Security posture: the relay only receives an *outbound* ssh connection
+    from here; the forwarded listener binds loopback *on the relay*, so no
+    new public port appears anywhere. Use a dedicated key restricted in the
+    relay's authorized_keys to `restrict,port-forwarding` (no pty, no
+    commands) — a stolen key then only ever reaches the token-guarded webui.
+    """
+
+    enabled: bool = False
+    host: str = ""  # relay, e.g. hangzhou.aliyun.h-sr.cn
+    port: int = 22
+    user: str = "root"
+    key_file: str = ""  # default: <data_dir>/.ssh/muze_tunnel (create by hand)
+    remote_host: str = "127.0.0.1"  # bind address on the relay
+    remote_port: int = 0  # 0 = same as web.port
+
+
 class WebConfig(BaseModel):
     """App-level webui: one web frontend serves every account in the process."""
 
@@ -325,6 +346,20 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8300
     token: str = ""  # empty -> generated at startup and logged
+    tunnel: TunnelConfig = TunnelConfig()
+
+
+class RemoteConfig(BaseModel):
+    """`muze cli --remote` upstream (the *dev machine* side).
+
+    Resolved from CLI args > env (MUZE_REMOTE_URL / MUZE_REMOTE_TOKEN /
+    MUZE_REMOTE_ACCOUNT) > the `remote:` section of config.yaml.
+    """
+
+    url: str = ""  # e.g. http://127.0.0.1:8300 via an ssh -L tunnel
+    token: str = ""
+    account: str = ""
+    timeout: float = 600.0
 
 
 class LogConfig(BaseModel):
@@ -609,6 +644,23 @@ def load_accounts(path: str | Path) -> list[AccountSpec]:
             raise ValueError(f"accounts.milky[{i}] ({name}) endpoint invalid:\n{e}") from e
         specs.append(AccountSpec(name, "milky", endpoint, cfg))
     return specs
+
+
+def load_remote(path: str | Path) -> RemoteConfig:
+    """Read the top-level `remote:` section of config.yaml (dev-machine side
+    of `muze cli --remote`). Missing section -> all defaults (empty url)."""
+    p = Path(path)
+    if not p.exists():
+        return RemoteConfig()
+    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        return RemoteConfig()
+    sec = raw.get("remote")
+    if not sec:
+        return RemoteConfig()
+    if not isinstance(sec, dict):
+        raise ValueError(f"invalid config {p}: remote must be a mapping")
+    return RemoteConfig.model_validate(sec)
 
 
 def describe_watch(cfg: MuzeConfig, scene: str, peer_id: int) -> bool:

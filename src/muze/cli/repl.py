@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from muze.ai.agent import Agent
@@ -33,11 +35,78 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
         "-i", "--instance", default=None,
         help="account name when the config defines multiple accounts",
     )
+    p.add_argument(
+        "--remote", default=None,
+        help="upstream webui URL (client mode: drive the running instance "
+             "over HTTP instead of embedding a second one), e.g. "
+             "http://127.0.0.1:8300; also env MUZE_REMOTE_URL or the "
+             "`remote:` section of config.yaml",
+    )
+    p.add_argument(
+        "--remote-token", default=None,
+        help="webui bearer token; also env MUZE_REMOTE_TOKEN or remote.token",
+    )
+    p.add_argument(
+        "--account", default=None,
+        help="account name on the upstream (multi-account instances)",
+    )
     return p.parse_args(argv)
+
+
+def _resolve_remote(args: argparse.Namespace):
+    """args > env > config.yaml `remote:`; returns (url, token, account)."""
+    from muze.config import load_remote
+
+    rc = load_remote(args.config)
+    url = args.remote or os.environ.get("MUZE_REMOTE_URL") or rc.url
+    token = (args.remote_token or os.environ.get("MUZE_REMOTE_TOKEN") or rc.token)
+    account = args.account or os.environ.get("MUZE_REMOTE_ACCOUNT") or rc.account
+    return url, token, account
+
+
+async def _run_remote(args: argparse.Namespace) -> int:
+    from muze.cli.remote import RemoteService
+    from muze.console import repl_async
+    from muze.core.service import ControlContext
+
+    url, token, account = _resolve_remote(args)
+    if not url:
+        print("remote mode needs a URL: --remote URL / MUZE_REMOTE_URL / remote.url",
+              file=sys.stderr)
+        return 2
+    svc = RemoteService(url, token=token, account=account)
+    try:
+        info = await svc.ping()
+    except RuntimeError as e:
+        print(f"remote: {e}", file=sys.stderr)
+        await svc.close()
+        return 2
+    ver = info.get("version", "?")
+    acct = info.get("account", account or "default")
+    print(
+        f"muze cli (remote) -> {url} | account={acct} | upstream={ver}\n"
+        f"  remote console: /shutdown closes this console only (the service keeps running)",
+        flush=True,
+    )
+    ctx = ControlContext(
+        source="cli", chat_key="cli:remote", scene="", peer_id=0,
+        user_label="console-remote", auto_confirm=True,
+    )
+    history = Path(tempfile.gettempdir()) / "muze_remote_console_history"
+    try:
+        await repl_async(svc, ctx, history)
+    finally:
+        await svc.close()
+    return 0
 
 
 def run_cli(argv: list[str]) -> int:
     args = parse_cli_args(argv)
+    if args.remote is not None or os.environ.get("MUZE_REMOTE_URL"):
+        try:
+            return asyncio.run(_run_remote(args))
+        except KeyboardInterrupt:
+            return 0
     try:
         specs = load_accounts(args.config)
     except (FileNotFoundError, ValueError) as e:
