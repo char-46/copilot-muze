@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -78,3 +81,19 @@ def test_tunnel_missing_key_hint(tmp_path):
     tun = SshTunnel(TunnelConfig(enabled=True, host="r"), 8300, tmp_path)
     with pytest.raises(FileNotFoundError, match="permitlisten"):
         tun.command()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls ACL fix is win32-only")
+def test_tunnel_key_acl_auto_tightened(tmp_path):
+    key = _mkkey(tmp_path)
+    # simulate the copy-from-elsewhere state: explicit group ACEs, exactly
+    # what /inheritance:r alone would NOT remove
+    for sid in ("*S-1-5-11", "*S-1-5-32-545"):
+        subprocess.run(["icacls", str(key), "/grant", f"{sid}:R"],
+                       capture_output=True, check=False)
+    tun = SshTunnel(TunnelConfig(enabled=True, host="r"), 8300, tmp_path)
+    tun._tighten_key_acl()
+    acl = subprocess.run(["icacls", str(key)], capture_output=True,
+                         text=True, check=False).stdout
+    assert "S-1-5-11" not in acl
+    assert (os.environ.get("USERNAME") or "").lower() in acl.lower()

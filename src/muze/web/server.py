@@ -13,7 +13,7 @@ import json
 import logging
 import secrets
 from pathlib import Path
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 
 from aiohttp import web
 
@@ -68,7 +68,8 @@ def _coerce_like(value: object, like: object) -> object:
     return value
 
 
-def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
+def create_app(accounts: dict[str, WebAccount], token: str,
+               extra_tokens: "Iterable[str]" = ()) -> web.Application:
     default_name = next(iter(accounts))
 
     def ctx(user: str = "web") -> ControlContext:
@@ -91,12 +92,14 @@ def create_app(accounts: dict[str, WebAccount], token: str) -> web.Application:
         return acct
 
     # ------------------------------------------------------------------
+    valid_tokens = tuple(t for t in (token, *extra_tokens) if t)
+
     @web.middleware
     async def auth(request: web.Request, handler):
         if request.path.startswith("/api/"):
             hdr = request.headers.get("Authorization", "")
             supplied = hdr[7:].strip() if hdr.startswith("Bearer ") else request.query.get("token", "")
-            if not secrets.compare_digest(supplied, token):
+            if not any(secrets.compare_digest(supplied, t) for t in valid_tokens):
                 return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
 
@@ -665,7 +668,8 @@ async def start_web(
         n: (a if isinstance(a, WebAccount) else WebAccount(*a))
         for n, a in accounts.items()
     }
-    app = create_app(norm, token)
+    extra = (cfg.tunnel.token,) if cfg.tunnel.token and cfg.tunnel.token != token else ()
+    app = create_app(norm, token, extra_tokens=extra)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, cfg.host, cfg.port)
