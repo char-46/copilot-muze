@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 from pathlib import Path
 
 from muze.config import TunnelConfig, TunnelForward
@@ -65,6 +67,7 @@ class SshTunnel:
                 "loopback-only binds; each box claims its own remote_port "
                 "range so tunnels never collide)"
             )
+        self._tighten_key_acl()
         cmd = [
             "ssh", "-N", "-T",
             "-o", "BatchMode=yes",
@@ -84,6 +87,49 @@ class SshTunnel:
             ]
         cmd.append(f"{self.cfg.user}@{self.cfg.host}")
         return cmd
+
+    def _tighten_key_acl(self) -> None:
+        """Windows OpenSSH refuses private keys readable by other accounts
+        ("Bad permissions ... UNPROTECTED PRIVATE KEY FILE"). A key copied
+        from elsewhere inherits group ACEs (Authenticated Users etc.), so
+        strip inheritance and grant only the current user read access —
+        exactly the manual icacls dance every new box would otherwise hit."""
+        if sys.platform != "win32":
+            return
+        import subprocess
+
+        try:
+            r = subprocess.run(
+                ["icacls", str(self.key_file)], capture_output=True,
+                text=True, timeout=10,
+            )
+            acl = r.stdout or ""
+            too_open = (
+                "Authenticated Users" in acl
+                or "Everyone" in acl
+                or "\\Users" in acl
+            )
+            if not too_open:
+                return
+            user = os.environ.get("USERNAME") or ""
+            if not user:
+                return
+            log.info("tunnel key %s ACL too open; restricting to %s",
+                     self.key_file.name, user)
+            # NB: /inheritance:r only strips INHERITED aces; copy tools and
+            # default folder templates leave EXPLICIT group aces behind, so
+            # also remove the usual suspects by SID (locale-proof):
+            # Authenticated Users S-1-5-11, Users S-1-5-32-545, Everyone
+            # S-1-1-0. Administrators/SYSTEM may stay (ssh accepts those).
+            for args in (
+                ["icacls", str(self.key_file), "/inheritance:r"],
+                ["icacls", str(self.key_file), "/remove:g",
+                 "*S-1-5-11", "*S-1-5-32-545", "*S-1-1-0"],
+                ["icacls", str(self.key_file), "/grant:r", f"{user}:R"],
+            ):
+                subprocess.run(args, capture_output=True, timeout=10, check=False)
+        except Exception as e:  # best effort: ssh will report if still bad
+            log.warning("key ACL tightening failed (%s); ssh may reject the key", e)
 
     async def start(self) -> None:
         cmd = self.command()  # fail fast on missing key/config

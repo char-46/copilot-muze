@@ -392,13 +392,16 @@ web:
         remote_port: 18300
       - local_port: 22        # 本盒 sshd（开发机 shell）
         remote_port: 18301
+    token: <长随机串>          # 独立的远程访问令牌（可选）：本地浏览器继续用
+                              # web.token，--remote 用这把；两者互不影响、
+                              # 可分别轮换
 ```
 
 **开发机侧：**
 
 ```powershell
 ssh -L 8300:127.0.0.1:18300 -L 2222:127.0.0.1:18301 root@relay.example.com
-muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>   # REPL
+muze cli --remote http://127.0.0.1:8300 --remote-token <tunnel token>   # REPL
 ssh -p 2222 <盒上用户>@127.0.0.1                                        # shell
 ```
 

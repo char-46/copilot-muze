@@ -349,6 +349,9 @@ class TunnelConfig(BaseModel):
     remote_host: str = "127.0.0.1"  # bind address for every forward on the relay
     remote_port: int = 0  # webui forward when `forwards` is empty; 0 = web.port
     forwards: list[TunnelForward] = []  # extra/complete forward table
+    token: str = ""  # independent bearer token for remote (tunnel) webui access;
+    # the local browser keeps web.token while `muze cli --remote` uses this one —
+    # either leaking never invalidates the other, and they rotate independently
 
 
 class WebConfig(BaseModel):

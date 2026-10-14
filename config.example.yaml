@@ -199,6 +199,9 @@ web:                          # app-level: one webui serves every account
                               #  range (box1: 1830x, box2: 1831x, ...) so
                               #  tunnels never collide. forwards:[]
                               #  defaults to webui-only via remote_port.
+  #   token: ""               # INDEPENDENT bearer token for remote access:
+                              # the local browser keeps web.token, muze cli
+                              # --remote uses this one; rotate separately
 
 # remote:                     # DEV MACHINE side of `muze cli --remote` (args
 #   url: http://127.0.0.1:8300   # and MUZE_REMOTE_* env win over this section)

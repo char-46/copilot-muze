@@ -425,13 +425,15 @@ web:
         remote_port: 18300
       - local_port: 22        # this box's sshd (dev shells)
         remote_port: 18301
+    token: <strong random>    # independent remote-access bearer (optional);
+                              # the browser keeps web.token, --remote uses this
 ```
 
 **From the dev machine:**
 
 ```powershell
 ssh -L 8300:127.0.0.1:18300 -L 2222:127.0.0.1:18301 root@relay.example.com
-muze cli --remote http://127.0.0.1:8300 --remote-token <webui token>   # REPL
+muze cli --remote http://127.0.0.1:8300 --remote-token <tunnel token>   # REPL
 ssh -p 2222 <box-user>@127.0.0.1                                        # shell
 ```
 

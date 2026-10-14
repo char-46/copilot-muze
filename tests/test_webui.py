@@ -167,6 +167,31 @@ async def test_memories_endpoint(client):
     assert d["memories"] == []
 
 
+async def test_tunnel_token_independent(tmp_path):
+    """web.tunnel.token is a second valid bearer; wrong tokens still 401."""
+    conn = await open_db(str(tmp_path / "t.db"))
+    repo = Repository(conn)
+    svc = ControlService(MuzeConfig(), Recorder(), repo, ChatLog(), Runtime())
+    app = create_app(
+        {"main": WebAccount(svc, repo, svc.runtime)},
+        "browser-token",
+        extra_tokens=("tunnel-token",),
+    )
+    server = TestServer(app)
+    cl = TestClient(server)
+    await cl.start_server()
+    try:
+        r = await cl.get("/api/info", headers={"Authorization": "Bearer tunnel-token"})
+        assert r.status == 200  # tunnel token accepted
+        r = await cl.get("/api/info", headers={"Authorization": "Bearer browser-token"})
+        assert r.status == 200  # primary token still valid
+        r = await cl.get("/api/info", headers={"Authorization": "Bearer wrong"})
+        assert r.status == 401
+    finally:
+        await cl.close()
+        await conn.close()
+
+
 async def test_rag_endpoint_and_search(client):
     r = await client.get("/api/rag")
     assert r.status == 200
