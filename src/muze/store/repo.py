@@ -324,6 +324,7 @@ class Repository:
         self, media_id: int, *, status: str, file_path: str | None = None,
         file_size: int | None = None, error: str | None = None,
         content_hash: str | None = None, summary: str | None = None,
+        asr_ts: str | None = None,
     ) -> None:
         await self.conn.execute(
             """
@@ -331,10 +332,11 @@ class Repository:
                              file_size=COALESCE(?, file_size),
                              content_hash=COALESCE(?, content_hash),
                              summary=COALESCE(?, summary),
+                             asr_ts=COALESCE(?, asr_ts),
                              error=?, updated_at=?
             WHERE id=?
             """,
-            (status, file_path, file_size, content_hash, summary, error, _now(), media_id),
+            (status, file_path, file_size, content_hash, summary, asr_ts, error, _now(), media_id),
         )
         await self.conn.commit()
 
