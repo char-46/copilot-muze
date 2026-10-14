@@ -120,23 +120,34 @@ class BackfillConfig(BaseModel):
 
 
 class AsrConfig(BaseModel):
-    """Voice transcription chain: api | local | qq | auto | "" (off).
+    """Voice transcription chain: api | qwen | local | qq | auto | "" (off).
 
     - api: any OpenAI-compatible /audio/transcriptions endpoint (whisper-1,
       SenseVoice, ...) — configured as an llm.models entry routed via the
       llm.roles "asr" chain
+    - qwen: local Qwen3-ASR (optional dependency `uv sync --extra asr-qwen`);
+      with an aligner configured it also produces per-word timestamps via
+      Qwen3-ForcedAligner (persisted to media.asr_ts)
     - local: faster-whisper on CPU (optional dependency, installed separately)
     - qq: the protocol side itself — Milky/LLBot exposes NO transcription
       API today, so this is a reserved stub that reports unsupported
-    - auto: api when configured, else local when importable, else off
+    - auto: api when configured, else qwen when importable, else local, else off
     """
 
     enabled: bool = True
-    provider: str = "auto"  # auto | api | local | qq | ""
+    provider: str = "auto"  # auto | api | qwen | local | qq | ""
     language: str = "zh"
     max_per_pass: int = 8  # clips transcribed per enrichment pass
     local_model: str = "small"  # faster-whisper model size
     min_duration_sec: float = 1.0  # shorter clips are not worth a call
+    # --- qwen backend (qwen-asr package, transformers) ---
+    qwen_model: str = "Qwen/Qwen3-ASR-0.6B"  # hf id or local dir
+    aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B"  # "" = no timestamps
+    timestamps: bool = True  # keep per-word timings (needs aligner_model)
+    qwen_device: str = "auto"  # auto (GPU when VRAM fits, else CPU) | cuda | cpu
+    qwen_gpu_weight_gb: float = 3.4  # ASR + aligner bf16 VRAM estimate
+    qwen_max_new_tokens: int = 512  # raise for very long clips
+    qwen_unload_idle_sec: int = 1800  # release the model after this idle (0=never)
 
 
 class OcrConfig(BaseModel):

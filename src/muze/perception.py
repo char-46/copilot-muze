@@ -51,14 +51,120 @@ def _faster_whisper():
         return None
 
 
+def _qwen_asr_pkg():
+    try:
+        from qwen_asr import Qwen3ASRModel  # type: ignore
+
+        return Qwen3ASRModel
+    except Exception:
+        return None
+
+
+# cfg.language ("zh", "en", ...) -> Qwen3-ASR language name; None = autodetect
+_QWEN_LANG = {
+    "zh": "Chinese", "en": "English", "yue": "Cantonese", "ja": "Japanese",
+    "ko": "Korean", "ru": "Russian", "fr": "French", "de": "German",
+    "es": "Spanish", "pt": "Portuguese", "it": "Italian", "": None,
+}
+
+
+class QwenAsrBackend:
+    """Local Qwen3-ASR (+ optional Qwen3-ForcedAligner timestamps).
+
+    Loads lazily on first clip; GPU (bf16) when free VRAM fits, else CPU
+    (float32). unload_if_idle() releases the weights between sparse
+    enrichment passes, mirroring the embedder governor philosophy."""
+
+    def __init__(self, cfg: AsrConfig) -> None:
+        self.cfg = cfg
+        self._model = None
+        self._last_used = 0.0
+
+    # -- lifecycle -------------------------------------------------
+    def _pick_device(self) -> tuple[str, str]:
+        """(device_map, dtype-torch-name)"""
+        want = (self.cfg.qwen_device or "auto").strip().lower()
+        if want in ("cpu", ""):
+            return "cpu", "float32"
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                if want == "cuda":
+                    return "cuda:0", "bfloat16"
+                free, _total = torch.cuda.mem_get_info()
+                if free >= self.cfg.qwen_gpu_weight_gb * (1 << 30):
+                    return "cuda:0", "bfloat16"
+        except Exception:
+            pass
+        return "cpu", "float32"
+
+    def _load(self):
+        Model = _qwen_asr_pkg()
+        if Model is None:
+            raise RuntimeError("qwen: 未安装 qwen-asr（uv sync --extra asr-qwen）")
+        if self._model is None:
+            import time
+
+            import torch
+
+            device, dtype_name = self._pick_device()
+            kwargs = dict(
+                dtype=getattr(torch, dtype_name),
+                device_map=device,
+                max_inference_batch_size=8,
+                max_new_tokens=self.cfg.qwen_max_new_tokens,
+            )
+            if self.cfg.aligner_model and self.cfg.timestamps:
+                kwargs["forced_aligner"] = self.cfg.aligner_model
+                kwargs["forced_aligner_kwargs"] = dict(
+                    dtype=getattr(torch, dtype_name), device_map=device
+                )
+            log.info("loading qwen3-asr %s on %s", self.cfg.qwen_model, device)
+            self._model = Model.from_pretrained(self.cfg.qwen_model, **kwargs)
+        self._last_used = time.time()
+        return self._model
+
+    def unload_if_idle(self, now: float | None = None) -> bool:
+        limit = self.cfg.qwen_unload_idle_sec
+        if not limit or self._model is None:
+            return False
+        import time
+
+        if (now or time.time()) - self._last_used >= limit:
+            log.info("unloading idle qwen3-asr")
+            self._model = None
+            return True
+        return False
+
+    # -- inference -------------------------------------------------
+    def transcribe_full(self, wav_path: Path) -> tuple[str, list[list]]:
+        """-> (text, [[word, start, end], ...]) — timings empty without an
+        aligner. Blocking; callers wrap in a thread."""
+        model = self._load()
+        lang = _QWEN_LANG.get((self.cfg.language or "").strip().lower())
+        want_ts = bool(self.cfg.aligner_model) and self.cfg.timestamps
+        r = model.transcribe(
+            audio=str(wav_path), language=lang, return_time_stamps=want_ts
+        )[0]
+        text = (getattr(r, "text", "") or "").strip()
+        ts = []
+        for w in getattr(r, "time_stamps", None) or []:
+            ts.append([getattr(w, "text", ""), round(float(w.start_time), 2),
+                       round(float(w.end_time), 2)])
+        return text, ts
+
+
 class AsrChain:
-    """provider pick: api (registry asr role) | local (faster-whisper) |
-    qq (reserved stub) | auto. resolve() reports what is actually usable."""
+    """provider pick: api (registry asr role) | qwen (local Qwen3-ASR) |
+    local (faster-whisper) | qq (reserved stub) | auto. resolve() reports
+    what is actually usable."""
 
     def __init__(self, cfg: AsrConfig, llm: LLMClient) -> None:
         self.cfg = cfg
         self.llm = llm
         self._local_model = None  # lazy faster-whisper instance
+        self._qwen = QwenAsrBackend(cfg) if _qwen_asr_pkg() else None
 
     def resolve(self) -> tuple[str, str]:
         """(active_provider, note) — "" provider means unavailable."""
@@ -74,24 +180,44 @@ class AsrChain:
             if _asr_api_entry(self.llm) is None:
                 return "", "api: llm.roles 未配置 asr 角色"
             return "api", ""
+        if p == "qwen":
+            if _qwen_asr_pkg() is None:
+                return "", "qwen: 未安装 qwen-asr（uv sync --extra asr-qwen）"
+            return "qwen", ""
         if p == "local":
             if _faster_whisper() is None:
                 return "", "local: 未安装 faster-whisper"
             return "local", ""
-        # auto: api first (no local footprint), then local, then qq
+        # auto: api first (no local footprint), then qwen, then whisper
         if _asr_api_entry(self.llm) is not None:
             return "api", ""
+        if _qwen_asr_pkg() is not None:
+            return "qwen", ""
         if _faster_whisper() is not None:
             return "local", ""
-        return "", "auto: 无可用 ASR 后端（配置 api 角色或安装 faster-whisper）"
+        return "", "auto: 无可用 ASR 后端（配置 api 角色或安装 qwen-asr/faster-whisper）"
 
     async def transcribe(self, wav_path: str | Path, duration_sec: float = 0.0) -> str:
+        text, _ts = await self.transcribe_full(wav_path, duration_sec)
+        return text
+
+    async def transcribe_full(
+        self, wav_path: str | Path, duration_sec: float = 0.0
+    ) -> tuple[str, list[list]]:
         provider, note = self.resolve()
         if not provider:
             raise RuntimeError(note or "ASR 不可用")
         if provider == "api":
-            return await self._transcribe_api(Path(wav_path), duration_sec)
-        return await self._transcribe_local(Path(wav_path))
+            return await self._transcribe_api(Path(wav_path), duration_sec), []
+        if provider == "qwen":
+            if self._qwen is None:  # package appeared after __init__
+                self._qwen = QwenAsrBackend(self.cfg)
+            return await _to_thread(self._qwen.transcribe_full, Path(wav_path))
+        return await self._transcribe_local(Path(wav_path)), []
+
+    def maybe_unload(self) -> None:
+        if self._qwen is not None:
+            self._qwen.unload_if_idle()
 
     async def _transcribe_api(self, p: Path, duration_sec: float = 0.0) -> str:
         chain = self.llm.resolve("asr")
@@ -147,8 +273,16 @@ async def _to_thread(fn, *a):
 
 # ------------------------------------------------------------------- OCR
 def _rapidocr():
+    """rapidocr-onnxruntime ships as `rapidocr_onnxruntime` on the 1.3.x
+    line and as the unified `rapidocr` module since 1.4 — accept both."""
     try:
         from rapidocr_onnxruntime import RapidOCR  # type: ignore
+
+        return RapidOCR
+    except Exception:
+        pass
+    try:
+        from rapidocr import RapidOCR  # type: ignore
 
         return RapidOCR
     except Exception:

@@ -407,9 +407,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v10_ai_sessions(conn)
         await _migrate_v11_rag(conn)
         await _migrate_v12_value(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '12')")
+        await _migrate_v13_media_asr_ts(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '13')")
         await conn.commit()
-        log.info("database created (schema v12)")
+        log.info("database created (schema v13)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -453,6 +454,21 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v12 (message value scores)")
         version = 12
+    if version < 13:
+        await _migrate_v13_media_asr_ts(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '13')")
+        await conn.commit()
+        log.info("database migrated to schema v13 (media asr timestamps)")
+        version = 13
+
+
+async def _migrate_v13_media_asr_ts(conn: aiosqlite.Connection) -> None:
+    """media.asr_ts: JSON [[word, start, end], ...] from Qwen3-ForcedAligner."""
+    async with conn.execute("PRAGMA table_info(media)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if not cols or "asr_ts" in cols:
+        return
+    await conn.execute("ALTER TABLE media ADD COLUMN asr_ts TEXT")
 
 
 async def _migrate_v12_value(conn: aiosqlite.Connection) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -757,6 +758,8 @@ class App:
                     done += await self._ocr_pass(ocr)
                 if done:
                     log.info("[%s] perception pass: %s media enriched", self.spec.name, done)
+                if asr is not None:
+                    asr.maybe_unload()  # release idle local ASR weights
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -778,7 +781,8 @@ class App:
                 await self.repo.update_media(m["id"], status="done", summary="")
                 continue
             try:
-                text = (await asr.transcribe(p, duration_sec=dur)).strip()
+                text, ts = await asr.transcribe_full(p, duration_sec=dur)
+                text = text.strip()
             except Exception as e:
                 log.warning("asr failed for %s: %s", m.get("file_path"), e)
                 continue  # transient-looking: retried on a later pass
@@ -786,7 +790,8 @@ class App:
                 await self.repo.update_media(m["id"], status="done", summary="")
                 continue
             await self.repo.update_media(
-                m["id"], status="done", summary=("[转写] " + text)[:500]
+                m["id"], status="done", summary=("[转写] " + text)[:500],
+                asr_ts=json.dumps(ts, ensure_ascii=False) if ts else None,
             )
             old = await self.repo.message_text(m["scene"], m["peer_id"], m["message_seq"])
             if old:
@@ -957,14 +962,14 @@ class App:
                     fixed = await self.media.retry_failed(limit=20)
                     if fixed:
                         log.info("media retry recovered %s file(s)", fixed)
-                    swept, swept_b = self.blobs.sweep_tmp(
+                    swept, swept_b = self.blobstore.sweep_tmp(
                         getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0)
                     )
                     # read-only fallback roots (an old store after a volume
                     # move) get their tmp swept too — no process writes there
                     # anymore, so any .part left behind is abandoned
-                    for alt in self.blobs.read_roots:
-                        s2, b2 = self.blobs.sweep_root_tmp(
+                    for alt in self.blobstore.read_roots:
+                        s2, b2 = self.blobstore.sweep_root_tmp(
                             alt,
                             getattr(self.cfg.ingest, "media_tmp_max_age_sec", 21600.0),
                         )
