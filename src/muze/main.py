@@ -1209,6 +1209,8 @@ async def _bootstrap(apps: list[App]) -> None:
                         apps[0].cfg.storage.data_dir,
                     )
                     await tunnel.start()
+                    for app in apps:  # /tun reaches it from any account
+                        app.runtime.tunnel = tunnel
                 except Exception:
                     log.exception("ssh tunnel failed to start; continuing without it")
 
