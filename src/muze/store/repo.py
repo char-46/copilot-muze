@@ -294,18 +294,20 @@ class Repository:
             "file_size": None,
             "content_hash": None,
             "time": None,
+            "asr_ts": None,
             **row,
         }
         cur = await self.conn.execute(
             """
-            INSERT INTO media
-                (scene, peer_id, message_seq, seg_index, kind, resource_id, file_id,
-                 file_name, file_hash, width, height, duration, summary,
-                 status, file_path, file_size, content_hash, time, created_at, updated_at)
-            VALUES (:scene, :peer_id, :message_seq, :seg_index, :kind, :resource_id,
-                    :file_id, :file_name, :file_hash, :width, :height, :duration,
-                    :summary, :status, :file_path, :file_size, :content_hash, :time,
-                    :created_at, :updated_at)
+        INSERT INTO media
+            (scene, peer_id, message_seq, seg_index, kind, resource_id, file_id,
+             file_name, file_hash, width, height, duration, summary,
+             status, file_path, file_size, content_hash, time, asr_ts,
+             created_at, updated_at)
+        VALUES (:scene, :peer_id, :message_seq, :seg_index, :kind, :resource_id,
+                :file_id, :file_name, :file_hash, :width, :height, :duration,
+                :summary, :status, :file_path, :file_size, :content_hash, :time,
+                :asr_ts, :created_at, :updated_at)
             ON CONFLICT (scene, peer_id, message_seq, seg_index) DO NOTHING
             """,
             {
@@ -375,6 +377,27 @@ class Repository:
         ) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def media_reenrich(
+        self, scene: str, peer_id: int, kinds: list[str], days: int = 0
+    ) -> int:
+        """Reset summary/asr_ts on DONE media of one conversation so the
+        perception pass re-transcribes / re-OCRs them (old media gets
+        re-understood after a backend upgrade). days bounds the reset to
+        recent messages (0 = no bound). Returns the reset row count."""
+        qs = ",".join("?" for _ in kinds)
+        sql = (
+            f"UPDATE media SET summary=NULL, asr_ts=NULL "
+            f"WHERE scene=? AND peer_id=? AND status='done' AND kind IN ({qs})"
+        )
+        args: list = [scene, peer_id, *kinds]
+        if days and days > 0:
+            sql += " AND time>=?"
+            args.append(int(time.time() - days * 86400))
+        async with self.conn.execute(sql, args) as cur:
+            n = cur.rowcount
+        await self.conn.commit()
+        return n or 0
 
     async def message_text(self, scene: str, peer_id: int, message_seq: int) -> str:
         async with self.conn.execute(

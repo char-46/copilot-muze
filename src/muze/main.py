@@ -743,6 +743,9 @@ class App:
         acfg, ocfg = self.cfg.ingest.asr, self.cfg.ingest.ocr
         asr = AsrChain(acfg, self.llm) if acfg.enabled else None
         ocr = OcrChain(ocfg, self.llm) if ocfg.enabled else None
+        # share with the control layer: agent tools (transcribe_voice,
+        # ocr_image) use the SAME lazily-loaded model instances
+        self.runtime.asr, self.runtime.ocr = asr, ocr
         voice_re = re.compile(r"\[语音:[\d.]+s?\]")
         while not self._stop.is_set():
             try:
@@ -766,42 +769,21 @@ class App:
                 log.exception("perception pass failed")
 
     async def _asr_pass(self, asr, voice_re) -> int:
+        from muze.perception import transcribe_media_row
+
         acfg = self.cfg.ingest.asr
         rows = await self.repo.media_pending_enrichment(["record"], acfg.max_per_pass)
         n = 0
         for m in rows:
             if self._stop.is_set():
                 break
-            dur = float(m.get("duration") or 0)
-            if dur and dur < acfg.min_duration_sec:
-                await self.repo.update_media(m["id"], status="done", summary="")
-                continue
-            p = self.media.abs_path(m) if self.media is not None else None
-            if p is None or not p.exists():
-                await self.repo.update_media(m["id"], status="done", summary="")
-                continue
             try:
-                text, ts = await asr.transcribe_full(p, duration_sec=dur)
-                text = text.strip()
+                text, _ts = await transcribe_media_row(asr, self.repo, m, self.media)
             except Exception as e:
                 log.warning("asr failed for %s: %s", m.get("file_path"), e)
                 continue  # transient-looking: retried on a later pass
-            if not text:
-                await self.repo.update_media(m["id"], status="done", summary="")
-                continue
-            await self.repo.update_media(
-                m["id"], status="done", summary=("[转写] " + text)[:500],
-                asr_ts=json.dumps(ts, ensure_ascii=False) if ts else None,
-            )
-            old = await self.repo.message_text(m["scene"], m["peer_id"], m["message_seq"])
-            if old:
-                new = voice_re.sub(lambda _: f"[语音转写] {text}", old, count=1)
-                if new == old:  # no placeholder (mixed-content message)
-                    new = old + f"\n[语音转写] {text}"
-                await self.repo.update_message_text(
-                    m["scene"], m["peer_id"], m["message_seq"], new
-                )
-            n += 1
+            if text:
+                n += 1
         return n
 
     async def _ocr_pass(self, ocr) -> int:

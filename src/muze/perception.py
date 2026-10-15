@@ -271,6 +271,46 @@ async def _to_thread(fn, *a):
     return await asyncio.to_thread(fn, *a)
 
 
+VOICE_PLACEHOLDER_RE = re.compile(r"\[语音:[\d.]+s?\]")
+
+
+async def transcribe_media_row(
+    asr: "AsrChain", repo, m: dict, media_store=None
+) -> tuple[str, list[list]]:
+    """Transcribe ONE record media row and write everything back: media
+    summary + asr_ts, plus the [语音转写] rewrite of the message text.
+    Shared by the background perception pass and the transcribe_voice
+    agent tool (old clips re-understood on demand). Returns (text, ts);
+    ("", []) means "handled, nothing to show" (too short / file gone)."""
+    dur = float(m.get("duration") or 0)
+    min_dur = getattr(asr.cfg, "min_duration_sec", 1.0)
+    p = None
+    if media_store is not None:
+        p = media_store.abs_path(m)
+    p = Path(p or m.get("file_path") or "")
+    if (dur and dur < min_dur) or not p.exists():
+        await repo.update_media(m["id"], status="done", summary="")
+        return "", []
+    text, ts = await asr.transcribe_full(p, duration_sec=dur)
+    text = text.strip()
+    if not text:
+        await repo.update_media(m["id"], status="done", summary="")
+        return "", []
+    await repo.update_media(
+        m["id"], status="done", summary=("[转写] " + text)[:500],
+        asr_ts=json.dumps(ts, ensure_ascii=False) if ts else None,
+    )
+    old = await repo.message_text(m["scene"], m["peer_id"], m["message_seq"])
+    if old:
+        new = VOICE_PLACEHOLDER_RE.sub(lambda _: f"[语音转写] {text}", old, count=1)
+        if new == old:  # no placeholder (mixed-content message)
+            new = old + f"\n[语音转写] {text}"
+        await repo.update_message_text(
+            m["scene"], m["peer_id"], m["message_seq"], new
+        )
+    return text, ts
+
+
 # ------------------------------------------------------------------- OCR
 def _rapidocr():
     """rapidocr-onnxruntime ships as `rapidocr_onnxruntime` on the 1.3.x
