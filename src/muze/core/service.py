@@ -1904,7 +1904,10 @@ class ControlService:
             ]
             return CommandOutcome("\n".join(lines))
         if action == "restart":
-            await t.restart()
+            try:
+                await t.restart()
+            except Exception as e:
+                return CommandOutcome.err(f"隧道重启失败: {e}")
             return CommandOutcome("隧道已重启（监督器接管，几秒内重连）")
         if action == "stop":
             await t.stop()
@@ -1912,8 +1915,11 @@ class ControlService:
         if action == "start":
             if t.status()["connected"]:
                 return CommandOutcome("隧道已在运行")
-            t._stopping = False
-            await t.start()
+            try:
+                t._stopping = False
+                await t.start()
+            except Exception as e:
+                return CommandOutcome.err(f"隧道启动失败: {e}")
             return CommandOutcome("隧道已启动")
         return CommandOutcome.err("用法: /tun [status|restart|stop|start]")
 
