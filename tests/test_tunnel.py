@@ -142,10 +142,43 @@ async def test_tunnel_restart_cycle(tmp_path, monkeypatch):
     await tun.start()
     await asyncio.sleep(0.05)  # let the supervisor spawn once
     assert tun.status()["connected"] is True
+    # idempotent: a second start() must NOT spawn a second supervisor
+    await tun.start()
+    await asyncio.sleep(0.05)
+    assert len(started) == 1
     await tun.restart()
     await asyncio.sleep(0.05)
     assert len(started) == 2  # respawned
     assert tun._stopping is False
+    await tun.stop()
+
+
+async def test_tunnel_acl_runs_once_off_loop(tmp_path, monkeypatch):
+    _mkkey(tmp_path)
+    tun = SshTunnel(TunnelConfig(enabled=True, host="r"), 8300, tmp_path)
+    calls = []
+
+    async def _spawn(*a, **k):
+        class _P:
+            returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(3600)
+
+        return _P()
+
+    def _tighten():
+        calls.append(1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr(tun, "_tighten_key_acl", _tighten)
+    await tun.start()
+    await tun.restart()  # a full cycle
+    await tun.restart()
+    await asyncio.sleep(0.05)
+    assert len(calls) == 1  # once per process, never on the reconnect path
+    # command() itself never touches the ACL
+    assert "icacls" not in " ".join(tun.command())
     await tun.stop()
 
 

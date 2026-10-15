@@ -56,6 +56,7 @@ class SshTunnel:
         self._restarts = 0
         self._last_err = ""
         self._connected_at: float | None = None
+        self._acl_done = False  # icacls runs once per process, off the loop
 
     # ------------------------------------------------------------- status
     def status(self) -> dict:
@@ -97,7 +98,6 @@ class SshTunnel:
                 "loopback-only binds; each box claims its own remote_port "
                 "range so tunnels never collide)"
             )
-        self._tighten_key_acl()
         cmd = [
             "ssh", "-N", "-T",
             "-o", "BatchMode=yes",
@@ -166,6 +166,15 @@ class SshTunnel:
             log.warning("key ACL tightening failed (%s); ssh may reject the key", e)
 
     async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return  # idempotent: never run two supervisors (two ssh children
+            # would fight over the -R ports forever)
+        # the one-time ACL fix runs icacls (a blocking subprocess) — keep it
+        # OFF the event loop and OFF the reconnect path: other modules must
+        # never feel the tunnel's lifecycle
+        if not self._acl_done:
+            await asyncio.to_thread(self._tighten_key_acl)
+            self._acl_done = True
         cmd = self.command()  # fail fast on missing key/config
         for f in self.forwards:
             log.info(
@@ -199,9 +208,10 @@ class SshTunnel:
                 delay = RESTART_DELAY_MIN
             self._restarts += 1
             stderr_tail = ""
-            if self._proc.stderr is not None:
+            stderr = getattr(self._proc, "stderr", None)
+            if stderr is not None:
                 try:
-                    err = await asyncio.wait_for(self._proc.stderr.read(), timeout=5)
+                    err = await asyncio.wait_for(stderr.read(), timeout=5)
                     stderr_tail = err.decode(errors="replace").strip().splitlines()[-1:]\
                         [0][:200] if err.strip() else ""
                 except Exception:
