@@ -814,11 +814,35 @@ class ControlService:
     @slash("forget", "/forget <id>", "停用一条长期记忆", write=True)
     async def cmd_forget(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
-            return CommandOutcome.err("用法: /forget <id>（/memories 查 id）")
+            return CommandOutcome.err("用法: /forget <id>（/memories 看 id）")
         ok = await self.repo.retire_memory(int(args[0]))
         if not ok:
             return CommandOutcome.err(f"#{args[0]} 不存在或已停用")
         return CommandOutcome(f"已停用记忆 #{args[0]}")
+
+    @slash(
+        "reenrich",
+        "/reenrich <scene/peer> [record|image|all] [天数]",
+        "重置旧媒体结果让后台重新理解：record=重新转写语音(含逐词时间戳)，"
+        "image=重新OCR，all=两者；天数只处理最近N天(默认全部)。感知循环每2分钟8条慢慢消化",
+        write=True,
+    )
+    async def cmd_reenrich(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            return CommandOutcome.err("用法: /reenrich <scene/peer> [record|image|all] [天数]")
+        scene, peer = self.parse_target(args[0])
+        kind = args[1].lower() if len(args) > 1 else "record"
+        kinds = {"record": ["record"], "image": ["image"], "all": ["record", "image"]}
+        if kind not in kinds:
+            return CommandOutcome.err("类型: record | image | all")
+        days = int(args[2]) if len(args) > 2 else 0
+        n = await self.repo.media_reenrich(scene, peer, kinds[kind], days)
+        label = await self.target_label(scene, peer)
+        return CommandOutcome(
+            f"已重置 {label} 的 {n} 条{'语音' if kinds[kind] == ['record'] else '图片' if kinds[kind] == ['image'] else '媒体'}，"
+            "后台感知循环会逐批重新转写/OCR（每2分钟8条）"
+        )
+
 
     @slash("coverage", "/coverage <scene/peer> [页数]", "已拉历史条数 + 服务器漫游未拉缺口（只读探测，默认10页）")
     async def cmd_coverage(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
@@ -1932,6 +1956,9 @@ class Runtime:
         self.media = None  # MediaStore, injected by main (path addressing)
         self.rag = None  # RagIndexer, injected by main
         self.batch = None  # BatchRunner (async /v1/batch lane), injected by main
+        self.asr = None  # perception AsrChain, injected by main (shared
+        #                        with the perception loop and agent tools)
+        self.ocr = None  # perception OcrChain, injected by main
         self.rag_force = None  # forced indexing task (/rag run)
         self.rag_stop = None  # its stop event
         self.log_path = ""

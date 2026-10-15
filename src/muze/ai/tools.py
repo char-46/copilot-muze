@@ -191,6 +191,30 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "transcribe_voice",
+            "description": (
+                "转写某条语音消息并返回文本与逐词时间戳（word, start, end 秒）。"
+                "已转写的直接返回缓存并回填正文（[语音转写] 前缀）；force=true 强制重转写"
+                "（换识别后端后用于重新理解旧语音）。需要精确到'第几秒说了什么'时也用它。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scene": {"type": "string", "enum": ["friend", "group"]},
+                    "peer_id": {"type": "integer"},
+                    "message_seq": {"type": "integer"},
+                    "force": {
+                        "type": "boolean",
+                        "description": "忽略已有转写结果，重新识别",
+                    },
+                },
+                "required": ["scene", "peer_id", "message_seq"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ocr_image",
             "description": "识别某条消息图片中的文字（OCR）",
             "parameters": {
@@ -1059,6 +1083,20 @@ class ToolRunner:
         ]
         if not imgs:
             return {"error": "该消息没有已下载的图片"}
+        # local rapidocr first (free, instant); fall back to the vision model
+        ocr = getattr(self.service.runtime, "ocr", None)
+        source = "llm"
+        if ocr is not None:
+            try:
+                provider, _note = ocr.resolve()
+            except Exception:
+                provider = ""
+            if provider == "local":
+                out = []
+                for m in imgs[:3]:
+                    text = await ocr.extract_text(self._media_abs(m) or m["file_path"])
+                    out.append(text)
+                return {"text": "\n---\n".join(out), "source": "local-ocr"}
         if self.llm is None:
             return {"error": "未配置视觉模型"}
         out = []
@@ -1069,7 +1107,50 @@ class ToolRunner:
                     "识别并逐字输出图片中的所有文字（保留换行），不要解释。",
                 )
             )
-        return {"text": "\n---\n".join(out)}
+        return {"text": "\n---\n".join(out), "source": source}
+
+    async def t_transcribe_voice(self, args: dict) -> dict:
+        from muze.perception import transcribe_media_row
+
+        medias = await self.repo.media_for_message(
+            args["scene"], args["peer_id"], args["message_seq"]
+        )
+        recs = [
+            m for m in medias
+            if m["kind"] == "record" and m["status"] == "done" and m.get("file_path")
+        ]
+        if not recs:
+            return {"error": "该消息没有已下载的语音"}
+        asr = getattr(self.service.runtime, "asr", None)
+        if asr is None:
+            return {"error": "语音转写未启用（ingest.asr）"}
+        force = bool(args.get("force"))
+        out_text, out_ts = [], []
+        for m in recs[:2]:  # a message rarely carries more voice segments
+            if not force and (m.get("summary") or "").startswith("[转写]"):
+                # cached: surface it with the stored timestamps
+                text = m["summary"][4:].lstrip()
+                try:
+                    ts = json.loads(m.get("asr_ts") or "[]")
+                except Exception:
+                    ts = []
+                out_text.append(text)
+                out_ts.extend(ts)
+                continue
+            try:
+                text, ts = await transcribe_media_row(
+                    asr, self.repo, m,
+                    getattr(self.service.runtime, "media", None),
+                )
+            except Exception as e:
+                return {"error": f"转写失败: {e}"}
+            out_text.append(text)
+            out_ts.extend(ts)
+        return {
+            "text": "\n".join(t for t in out_text if t) or "（语音无有效内容）",
+            "timestamps": out_ts[:400],
+            "note": "时间戳为 [词, 开始秒, 结束秒]；正文已回填消息",
+        }
 
     async def t_make_chart(self, args: dict) -> dict:
         import asyncio

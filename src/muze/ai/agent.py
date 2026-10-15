@@ -69,6 +69,9 @@ SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）�
 - 查询也可用 cli 工具（和 /help 的命令完全一致），如 cli({"command":"search 关键词"})、
   cli({"command":"summary group/123 60"})；不确定命令就 cli({"command":"help"})。
 - 需要逐条看消息内容时才用 get_recent_messages。
+- 语音消息以 [语音转写] 文本进入上下文；未转写的（仍是 [语音:3s] 占位）用 transcribe_voice 转写，
+  需要逐词时间戳（"第几秒说了什么"）或换后端后重新理解旧语音也用它（force=true）；
+  旧图重新识别文字用 ocr_image（本地 OCR 优先）。
 - 图片内容用 describe_image 识别（是否值得调用由你结合当前请求、长期记忆与背景判断，只识别携带信息量的图；
   说明 purpose 识别目标，结果自动缓存；表情/贴图仅在任务相关时用 force 识别）；
   本地文档/压缩包用 read_document（docx/pdf/xlsx/xls/pptx/rtf/txt + zip/7z/tar；压缩包先看列表再 entry 读成员）；

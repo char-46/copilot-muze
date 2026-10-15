@@ -168,3 +168,171 @@ async def test_media_asr_ts_column(tmp_path):
         assert got["summary"] == "[转写] 你"
     finally:
         await conn.close()
+
+
+# ------------------------------------------------- transcribe_media_row
+async def test_transcribe_media_row_writeback(tmp_path, monkeypatch):
+    from muze.perception import transcribe_media_row
+    from muze.store.db import open_db
+    from muze.store.repo import Repository
+
+    _install_fake_qwen(monkeypatch, _result())
+    conn = await open_db(str(tmp_path / "t.db"))
+    try:
+        repo = Repository(conn)
+        from muze.provider.milky.models import IncomingMessage
+
+        now = 1700000000
+        await repo.upsert_message(
+            IncomingMessage.from_raw({
+                "message_scene": "friend", "peer_id": 1, "message_seq": 7,
+                "sender_id": 7, "time": now,
+                "segments": [{"type": "text", "data": {"text": "[语音:3s]"}}],
+            }),
+            "[语音:3s]", "event",
+        )
+        await repo.add_media({
+            "resource_id": None, "file_id": "f1", "file_name": None,
+            "file_hash": None, "width": None, "height": None, "duration": 3,
+            "summary": None, "scene": "friend", "peer_id": 1, "message_seq": 7,
+            "seg_index": 0, "kind": "record", "status": "done",
+            "file_path": "x.wav",
+            "created_at": now, "updated_at": now,
+        })
+        row = (await repo.media_for_message("friend", 1, 7))[0]
+        chain = AsrChain(AsrConfig(provider="qwen"), _FakeLLM())
+
+        # fake audio file exists so the exists() check passes
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"RIFF")
+
+        class _Store:
+            def abs_path(self, m):
+                return wav
+
+        text, ts = await transcribe_media_row(chain, repo, row, _Store())
+        assert text == "你好世界"
+        got = await repo.media_by_id(row["id"])
+        assert got["summary"].startswith("[转写] 你好世界")
+        assert json.loads(got["asr_ts"])[0] == ["你", 0.1, 0.25]
+        msg = await repo.message_text("friend", 1, 7)
+        assert "[语音转写] 你好世界" in msg
+    finally:
+        await conn.close()
+
+
+# ------------------------------------------------------- /reenrich reset
+async def test_media_reenrich_reset(tmp_path):
+    from muze.store.db import open_db
+    from muze.store.repo import Repository
+
+    conn = await open_db(str(tmp_path / "t.db"))
+    try:
+        repo = Repository(conn)
+        now = 1700000000
+        base = {
+            "resource_id": None, "file_id": None, "file_name": None,
+            "file_hash": None, "width": None, "height": None, "duration": 3,
+            "file_path": "x", "summary": "[转写] 旧", "asr_ts": "[[旧,0,1]]",
+            "status": "done", "created_at": now, "updated_at": now,
+        }
+        await repo.add_media({**base, "scene": "friend", "peer_id": 1,
+                              "message_seq": 1, "seg_index": 0, "kind": "record"})
+        await repo.add_media({**base, "scene": "friend", "peer_id": 1,
+                              "message_seq": 2, "seg_index": 0, "kind": "image"})
+        await repo.add_media({**base, "scene": "group", "peer_id": 9,
+                              "message_seq": 1, "seg_index": 0, "kind": "record"})
+        n = await repo.media_reenrich("friend", 1, ["record"])
+        assert n == 1
+        r = (await repo.media_for_message("friend", 1, 1))[0]
+        assert r["summary"] is None and r["asr_ts"] is None
+        img = (await repo.media_for_message("friend", 1, 2))[0]
+        assert img["summary"] == "[转写] 旧"  # other kind untouched
+        other = (await repo.media_for_message("group", 9, 1))[0]
+        assert other["summary"] == "[转写] 旧"  # other conversation untouched
+        # back on the enrichment queue after reset
+        pend = await repo.media_pending_enrichment(["record"], 10)
+        assert [p["id"] for p in pend] == [r["id"]]
+    finally:
+        await conn.close()
+
+
+# -------------------------------------------------- ocr_image local-first
+async def test_ocr_image_prefers_local_chain(tmp_path):
+    from muze.ai.tools import ToolRunner
+    from muze.config import MuzeConfig
+    from muze.core.service import ControlService, Runtime
+    from muze.chatlog import ChatLog
+    from muze.store.db import open_db
+    from muze.store.repo import Repository
+    from test_permissions import Recorder
+
+    conn = await open_db(str(tmp_path / "t.db"))
+    try:
+        repo = Repository(conn)
+        svc = ControlService(MuzeConfig(), Recorder(), repo, ChatLog(), Runtime())
+        now = 1700000000
+        await repo.add_media({
+            "resource_id": None, "file_id": None, "file_name": None,
+            "file_hash": None, "width": None, "height": None, "duration": None,
+            "file_path": "a.png", "summary": None, "scene": "friend", "peer_id": 1,
+            "message_seq": 3, "seg_index": 0, "kind": "image", "status": "done",
+            "created_at": now, "updated_at": now,
+        })
+
+        class _LocalOcr:
+            def resolve(self):
+                return "local", ""
+
+            async def extract_text(self, path):
+                return "本地OCR结果"
+
+        svc.runtime.ocr = _LocalOcr()
+        runner = ToolRunner.__new__(ToolRunner)
+        runner.repo = repo
+        runner.service = svc
+        runner.llm = None
+        out = await runner.t_ocr_image(
+            {"scene": "friend", "peer_id": 1, "message_seq": 3}
+        )
+        assert out["source"] == "local-ocr" and out["text"] == "本地OCR结果"
+    finally:
+        await conn.close()
+
+
+# ------------------------------------------- transcribe_voice tool (cache)
+async def test_transcribe_voice_tool_cached(tmp_path):
+    from muze.ai.tools import ToolRunner
+    from muze.config import MuzeConfig
+    from muze.core.service import ControlService, Runtime
+    from muze.chatlog import ChatLog
+    from muze.store.db import open_db
+    from muze.store.repo import Repository
+    from test_permissions import Recorder
+
+    conn = await open_db(str(tmp_path / "t.db"))
+    try:
+        repo = Repository(conn)
+        svc = ControlService(MuzeConfig(), Recorder(), repo, ChatLog(), Runtime())
+        now = 1700000000
+        await repo.add_media({
+            "resource_id": None, "file_id": None, "file_name": None,
+            "file_hash": None, "width": None, "height": None, "duration": 3,
+            "file_path": "a.wav",
+            "summary": "[转写] 缓存的转写", "asr_ts": '[["缓",0.0,0.5]]',
+            "scene": "friend", "peer_id": 1, "message_seq": 4, "seg_index": 0,
+            "kind": "record", "status": "done",
+            "created_at": now, "updated_at": now,
+        })
+        svc.runtime.asr = object()  # present but must not be hit (cache path)
+        runner = ToolRunner.__new__(ToolRunner)
+        runner.repo = repo
+        runner.service = svc
+        runner.llm = None
+        out = await runner.t_transcribe_voice(
+            {"scene": "friend", "peer_id": 1, "message_seq": 4}
+        )
+        assert out["text"] == "缓存的转写"
+        assert out["timestamps"] == [["缓", 0.0, 0.5]]
+    finally:
+        await conn.close()
