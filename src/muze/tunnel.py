@@ -53,6 +53,36 @@ class SshTunnel:
         self._task: asyncio.Task | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._stopping = False
+        self._restarts = 0
+        self._last_err = ""
+        self._connected_at: float | None = None
+
+    # ------------------------------------------------------------- status
+    def status(self) -> dict:
+        alive = self._proc is not None and self._proc.returncode is None
+        import time as _time
+
+        return {
+            "host": f"{self.cfg.user}@{self.cfg.host}:{self.cfg.port}",
+            "connected": alive,
+            "uptime_sec": (
+                round(_time.time() - self._connected_at, 1)
+                if alive and self._connected_at else 0.0
+            ),
+            "restarts": self._restarts,
+            "last_error": self._last_err[:160],
+            "forwards": [
+                f"{self.cfg.remote_host}:{f.remote_port} -> {f.local_host}:{f.local_port}"
+                for f in self.forwards
+            ],
+        }
+
+    async def restart(self) -> None:
+        log.info("ssh tunnel: manual restart requested")
+        await self.stop()
+        self._stopping = False
+        self._restarts = 0
+        await self.start()
 
     def command(self) -> list[str]:
         if not self.key_file.is_file():
@@ -74,8 +104,12 @@ class SshTunnel:
             "-o", "IdentitiesOnly=yes",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
+            # aggressive liveness: detect a dead peer in <=60s so the relay
+            # side (ClientAlive) and this side tear down together — without
+            # this a half-open connection keeps the -R ports held hostage
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4",
+            "-o", "TCPKeepAlive=yes",
             "-o", "ConnectTimeout=15",
             "-i", str(self.key_file),
             "-p", str(self.cfg.port),
@@ -141,6 +175,8 @@ class SshTunnel:
         self._task = asyncio.create_task(self._supervise(cmd))
 
     async def _supervise(self, cmd: list[str]) -> None:
+        import time as _time
+
         delay = RESTART_DELAY_MIN
         while not self._stopping:
             started = asyncio.get_running_loop().time()
@@ -152,13 +188,16 @@ class SshTunnel:
                 )
             except Exception as e:  # e.g. ssh client missing
                 log.error("ssh tunnel: cannot spawn ssh (%s); giving up", e)
+                self._last_err = f"cannot spawn ssh: {e}"
                 return
+            self._connected_at = _time.time()
             rc = await self._proc.wait()
             if self._stopping:
                 return
             lived = asyncio.get_running_loop().time() - started
             if lived >= STABLE_AFTER:
                 delay = RESTART_DELAY_MIN
+            self._restarts += 1
             stderr_tail = ""
             if self._proc.stderr is not None:
                 try:
@@ -167,6 +206,13 @@ class SshTunnel:
                         [0][:200] if err.strip() else ""
                 except Exception:
                     pass
+            self._last_err = stderr_tail or f"rc={rc}"
+            # a remote port held by a relay-side zombie (dead peer whose
+            # connection the relay hasn't reaped yet) frees itself within the
+            # relay's ClientAlive window — retry fast instead of backing off
+            port_conflict = "forwarding failed" in stderr_tail or "already in use" in stderr_tail
+            if port_conflict:
+                delay = 15.0
             log.warning(
                 "ssh tunnel exited rc=%s after %.0fs; retrying in %.0fs%s",
                 rc, lived, delay, f" ({stderr_tail})" if stderr_tail else "",

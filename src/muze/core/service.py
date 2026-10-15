@@ -1882,6 +1882,41 @@ class ControlService:
         self.runtime.request_stop()
         return CommandOutcome("已请求停止服务")
 
+    @slash(
+        "tun",
+        "/tun [status|restart|stop|start]",
+        "查看/管理 SSH 反向隧道（隧道断了也能用：走 QQ 就能重启它）",
+        scope="app",
+        write=True,
+    )
+    async def cmd_tun(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        t = self.runtime.tunnel
+        action = args[0].lower() if args else "status"
+        if t is None:
+            return CommandOutcome.err("未启用隧道（web.tunnel.enabled）")
+        if action == "status":
+            s = t.status()
+            state = "已连接" if s["connected"] else "未连接"
+            lines = [
+                f"隧道 {state}（{s['uptime_sec']:.0f}s），中继 {s['host']}",
+                f"转发: " + "；".join(s["forwards"]),
+                f"重启 {s['restarts']} 次" + (f"，最近错误: {s['last_error']}" if s["last_error"] else ""),
+            ]
+            return CommandOutcome("\n".join(lines))
+        if action == "restart":
+            await t.restart()
+            return CommandOutcome("隧道已重启（监督器接管，几秒内重连）")
+        if action == "stop":
+            await t.stop()
+            return CommandOutcome("隧道已停止（/tun start 重新拉起）")
+        if action == "start":
+            if t.status()["connected"]:
+                return CommandOutcome("隧道已在运行")
+            t._stopping = False
+            await t.start()
+            return CommandOutcome("隧道已启动")
+        return CommandOutcome.err("用法: /tun [status|restart|stop|start]")
+
     # ------------------------------------------------------------ qq route
     def is_control_ctx(self, ctx: ControlContext) -> bool:
         """Is this the controller's own session (where writes are allowed)?"""
@@ -1959,6 +1994,7 @@ class Runtime:
         self.asr = None  # perception AsrChain, injected by main (shared
         #                        with the perception loop and agent tools)
         self.ocr = None  # perception OcrChain, injected by main
+        self.tunnel = None  # app-level SshTunnel, injected by main (/tun)
         self.rag_force = None  # forced indexing task (/rag run)
         self.rag_stop = None  # its stop event
         self.log_path = ""
