@@ -271,6 +271,54 @@ async def _to_thread(fn, *a):
 VOICE_PLACEHOLDER_RE = re.compile(r"\[语音:[\d.]+s?\]")
 
 
+def _ffmpeg_exe() -> str | None:
+    """Guaranteed ffmpeg: the imageio-ffmpeg wheel bundles one; a system
+    ffmpeg is a fine fallback. None -> no audio conversion possible."""
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    import shutil
+
+    return shutil.which("ffmpeg")
+
+
+def ensure_wav(p: Path) -> Path:
+    """QQ voice blobs are SILK (transcoded to .wav at ingest) or AMR
+    (stored raw — libsndfile/soundfile cannot read AMR, so every
+    transcription of an AMR clip died with "Format not recognised").
+    Convert non-wav audio to 16kHz mono wav next to the source; return the
+    original path when it is already wav or when no ffmpeg exists (the
+    backend then reports its own error)."""
+    if p.suffix.lower() in (".wav", ".wave"):
+        return p
+    exe = _ffmpeg_exe()
+    if exe is None:
+        return p
+    out = p.with_suffix(".conv.wav")
+    if out.exists():  # blob content is immutable; the sidecar stays valid
+        return out
+    import subprocess
+
+    r = subprocess.run(
+        [exe, "-y", "-loglevel", "error", "-i", str(p),
+         "-ar", "16000", "-ac", "1", str(out)],
+        capture_output=True, timeout=120,
+    )
+    if r.returncode != 0 or not out.exists():
+        try:
+            out.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"audio convert failed for {p.name}: "
+            f"{r.stderr.decode(errors='replace')[-200:]}"
+        )
+    return out
+
+
 async def transcribe_media_row(
     asr: "AsrChain", repo, m: dict, media_store=None
 ) -> tuple[str, list[list]]:
@@ -288,6 +336,7 @@ async def transcribe_media_row(
     if (dur and dur < min_dur) or not p.exists():
         await repo.update_media(m["id"], status="done", summary="")
         return "", []
+    p = await _to_thread(ensure_wav, p)  # AMR/other formats -> 16k wav
     text, ts = await asr.transcribe_full(p, duration_sec=dur)
     text = text.strip()
     if not text:

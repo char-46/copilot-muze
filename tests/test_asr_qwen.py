@@ -350,3 +350,96 @@ async def test_transcribe_voice_tool_cached(tmp_path):
         assert out["timestamps"] == [["缓", 0.0, 0.5]]
     finally:
         await conn.close()
+
+
+# --------------------------------------------------- AMR -> wav conversion
+def test_ensure_wav_passthrough_and_no_ffmpeg(tmp_path, monkeypatch):
+    from muze.perception import ensure_wav
+
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF")
+    assert ensure_wav(wav) == wav  # wav passes through untouched
+    monkeypatch.setattr("muze.perception._ffmpeg_exe", lambda: None)
+    amr = tmp_path / "b.amr"
+    amr.write_bytes(b"#!AMR")
+    assert ensure_wav(amr) == amr  # no ffmpeg: original returned as-is
+
+
+def test_ensure_wav_converts_and_caches(tmp_path, monkeypatch):
+    from muze.perception import ensure_wav
+
+    amr = tmp_path / "v.amr"
+    amr.write_bytes(b"#!AMR")
+    runs = []
+
+    class _R:
+        returncode = 0
+
+    def _run(cmd, **k):
+        runs.append(cmd)
+        out = cmd[-1]
+        Path(out).write_bytes(b"RIFF16k")
+        return _R()
+
+    monkeypatch.setattr("muze.perception._ffmpeg_exe", lambda: "ffmpeg")
+    monkeypatch.setattr("subprocess.run", _run)
+    out = ensure_wav(amr)
+    assert out.suffixes[-2:] == [".conv", ".wav"] and out.exists()
+    assert "-ar" in runs[0] and "16000" in runs[0]
+    out2 = ensure_wav(amr)  # sidecar cache: no second conversion
+    assert out2 == out and len(runs) == 1
+
+
+async def test_transcribe_media_row_amr(tmp_path, monkeypatch):
+    """QQ AMR voice: the clip handed to the backend must be the converted
+    16k wav sidecar, never the raw AMR blob."""
+    from muze.perception import transcribe_media_row
+    from muze.provider.milky.models import IncomingMessage
+    from muze.store.db import open_db
+    from muze.store.repo import Repository
+
+    calls = _install_fake_qwen(monkeypatch, _result())
+    conn = await open_db(str(tmp_path / "t.db"))
+    try:
+        repo = Repository(conn)
+        now = 1700000000
+        await repo.upsert_message(
+            IncomingMessage.from_raw({
+                "message_scene": "friend", "peer_id": 1, "message_seq": 7,
+                "sender_id": 7, "time": now,
+                "segments": [{"type": "text", "data": {"text": "[语音:2s]"}}],
+            }),
+            "[语音:2s]", "event",
+        )
+        await repo.add_media({
+            "resource_id": None, "file_id": "f1", "file_name": None,
+            "file_hash": None, "width": None, "height": None, "duration": 2,
+            "summary": None, "scene": "friend", "peer_id": 1, "message_seq": 7,
+            "seg_index": 0, "kind": "record", "status": "done",
+            "file_path": "v.amr",
+            "created_at": now, "updated_at": now,
+        })
+        row = (await repo.media_for_message("friend", 1, 7))[0]
+
+        class _R:
+            returncode = 0
+
+        def _run(cmd, **k):
+            Path(cmd[-1]).write_bytes(b"RIFF")
+            return _R()
+
+        monkeypatch.setattr("muze.perception._ffmpeg_exe", lambda: "ffmpeg")
+        monkeypatch.setattr("subprocess.run", _run)
+
+        class _Store:
+            def abs_path(self, m):
+                return tmp_path / "v.amr"
+
+        (tmp_path / "v.amr").write_bytes(b"#!AMR")
+        text, ts = await transcribe_media_row(
+            AsrChain(AsrConfig(provider="qwen"), _FakeLLM()), repo, row, _Store()
+        )
+        assert text == "你好世界" and ts
+        assert calls["audio"].endswith(".conv.wav")  # converted, not the AMR
+    finally:
+        await conn.close()
