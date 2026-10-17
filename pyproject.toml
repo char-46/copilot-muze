@@ -7,7 +7,7 @@ license = { text = "CC-BY-SA-4.0" }
 authors = [{ name = "muze" }]
 # Pre-release is bumped per feature commit; build metadata (git sha, build time)
 # is appended at runtime by muze.version.get_version().
-version = "0.1.0a125"
+version = "0.1.0a126"
 dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
@@ -35,8 +35,10 @@ muze = "muze.__main__:main"
 rag-local = ["sentence-transformers>=3.0", "torch>=2.2", "psutil>=5.9", "nvidia-ml-py>=12"]
 # lightweight ONNX alternative (no torch)
 rag-onnx = ["fastembed>=0.3"]
-# local Qwen3-ASR + Qwen3-ForcedAligner (timestamps); pins transformers 4.57.x
-asr-qwen = ["qwen-asr>=0.0.6", "torch>=2.2", "psutil>=5.9", "nvidia-ml-py>=12"]
+# local Qwen3-ASR + Qwen3-ForcedAligner (timestamps); pins transformers 4.57.x;
+# imageio-ffmpeg bundles an ffmpeg binary — QQ AMR voice blobs must be
+# converted to wav (libsndfile cannot read AMR)
+asr-qwen = ["qwen-asr>=0.0.6", "torch>=2.2", "psutil>=5.9", "nvidia-ml-py>=12", "imageio-ffmpeg>=0.5"]
 # local OCR (rapidocr 1.3.x module name; 1.4+ also supported at runtime)
 ocr-local = ["rapidocr-onnxruntime>=1.3,<1.4"]
 
