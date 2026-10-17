@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -104,8 +105,6 @@ class QwenAsrBackend:
         if Model is None:
             raise RuntimeError("qwen: 未安装 qwen-asr（uv sync --extra asr-qwen）")
         if self._model is None:
-            import time
-
             import torch
 
             device, dtype_name = self._pick_device()
@@ -129,8 +128,6 @@ class QwenAsrBackend:
         limit = self.cfg.qwen_unload_idle_sec
         if not limit or self._model is None:
             return False
-        import time
-
         if (now or time.time()) - self._last_used >= limit:
             log.info("unloading idle qwen3-asr")
             self._model = None
