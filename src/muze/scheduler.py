@@ -13,7 +13,7 @@ import asyncio
 import logging
 
 from muze.chatlog import ChatLog, epoch_iso
-from muze.core.service import ControlContext, ControlService
+from muze.core.service import ControlContext, ControlService, is_llm_invocation
 from muze.store.repo import Repository
 
 log = logging.getLogger("muze.scheduler")
@@ -182,7 +182,17 @@ class Scheduler:
     # ------------------------------------------------------------- execute
     async def execute(self, row: dict) -> None:
         task_id = row["id"]
-        log.info("task #%s firing: %s", task_id, row["prompt"][:120])
+        prompt = row["prompt"]
+        # Natural-language tasks (the documented norm for agent-made tasks)
+        # must reach the AGENT, not the command parser: without this a
+        # prompt like "重试语音转写：用 transcribe_voice ..." fell through
+        # execute() as "neither command nor ::" and the help text got
+        # delivered verbatim into the control chat.
+        pfx = getattr(self.service.cfg.llm, "prefix", "::")
+        is_cmd = prompt.startswith("/") or (prompt.startswith(".") and len(prompt) > 1)
+        if not is_cmd and not is_llm_invocation(prompt, pfx):
+            prompt = f"{pfx} {prompt}"
+        log.info("task #%s firing: %s", task_id, prompt[:120])
         ctx = ControlContext(
             source="system",
             chat_key=f"task:{task_id}",
@@ -192,7 +202,7 @@ class Scheduler:
             auto_confirm=False,
         )
         try:
-            outcome = await self.service.execute(row["prompt"], ctx)
+            outcome = await self.service.execute(prompt, ctx)
             result_text = outcome.text or "(无输出)"
             if row.get("note") == self.MORNING_NOTE:
                 # dawn briefing: fan out to the whole morning audience
