@@ -107,6 +107,20 @@ async def test_qwen_transcribe_plain(monkeypatch, tmp_path):
     assert await chain.transcribe(tmp_path / "a.wav") == "你好世界"
 
 
+async def test_qwen_second_call_reuses_model(monkeypatch, tmp_path):
+    """Regression: `import time` used to live INSIDE the cold-load branch,
+    so every call after the first crashed with UnboundLocalError at
+    `self._last_used = time.time()` — i.e. all real transcriptions died
+    after the model was warm, exactly one step before returning text."""
+    calls = _install_fake_qwen(monkeypatch, _result())
+    chain = AsrChain(AsrConfig(provider="qwen"), _FakeLLM())
+    first = await chain.transcribe_full(tmp_path / "a.wav")
+    second = await chain.transcribe_full(tmp_path / "b.wav")  # model cached
+    assert first == second == ("你好世界", [["你", 0.1, 0.25], ["好", 0.25, 0.4]])
+    assert calls["audio"].endswith("b.wav")  # second call really ran
+    assert chain._qwen._last_used > 0  # touch survived the reuse path
+
+
 # ------------------------------------------------------------- lifecycle
 def test_qwen_unload_if_idle(monkeypatch):
     _install_fake_qwen(monkeypatch, _result())
