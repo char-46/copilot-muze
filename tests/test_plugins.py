@@ -215,6 +215,45 @@ async def test_scheduler_roundtrip(tmp_path):
     await conn.close()
 
 
+async def test_scheduler_natural_language_becomes_agent_turn(tmp_path):
+    """Regression (live box 2026-10-17 13:11): an agent-made task with a
+    natural-language prompt ('重试语音转写：用 transcribe_voice ...') fell
+    through execute() as neither-command-nor-:: and the HELP TEXT was
+    delivered verbatim into the control chat. Such prompts now get the
+    wake prefix prepended; explicit /commands and :: prompts pass through
+    untouched."""
+    conn = await open_db(str(tmp_path / "s.db"))
+    repo = Repository(conn)
+
+    class FakeSvc:
+        def __init__(self):
+            self.cfg = MuzeConfig()
+            self.executed: list[str] = []
+
+        async def execute(self, prompt, ctx):
+            self.executed.append(prompt)
+            return CommandOutcome("ok")
+
+        async def deliver(self, ctx, outcome):
+            pass
+
+    svc = FakeSvc()
+    sch = Scheduler(repo, svc, ChatLog())
+    ctx = ControlContext(source="cli", chat_key="t", scene="friend", peer_id=42)
+
+    await sch.create(prompt="重试语音转写：用 transcribe_voice 转写 seq 47",
+                     delay_sec=0, ctx=ctx)
+    await sch.create(prompt="/status", delay_sec=0, ctx=ctx)
+    await sch.create(prompt="::直接就是 AI 调用", delay_sec=0, ctx=ctx)
+    await sch.tick()
+    assert svc.executed == [
+        ":: 重试语音转写：用 transcribe_voice 转写 seq 47",  # prefixed
+        "/status",                                            # untouched
+        "::直接就是 AI 调用",                                  # untouched
+    ]
+    await conn.close()
+
+
 async def test_agent_schedule_task_tool_passes_time_args(tmp_path):
     """Regression (alpha.73): t_schedule_task assembled delay_sec/at_ts/
     interval_sec into kwargs but never passed **kwargs to scheduler.create,
