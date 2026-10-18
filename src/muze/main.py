@@ -1051,10 +1051,24 @@ _UIN_SCHED: dict[int, "Scheduler"] = {}
 _UIN_MAINT: set[int] = set()
 
 
-def _force_exit_after(seconds: float) -> None:
+def _force_exit_after(seconds: float, rc: int = 130) -> None:
     time.sleep(seconds)
-    sys.stderr.write(f"\nmuze: shutdown did not finish in {seconds}s; forcing exit\n")
-    os._exit(130)
+    sys.stderr.write(f"\nmuze: shutdown did not finish in {seconds}s; forcing exit (rc={rc})\n")
+    os._exit(rc)
+
+
+def _arm_exit_watchdog(rc: int, seconds: float = FORCE_EXIT_SECONDS + 5) -> None:
+    """Guarantee this process DIES. Live-box postmortem (2026-10-17/18):
+    after /restart the interpreter finished run_main, the daemon launched
+    the successor, and the old process then WEDGED in interpreter teardown
+    (non-daemon threads / atexit), stacking zombie generations inside the
+    original daemon's job object. The Ctrl-C path already had a watchdog;
+    now every serve exit path (restart rc=100, error rc, clean 0) arms one:
+    normal exits finish long before the timer, a wedged cleanup gets
+    os._exit'd with the intended code preserved."""
+    threading.Thread(
+        target=_force_exit_after, args=(seconds, rc), daemon=True
+    ).start()
 
 
 def _make_sigint_handler(apps: list["App"], loop: asyncio.AbstractEventLoop):
@@ -1162,14 +1176,17 @@ def run_main(argv: list[str]) -> int:
         loop.close()
 
     if rc:
+        _arm_exit_watchdog(rc)
         return rc
     if any(a.restart_requested for a in apps):
         if os.environ.get("MUZE_SUPERVISED") == "1":
             log.info("restart requested (rc=%d); daemon will relaunch", RESTART_EXIT)
+            _arm_exit_watchdog(RESTART_EXIT)
             return RESTART_EXIT
         log.info("restart requested; re-executing this process now")
         _reexec()
         return RESTART_EXIT  # only if exec failed
+    _arm_exit_watchdog(0)
     return 0
 
 

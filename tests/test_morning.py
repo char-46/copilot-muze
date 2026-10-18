@@ -113,6 +113,7 @@ async def test_morning_broadcast_hits_all_targets(env):  # noqa: F811
 # ---------------------------------------------------------------- scheduler
 async def test_ensure_and_execute_morning_task(env):  # noqa: F811
     service, repo, adapter, _cfg = env
+    cfg = _cfg
     sched = Scheduler(repo, service, ChatLog())
     assert await sched.ensure_morning_digest() is not None
     assert await sched.ensure_morning_digest() is None  # idempotent
@@ -130,6 +131,25 @@ async def test_ensure_and_execute_morning_task(env):  # noqa: F811
     # interval task rescheduled, not finished
     after = next(r for r in await repo.list_tasks() if r["id"] == row["id"])
     assert after["status"] == "active"
+    # re-anchored to the configured wall-clock slot (06:00), NOT fire+24h —
+    # the drift that kept the live box's digests landing at boot-time noon
+    from muze.digest import next_run_for_hhmm
+
+    assert after["next_run_at"] == next_run_for_hhmm(cfg.digest.morning_at)
+
+
+async def test_digest_task_reanchors_to_configured_slot(env):  # noqa: F811
+    service, repo, _adapter, cfg = env
+    sched = Scheduler(repo, service, ChatLog())
+    assert await sched.ensure_daily_digest() is not None
+    row = next(
+        r for r in await repo.list_tasks() if r.get("note") == Scheduler.DIGEST_NOTE
+    )
+    await sched.execute(row)
+    after = next(r for r in await repo.list_tasks() if r["id"] == row["id"])
+    from muze.digest import next_run_for_hhmm
+
+    assert after["next_run_at"] == next_run_for_hhmm(cfg.digest.at)  # next 01:00
 
 
 async def test_ensure_morning_disabled(env):  # noqa: F811
@@ -137,3 +157,24 @@ async def test_ensure_morning_disabled(env):  # noqa: F811
     cfg.digest.morning_enabled = False
     sched = Scheduler(repo, service, ChatLog())
     assert await sched.ensure_morning_digest() is None
+
+
+# ----------------------------------------------------------- exit watchdog
+async def test_exit_watchdog_preserves_rc(monkeypatch):
+    """Live-box postmortem: after /restart the old serve WEDGED in
+    interpreter teardown and stacked zombie generations. The watchdog must
+    os._exit with the intended rc when shutdown overruns."""
+    from muze import main as m
+
+    fired = []
+    monkeypatch.setattr(m.os, "_exit", lambda rc: fired.append(rc))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    m._force_exit_after(0.01, 100)
+    assert fired == [100]  # rc preserved (restart contract: 100 -> relaunch)
+
+    fired.clear()
+    m._arm_exit_watchdog(3, seconds=0.01)
+    import asyncio as _a
+
+    await _a.sleep(0.2)  # let the daemon thread run
+    assert fired == [3]
