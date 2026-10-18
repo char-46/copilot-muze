@@ -99,10 +99,11 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     control_peer_id INTEGER NOT NULL,
     next_run_at     INTEGER NOT NULL,         -- unix seconds
     interval_sec    INTEGER,
-    status          TEXT NOT NULL DEFAULT 'active',  -- active|done|cancelled|error
+    status          TEXT NOT NULL DEFAULT 'active',  -- active|running|done|cancelled|error
     created_by      TEXT NOT NULL DEFAULT '',
     note            TEXT,
     last_result     TEXT,
+    lease_until     INTEGER,                  -- running: claim expiry (owner died mid-run)
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -460,6 +461,23 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v13 (media asr timestamps)")
         version = 13
+    if version < 14:
+        await _migrate_v14_tasks_lease(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '14')")
+        await conn.commit()
+        log.info("database migrated to schema v14 (scheduled task claim leases)")
+        version = 14
+
+
+async def _migrate_v14_tasks_lease(conn: aiosqlite.Connection) -> None:
+    """scheduled_tasks.lease_until + 'running' status: task lifetime is
+    decoupled from the serve process via a claim/lease protocol (a restart
+    re-runs interrupted tasks from scratch instead of losing them)."""
+    async with conn.execute("PRAGMA table_info(scheduled_tasks)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if not cols or "lease_until" in cols:
+        return
+    await conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN lease_until INTEGER")
 
 
 async def _migrate_v13_media_asr_ts(conn: aiosqlite.Connection) -> None:

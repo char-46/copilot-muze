@@ -199,13 +199,16 @@ async def test_scheduler_roundtrip(tmp_path):
 
     task = await sch.create(prompt="/status", delay_sec=-0 if False else 0, ctx=ctx)
     assert task["kind"] == "once"
-    # due immediately (next_run_at <= now); force tick
+    # due immediately (next_run_at <= now); force tick. tick CLAIMS and
+    # spawns concurrent runners — drain() awaits their completion
     n = await sch.tick()
     assert n == 1
+    await sch.drain()
     assert svc.executed and svc.executed[0][0] == "/status"
     assert svc.delivered == ["ok: /status"]
     rows = await repo.list_tasks(active_only=False)
     assert rows[0]["status"] == "done" and rows[0]["last_result"].startswith("ok:")
+    assert rows[0]["lease_until"] is None
 
     # interval task reschedules
     t2 = await sch.create(prompt="每日报到", interval_sec=3600, ctx=ctx)
@@ -246,6 +249,7 @@ async def test_scheduler_natural_language_becomes_agent_turn(tmp_path):
     await sch.create(prompt="/status", delay_sec=0, ctx=ctx)
     await sch.create(prompt="::直接就是 AI 调用", delay_sec=0, ctx=ctx)
     await sch.tick()
+    await sch.drain()  # runners are concurrent; await completion
     assert svc.executed == [
         ":: 重试语音转写：用 transcribe_voice 转写 seq 47",  # prefixed
         "/status",                                            # untouched
