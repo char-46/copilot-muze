@@ -624,10 +624,91 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def claim_due_tasks(self, lease_sec: int, now_ts: int | None = None) -> list[dict]:
+        """Atomically claim due tasks for THIS process (status -> 'running'
+        + lease_until). Decouples task lifetime from the serve process:
+        - a second live scheduler sharing the DB cannot double-fire a
+          claimed row (UPDATE is atomic and guards on status/lease);
+        - a row whose owning process died mid-run (power loss, hard kill)
+          becomes claimable again once its lease expires, so the successor
+          re-runs it from scratch.
+        """
+        now = now_ts or _now()
+        async with self.conn.execute(
+            """
+            SELECT * FROM scheduled_tasks
+            WHERE (status='active' AND next_run_at <= ?)
+               OR (status='running' AND (lease_until IS NULL OR lease_until <= ?))
+            ORDER BY next_run_at
+            """,
+            (now, now),
+        ) as cur:
+            rows = await cur.fetchall()
+        claimed: list[dict] = []
+        for row in rows:
+            lease_until = now + lease_sec
+            cur = await self.conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status='running', lease_until=?, updated_at=?
+                WHERE id=? AND (status='active' OR lease_until IS NULL OR lease_until <= ?)
+                """,
+                (lease_until, now, row["id"], now),
+            )
+            if cur.rowcount == 1:
+                d = dict(row)
+                d["status"], d["lease_until"] = "running", lease_until
+                claimed.append(d)
+        if claimed:
+            await self.conn.commit()
+        return claimed
+
+    async def reset_task(self, task_id: int, next_run_at: int) -> None:
+        """Put a claimed (running) task back to active at next_run_at —
+        graceful-shutdown interruption ('re-run from scratch after restart')
+        and transient-failure retry both land here."""
+        await self.conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status='active', lease_until=NULL, next_run_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (next_run_at, _now(), task_id),
+        )
+        await self.conn.commit()
+
+    async def recover_stale_running(self, now_ts: int | None = None) -> list[dict]:
+        """Startup recovery: rows still 'running' with an expired lease were
+        interrupted by a process that no longer exists (power loss, hard
+        kill, pre-watchdog zombie). Hand them back to the pool as due NOW —
+        the fresh process re-runs them from scratch. Rows with a live lease
+        are left alone (a live owner may still be executing them)."""
+        now = now_ts or _now()
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE status='running' AND (lease_until IS NULL OR lease_until <= ?)",
+            (now,),
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            await self.conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status='active', lease_until=NULL, next_run_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (now, now, row["id"]),
+            )
+        if rows:
+            await self.conn.commit()
+        return [dict(r) for r in rows]
+
     async def list_tasks(self, active_only: bool = True) -> list[dict]:
         sql = "SELECT * FROM scheduled_tasks"
         if active_only:
-            sql += " WHERE status='active'"
+            # 'running' rows are claimed-but-inflight: still live tasks
+            # (digest mid-run must stay visible in /tasks and must count
+            # for ensure_daily_digest's idempotence check)
+            sql += " WHERE status IN ('active','running')"
         sql += " ORDER BY next_run_at DESC LIMIT 100"
         async with self.conn.execute(sql) as cur:
             rows = await cur.fetchall()
@@ -645,7 +726,7 @@ class Repository:
         await self.conn.execute(
             """
             UPDATE scheduled_tasks
-            SET status=?, last_result=?, updated_at=?,
+            SET status=?, last_result=?, updated_at=?, lease_until=NULL,
                 next_run_at=COALESCE(?, next_run_at)
             WHERE id=?
             """,

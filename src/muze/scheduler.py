@@ -4,7 +4,17 @@ controller's control conversation.
 Examples (natural language, the agent converts these via the schedule_task
 tool): "两小时后给我发未读摘要" / "每 2 小时总结一次群 123" / "明早 9 点提醒我 X".
 
-Persistence: scheduled_tasks table; the tick loop survives restarts.
+Persistence & process decoupling: task lifetime lives in the scheduled_tasks
+table behind a claim/lease protocol, NOT in serve-process memory:
+- firing = atomic DB claim (status 'running' + lease_until), so a second
+  live scheduler sharing the DB cannot double-fire a task;
+- a restart/shutdown cancels in-flight runs and RESETS their rows to
+  due-now — the successor process re-runs them from scratch;
+- a hard death (power loss, kill) leaves the row 'running'; the next
+  process recovers expired leases at startup (or the tick claims them
+  once they expire), again re-running from scratch;
+- runs execute concurrently (the dawn briefing no longer queues behind a
+  multi-minute nightly digest).
 """
 
 from __future__ import annotations
@@ -19,6 +29,8 @@ from muze.store.repo import Repository
 log = logging.getLogger("muze.scheduler")
 
 TICK_SECONDS = 20
+LEASE_SECONDS = 15 * 60     # claim lifetime; > longest expected task run
+RETRY_SECONDS = 5 * 60      # interval task transient failure -> retry delay
 
 
 class Scheduler:
@@ -28,9 +40,18 @@ class Scheduler:
         self.chatlog = chatlog
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._inflight: dict[int, asyncio.Task] = {}
 
     # ------------------------------------------------------------- control
     async def start(self) -> None:
+        # adopt tasks orphaned by a previous process (power loss / hard
+        # kill / pre-watchdog zombie): re-run them from scratch
+        recovered = await self.repo.recover_stale_running()
+        for row in recovered:
+            log.warning(
+                "task #%s was mid-run when its process died (lease expired); re-firing from scratch",
+                row["id"],
+            )
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
@@ -39,6 +60,39 @@ class Scheduler:
             self._task.cancel()
             try:
                 await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # cancel in-flight runs and hand their rows straight back to the
+        # pool as due-NOW: the successor process (daemon relaunch after
+        # /restart, or the user's start.ps1) picks them up and re-runs
+        # them from the beginning — restart must not lose a task
+        import time
+
+        for task_id, runner in list(self._inflight.items()):
+            if runner.done():
+                continue  # finished cleanly; execute() already rescheduled it
+            runner.cancel()
+            try:
+                await runner
+            except (asyncio.CancelledError, Exception):
+                pass
+            if not runner.cancelled():
+                # completed in the cancellation window: its own finish path
+                # has run — resetting would duplicate the task
+                continue
+            await self.repo.reset_task(task_id, int(time.time()))
+            log.info(
+                "task #%s interrupted by shutdown; reset to due-now (will re-run from scratch)",
+                task_id,
+            )
+        self._inflight.clear()
+
+    async def drain(self) -> None:
+        """Wait for all in-flight runs to finish (tests / graceful paths)."""
+        runners = list(self._inflight.values())
+        for r in runners:
+            try:
+                await r
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -54,13 +108,25 @@ class Scheduler:
                 return
 
     async def tick(self) -> int:
-        rows = await self.repo.due_tasks()
+        rows = await self.repo.claim_due_tasks(LEASE_SECONDS)
         for row in rows:
-            try:
-                await self.execute(row)
-            except Exception:
-                log.exception("task #%s crashed", row["id"])
+            if row["id"] in self._inflight:
+                continue
+            runner = asyncio.create_task(self._run(row))
+            self._inflight[row["id"]] = runner
+            runner.add_done_callback(lambda _t, _id=row["id"]: self._inflight.pop(_id, None))
         return len(rows)
+
+    async def _run(self, row: dict) -> None:
+        try:
+            await self.execute(row)
+        except asyncio.CancelledError:
+            raise  # stop() resets the row after awaiting us
+        except Exception:
+            log.exception("task #%s runner crashed; retrying from scratch", row["id"])
+            import time
+
+            await self.repo.reset_task(row["id"], int(time.time() + RETRY_SECONDS))
 
     # ------------------------------------------------------------- create
     def resolve_delivery(self, ctx: ControlContext) -> tuple[str, int]:
@@ -222,7 +288,19 @@ class Scheduler:
                     await self.service.deliver(ctx, outcome)
         except Exception as e:
             log.exception("task #%s execution failed", task_id)
-            await self.repo.finish_task(task_id, "error", f"执行失败: {e}")
+            if row["kind"] == "interval":
+                # transient failure (LLM hiccup, milky drop): an interval
+                # task must NOT die — a single error used to flip the
+                # nightly digest to status='error' forever. Retry soon.
+                import time
+
+                retry_at = int(time.time() + RETRY_SECONDS)
+                await self.repo.finish_task(
+                    task_id, "active", f"执行失败将重试: {e}", next_run_at=retry_at
+                )
+                log.info("task #%s interval failed; retry at %s", task_id, epoch_iso(retry_at))
+            else:
+                await self.repo.finish_task(task_id, "error", f"执行失败: {e}")
             return
 
         if row["kind"] == "interval":
@@ -252,4 +330,7 @@ class Scheduler:
 
     # -------------------------------------------------------------- status
     def status(self) -> dict:
-        return {"running": bool(self._task and not self._task.done())}
+        return {
+            "running": bool(self._task and not self._task.done()),
+            "inflight": sorted(self._inflight),
+        }
