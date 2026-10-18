@@ -228,7 +228,23 @@ class Scheduler:
         if row["kind"] == "interval":
             import time
 
-            nxt = int(time.time() + int(row["interval_sec"] or 0))
+            note = row.get("note") or ""
+            if note in (self.DIGEST_NOTE, self.MORNING_NOTE):
+                # re-anchor to the configured wall-clock slot instead of
+                # fire_time + 24h: a missed slot (box powered off overnight,
+                # live incident 2026-10-17/18) fires as a catch-up on boot
+                # and would otherwise DRIFT to "boot time + 24h" forever;
+                # long digest runtimes also no longer slide the slot
+                from muze.digest import next_run_for_hhmm
+
+                hhmm = (
+                    self.service.cfg.digest.morning_at
+                    if note == self.MORNING_NOTE
+                    else self.service.cfg.digest.at
+                )
+                nxt = next_run_for_hhmm(hhmm)
+            else:
+                nxt = int(time.time() + int(row["interval_sec"] or 0))
             await self.repo.finish_task(task_id, "active", result_text, next_run_at=nxt)
             log.info("task #%s rescheduled to %s", task_id, epoch_iso(nxt))
         else:
