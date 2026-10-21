@@ -105,6 +105,7 @@ class App:
         self.restart_requested = False
         self._shutdown_done = False
         self._mt_task = None
+        self._wake_task = None
         self._sup_task = None
         self._last_seen_write = 0.0
         self._offline_since: float | None = None  # set on bot_offline, cleared on reconnect
@@ -442,6 +443,45 @@ class App:
         log.info("[%s] catch-up done: +%s messages (offline %s)", self.spec.name, n, human)
         await self._notify(f"🔁 重连补齐完成：离线 {human}，新增 {n} 条消息。")
 
+    # ---------------------------------------------------------- wake gap
+    WAKE_CHECK_SEC = 30
+    WAKE_MIN_GAP_SEC = 120  # wall-clock jump beyond this = suspend/resume
+
+    async def _wake_watchdog(self) -> None:
+        """Detect system suspend/resume: the machine slept, this process was
+        frozen mid-air and never exited (live incident 2026-10-18..21: the
+        box slept 2.5 days). On resume the websocket heartbeat reconnects
+        within seconds, so _on_bot_online sees a sub-threshold gap and skips
+        the catch-up; worse, the periodic rescan only targets conversations
+        'active within 24h' per the LOCAL db, which a long sleep ages out
+        completely -- messages that arrived during the sleep would never be
+        pulled. This watchdog measures the wall-clock jump directly and runs
+        the same catch-up the reconnect path uses, independent of websocket
+        gap accounting. (Clock adjustments smaller than WAKE_MIN_GAP_SEC are
+        filtered; a rare false positive costs one idempotent roaming pull.)"""
+        from muze.timeparse import human_duration
+
+        last = time.time()
+        while True:
+            await asyncio.sleep(self.WAKE_CHECK_SEC)
+            now = time.time()
+            gap = now - last - self.WAKE_CHECK_SEC
+            last = now
+            if gap < self.WAKE_MIN_GAP_SEC:
+                continue
+            human = human_duration(int(gap))
+            log.warning(
+                "[%s] 检测到系统休眠/冻结 %s：主动补拉漏掉的消息", self.spec.name, human
+            )
+            try:
+                await self._notify(f"😴 检测到系统休眠 {human}，正在补拉漏掉的消息…")
+            except Exception:
+                pass
+            try:
+                await self._catch_up(gap)
+            except Exception:
+                log.exception("wake catch-up failed")
+
     async def _notify(self, text: str) -> None:
         if self.service is None:
             return
@@ -471,6 +511,7 @@ class App:
             # the reconnect loop starts them once the login succeeds
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
         self._mt_task = asyncio.create_task(self._maintenance_loop())
+        self._wake_task = asyncio.create_task(self._wake_watchdog())
         self._enrich_task = asyncio.create_task(self._startup_enrich())
         self._rag_task = asyncio.create_task(self._rag_loop())
         self._vram_task = asyncio.create_task(self._vram_steward_loop())
@@ -994,6 +1035,8 @@ class App:
 
         if self._mt_task is not None:
             self._mt_task.cancel()
+        if self._wake_task is not None:
+            self._wake_task.cancel()
         if getattr(self, "_reconnect_task", None) is not None:
             self._reconnect_task.cancel()
         if getattr(self, "_enrich_task", None) is not None:
