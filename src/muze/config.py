@@ -99,7 +99,7 @@ class BackfillConfig(BaseModel):
     page_limit: int = 30
     page_delay: float = 1.0
     conv_delay: float = 0.5
-    concurrency: int = 4
+    concurrency: int = 2
     rescan_interval_min: float = 30.0
     rescan_active_window_h: float = 24.0
     reconnect_gap_sec: float = 60.0  # min offline gap before a reconnect

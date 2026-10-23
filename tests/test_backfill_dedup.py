@@ -82,6 +82,8 @@ async def test_background_run_dedupes_across_sibling_backfillers(monkeypatch):
     b.running = False
     b._stop = asyncio.Event()
     b._task = b._rescan_task = None
+    b._retry_task = None
+    b._auto_retry = False
     b._reporter = None
     b.last_run_at = 0.0
     b.last_new_messages = 0

@@ -273,3 +273,33 @@ async def test_voice_amr_stays_amr(tmp_path):
     amr = store.abs_path(upd)
     assert amr is not None and amr.suffix == ".amr"
     await close(store)
+
+async def test_media_pending_skips_permanently_unresolvable(tmp_path):
+    """Expired sticker urls / id-less rows can never resolve again; retrying
+    them every cycle only produced an endless identical-warning burst (box
+    log 2026-10-21 16:44: 20 url-fails per 10 min, same rows forever)."""
+    conn = await open_db(str(tmp_path / "m.db"))
+    try:
+        repo = Repository(conn)
+        rows = [
+            ("failed", "url: no way to resolve url for media #1"),
+            ("failed", "url: market-face url expired; will reuse the blob next time the sticker appears"),
+            ("failed", "url: boom timeout"),   # transient: still worth a retry
+            ("pending", None),                 # never attempted
+        ]
+        for i, (status, err) in enumerate(rows, start=1):
+            await conn.execute(
+                "INSERT INTO media (scene,peer_id,message_seq,seg_index,kind,status,error,"
+                "created_at,updated_at) VALUES ('friend',1,?,0,'image',?,?,0,0)",
+                (i, status, err),
+            )
+        await conn.commit()
+        got = await repo.media_pending(10)
+        errs = [r["error"] for r in got]
+        assert "url: boom timeout" in errs
+        assert None in errs
+        assert not any(
+            e and ("expired" in e or "no way to resolve" in e) for e in errs
+        )
+    finally:
+        await conn.close()

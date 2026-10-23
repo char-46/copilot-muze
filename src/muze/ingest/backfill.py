@@ -151,7 +151,14 @@ class Backfiller:
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._rescan_task: asyncio.Task | None = None
+        self._retry_task: asyncio.Task | None = None
         self._reporter: ProgressReporter | None = None
+        # auto-retry of interrupted pulls only once the background loop is
+        # owned by the app (direct run_once callers manage their own retries)
+        self._auto_retry = False
+        # a pager that stops advancing gets a couple of human-paced retries
+        # before we give up for now (resume state is kept either way)
+        self.stall_backoff_sec = 2.0
 
     @property
     def initial_task(self) -> asyncio.Task | None:
@@ -261,6 +268,7 @@ class Backfiller:
         time_bounded = since is not None
         total_new = 0
         pages = 0
+        stalls = 0  # non-advancing cursor hits (retried, never "the end")
         done = False  # reached the target / window start / roaming/pager end
 
         # record intent up front so even a crash during the first page can be
@@ -343,8 +351,27 @@ class Backfiller:
                 done = True
                 break
             if cursor is not None and res.next_message_seq >= cursor:
-                done = True
-                break
+                # NOT the end of roaming: the pager handed back a cursor that
+                # does not advance (throttled/duplicated page). Treat it as an
+                # interruption — retry a few times, then stop WITH the resume
+                # state kept, so a later rescan/retry continues from here
+                # instead of quietly assuming "we reached the top".
+                stalls += 1
+                if stalls >= 3:
+                    log.warning(
+                        "backfill %s pager stalled at cursor=%s after %s pages; "
+                        "keeping resume state so a later retry continues",
+                        conv_id(scene, peer_id), cursor, pages,
+                    )
+                    break
+                log.info(
+                    "backfill %s cursor did not advance (cursor=%s, page=%s); retrying",
+                    conv_id(scene, peer_id), cursor, pages,
+                )
+                await asyncio.sleep(
+                    _jittered(max(bf.page_delay, self.stall_backoff_sec), bf.jitter_pct)
+                )
+                continue
 
             cursor = res.next_message_seq
             # persist progress so an interruption never loses more than a page
@@ -460,6 +487,45 @@ class Backfiller:
             self.running = False
             st["running"] = False
             st["last_run_at"] = time.monotonic()
+            await self._schedule_retry_if_interrupted()
+
+    RETRY_SEC = 300.0  # unfinished pull retried ~5 min later (jittered ±50%)
+
+    async def _schedule_retry_if_interrupted(self) -> None:
+        """Interrupted pulls are not "done": if any conversation still has a
+        resume state after this run, retry it soon instead of waiting for the
+        periodic rescan (or never, if the process restarts)."""
+        if self._stop.is_set():
+            return
+        if not getattr(self, "_auto_retry", False):
+            return  # not started by the app (tests / manual runs)
+        task = getattr(self, "_retry_task", None)
+        if task is not None and not task.done():
+            return  # a retry pass is already queued/running
+        try:
+            pending = await self.repo.pending_bf_conversations()
+        except Exception:
+            log.exception("backfill retry check failed")
+            return
+        if not pending:
+            return
+        log.info(
+            "backfill: %s conversation(s) have an unfinished pull; retrying soon",
+            len(pending),
+        )
+        self._retry_task = asyncio.create_task(self._retry_pending())
+
+    async def _retry_pending(self) -> None:
+        await asyncio.sleep(_jittered(self.RETRY_SEC, 0.5))
+        if self._stop.is_set():
+            return
+        pending = await self.repo.pending_bf_conversations()
+        if not pending:
+            return
+        log.info("backfill retry: resuming %s unfinished pull(s)", len(pending))
+        # background=False: a manual-style targeted run must not be skipped
+        # by the "a sibling ran recently" freshness guard
+        await self.run_once(pending, background=False)
 
     def subscribe(self, emit, key: str | None = None) -> bool:
         """Attach a late delivery target to the currently-running pull.
@@ -595,6 +661,7 @@ class Backfiller:
     # -------------------------------------------------------- background
     async def start_background(self) -> None:
         bf = self.cfg.ingest.backfill
+        self._auto_retry = True
         if bf.on_start:
             self._task = asyncio.create_task(self.run_once(background=True))
         if bf.rescan_interval_min > 0:
@@ -629,7 +696,7 @@ class Backfiller:
 
     async def stop(self) -> None:
         self._stop.set()
-        for t in (self._task, self._rescan_task):
+        for t in (self._task, self._rescan_task, self._retry_task):
             if t and not t.done():
                 t.cancel()
                 try:

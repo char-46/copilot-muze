@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import random
 import re
 import shutil
 import threading
@@ -643,7 +644,12 @@ class MediaStore:
     async def retry_failed(self, limit: int = 50) -> int:
         rows = await self.repo.media_pending(limit)
         ok = 0
-        for row in rows:
+        for i, row in enumerate(rows):
+            if i:
+                # human-like cadence: background retries have no audience, a
+                # tight request loop is a bot fingerprint (and previous bursts
+                # of dozens of instant attempts drew attention on the box)
+                await asyncio.sleep(random.uniform(1.5, 4.0))
             updated = await self.download_row(row)
             if updated.get("status") == "done":
                 ok += 1
