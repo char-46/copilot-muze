@@ -197,6 +197,17 @@ class Repository:
         )
         await self.conn.commit()
 
+    async def list_meta_prefix(self, prefix: str) -> list[tuple[str, str]]:
+        """All meta rows whose key starts with `prefix` (pending deliveries)."""
+        async with self.conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE ?", (prefix + "%",)
+        ) as cur:
+            return [(r[0], r[1]) for r in await cur.fetchall()]
+
+    async def del_meta(self, key: str) -> None:
+        await self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        await self.conn.commit()
+
     async def get_message_row(self, scene: str, peer_id: int, message_seq: int) -> dict | None:
         async with self.conn.execute(
             "SELECT * FROM messages WHERE scene = ? AND peer_id = ? AND message_seq = ?",

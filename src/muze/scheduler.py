@@ -20,7 +20,9 @@ table behind a claim/lease protocol, NOT in serve-process memory:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 
 from muze.chatlog import ChatLog, epoch_iso
 from muze.core.service import ControlContext, ControlService, is_llm_invocation
@@ -121,6 +123,7 @@ class Scheduler:
                 return
 
     async def tick(self) -> int:
+        await self._retry_pending_deliveries()
         rows = await self.repo.claim_due_tasks(LEASE_SECONDS)
         for row in rows:
             if row["id"] in self._inflight:
@@ -298,7 +301,10 @@ class Scheduler:
                     and not self.service.cfg.digest.deliver
                 )
                 if not skip_deliver:
-                    await self.service.deliver(ctx, outcome)
+                    delivered = await self.service.deliver(ctx, outcome)
+                    if not delivered:
+                        await self._queue_delivery_retry(task_id, ctx.scene, ctx.peer_id, result_text)
+                        result_text += "\n（投递失败，已排队重试）"
         except Exception as e:
             log.exception("task #%s execution failed", task_id)
             if row["kind"] == "interval":
@@ -340,6 +346,70 @@ class Scheduler:
             log.info("task #%s rescheduled to %s", task_id, epoch_iso(nxt))
         else:
             await self.repo.finish_task(task_id, "done", result_text)
+
+    # ------------------------------------------------- delivery retry
+    DELIVERY_RETRY_SEC = 60.0
+    DELIVERY_KEY = "pending_deliver:"
+
+    async def _queue_delivery_retry(
+        self, task_id: int, scene: str, peer_id: int, text: str
+    ) -> None:
+        """A failed delivery must not be forgotten: park the text and let the
+        tick loop re-send it. Live incident 2026-10-24: the nightly digest hit
+        'retcode=500 PMHQ send failed', the warning was swallowed and the task
+        rescheduled to the next day as if it had been delivered."""
+        if not scene or not peer_id or not text:
+            return
+        payload = {
+            "scene": scene,
+            "peer": int(peer_id),
+            "text": text,
+            "next_at": int(time.time() + self.DELIVERY_RETRY_SEC),
+            "tries": 0,
+        }
+        await self.repo.set_meta(
+            f"{self.DELIVERY_KEY}{task_id}", json.dumps(payload, ensure_ascii=False)
+        )
+        log.warning("task #%s delivery failed; parked for retry", task_id)
+
+    async def _retry_pending_deliveries(self) -> None:
+        now = time.time()
+        if now - getattr(self, "_last_delivery_try", 0.0) < self.DELIVERY_RETRY_SEC:
+            return
+        self._last_delivery_try = now
+        sender = getattr(self.service, "send_text", None)
+        if sender is None:
+            return
+        try:
+            rows = await self.repo.list_meta_prefix(self.DELIVERY_KEY)
+        except Exception:
+            log.exception("pending delivery scan failed")
+            return
+        for key, raw in rows:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                await self.repo.del_meta(key)
+                continue
+            if int(payload.get("next_at") or 0) > now:
+                continue
+            try:
+                ok = await sender(payload["scene"], int(payload["peer"]), payload["text"])
+            except Exception as e:
+                log.warning("parked delivery %s send raised: %s", key, e)
+                ok = False
+            if ok:
+                await self.repo.del_meta(key)
+                log.info("parked delivery %s re-sent", key)
+            else:
+                payload["tries"] = int(payload.get("tries") or 0) + 1
+                payload["next_at"] = int(
+                    now + min(3600.0, self.DELIVERY_RETRY_SEC * (2 ** payload["tries"]))
+                )
+                await self.repo.set_meta(key, json.dumps(payload, ensure_ascii=False))
+                log.warning(
+                    "parked delivery %s still failing (try %s)", key, payload["tries"]
+                )
 
     # -------------------------------------------------------------- status
     def status(self) -> dict:
