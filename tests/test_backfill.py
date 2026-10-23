@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from muze.chatlog import ChatLog
@@ -417,3 +419,53 @@ async def test_time_window_pull_resumes_after_cap(repo):
     await bf.run_once([("friend", 100)])  # resumes the window pull
     assert (await repo.coverage_stats("friend", 100))["min_seq"] == 41
     assert await repo.get_bf_state("friend", 100) == {}
+
+
+# ---------------------------- interruption != "we reached the top" (retry)
+class StallAdapter(FakeAdapter):
+    """Pager keeps handing back a cursor that does not advance (throttled or
+    duplicated page) — the old code took this as the end of roaming."""
+
+    async def get_history_messages(self, scene, peer_id, *, start_message_seq=None, limit=30):
+        self.calls.append((scene, peer_id, start_message_seq))
+        return HistoryResult(messages=[make_msg(scene, peer_id, 90)], next_message_seq=90)
+
+
+async def test_pager_stall_is_not_taken_for_the_end(repo):
+    """A stalled pager is retried a few times, then left resumable: the hole
+    must never be recorded as covered just because the page stopped moving."""
+    adapter = StallAdapter({})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    bf.stall_backoff_sec = 0
+    await bf.run_once([("friend", 100)])
+    assert len(adapter.calls) == 4  # first page + 3 stalled retries
+    state = await repo.get_bf_state("friend", 100)
+    assert state.get("cursor") == 90  # resume state KEPT for a later retry
+    assert ("friend", 100) in await repo.pending_bf_conversations()
+
+
+async def test_interrupted_pull_retries_by_itself(repo):
+    """An interrupted pull (page cap / error) is retried by the backfiller on
+    its own shortly after — it must not wait for the 30-min rescan and must
+    not be mistaken for a finished history pull."""
+    pages = [
+        {"start": 61, "seqs": list(range(61, 91)), "next": 31},
+        {"start": 31, "seqs": list(range(31, 61)), "next": 1},
+        {"start": 1, "seqs": list(range(1, 31)), "next": None},
+    ]
+    adapter = FakeAdapter({("friend", 100): pages})
+    bf = Backfiller(adapter, repo, MuzeConfig(), CountingPipeline(repo), ChatLog())
+    bf.cfg.ingest.backfill.page_delay = 0
+    bf.cfg.ingest.backfill.max_pages_per_conv = 1
+    bf._auto_retry = True
+    bf.RETRY_SEC = 0.01
+
+    await bf.run_once([("friend", 100)])
+    assert ("friend", 100) in await repo.pending_bf_conversations()
+    assert bf._retry_task is not None  # self-retry queued
+    bf.cfg.ingest.backfill.max_pages_per_conv = 10  # retry is not capped again
+
+    await asyncio.sleep(0.3)  # let the retry fire and finish the hole
+    assert await repo.get_bf_state("friend", 100) == {}
+    assert await _msg_count(repo, "friend", 100) == 90

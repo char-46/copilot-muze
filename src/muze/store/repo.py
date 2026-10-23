@@ -356,8 +356,14 @@ class Repository:
         return [dict(r) for r in rows]
 
     async def media_pending(self, limit: int = 100) -> list[dict]:
+        # rows whose URL can never be resolved again (expired sticker temp
+        # urls, rows with no resource/file id) are permanent; retrying them
+        # every cycle only produced a burst of identical warnings forever
         async with self.conn.execute(
-            "SELECT * FROM media WHERE status IN ('pending','failed') ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM media WHERE status IN ('pending','failed') "
+            "AND NOT (status='failed' AND error LIKE 'url: %' "
+            "AND (error LIKE '%expired%' OR error LIKE '%no way to resolve%')) "
+            "ORDER BY id DESC LIMIT ?",
             (limit,),
         ) as cur:
             rows = await cur.fetchall()
