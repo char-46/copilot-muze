@@ -274,7 +274,7 @@ reply:                          # outbound QQ replies: full text, QQ-safe form
   # >5000 chars: merged-forward chain carries the COMPLETE text (no more
   # truncation); 0 = off (then long replies send as sequential messages)
   forward_chars: 5000
-  node_chars: 4200             # per-node cap inside the chain
+  node_chars: 500              # per-node cap inside the chain (chat-sized nodes)
   strip_markdown: true         # QQ text is plain: strip md markers
   image_markdown: true         # send the rendered (formatted) image along -
                                # 图文 with the plain text; rendering uses

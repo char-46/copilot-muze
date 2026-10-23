@@ -63,3 +63,28 @@ def test_render_png_stitched(tmp_path):
 def test_render_png_none_when_deps_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "RENDER_OK", False)
     assert R.render_png("x", tmp_path) is None
+
+def test_render_png_has_no_paper_margins(tmp_path):
+    """User feedback 2026-10-24: the rendered image must be sized to the
+    content, not to an A4 sheet (which framed it in a wide white border)."""
+    if not R.RENDER_OK:
+        pytest.skip("render deps missing")
+    import io as _io
+
+    from PIL import Image
+
+    png = R.render_png("短句", tmp_path)
+    assert png is not None
+    im = Image.open(_io.BytesIO(png)).convert("RGB")
+    # A4 at scale 2 would be ~1190px wide; a content-sized crop is far narrower
+    assert im.width < 500
+    # and taller-than-wide is fine; the content must reach the trim padding
+    bg = Image.new("RGB", im.size, "white")
+    from PIL import ImageChops
+
+    bbox = ImageChops.difference(im, bg).getbbox()
+    assert bbox is not None
+    l, t, r, b = bbox
+    assert l <= R._PNG_TRIM_PAD + 2 and t <= R._PNG_TRIM_PAD + 2
+    assert im.width - r <= R._PNG_TRIM_PAD + 2
+    assert im.height - b <= R._PNG_TRIM_PAD + 2
