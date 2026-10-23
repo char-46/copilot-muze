@@ -63,16 +63,30 @@ if (-not (Test-Path $CfgAbs)) {
 # ---------------------------------------------------------------- auto-start task
 if ($InstallTask) {
     $startScript = Join-Path $PSScriptRoot "start.ps1"
+    # -Background matters: the foreground form ties the daemon to a hidden
+    # console that Windows ends together with the task (0x41306) and leaves
+    # no log behind — a logon start then fails completely silently (live
+    # incident 2026-10-23). -Background detaches, redirects daemon logs and
+    # verifies startup before the script exits.
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`" -Background"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Settings $settings -Force | Out-Null
-    Write-Ok "scheduled task '$TaskName' registered: muze starts at logon (start.ps1)"
-    Write-Step "remove it later with: Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
+    Write-Ok "scheduled task '$TaskName' registered: muze starts at logon (start.ps1 -Background)"
+    # watchdog: start.ps1 is idempotent ("already running" -> exit 0), so a
+    # 5-minute repeat revives a killed/crashed daemon even though the user
+    # session (and therefore the logon trigger) never fires again
+    $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionDuration ([TimeSpan]::MaxValue)
+    Register-ScheduledTask -TaskName "$TaskName-watch" -Action $action `
+        -Trigger $watchTrigger -Settings $settings -Force | Out-Null
+    Write-Ok "scheduled task '$TaskName-watch' registered: every 5 min, starts muze if it is down"
+    Write-Step "remove them later with: Unregister-ScheduledTask -TaskName $TaskName,'$TaskName-watch' -Confirm:`$false"
 }
 
 # remember the extras for future update.ps1 runs (uv sync is exact)
