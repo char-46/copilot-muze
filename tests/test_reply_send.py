@@ -243,7 +243,9 @@ async def test_big_body_falls_back_to_human_chunks(env):
     service, adapter, cfg, _ = env
     cfg.reply.forward_chars = 0        # force the single-shot path
     cfg.reply.image_markdown = False
+    adapter.caps.send_forward = False  # no merged forward available either
     service.TEXT_CHUNK_GAP = (0.0, 0.0)
+    service.SAFE_SINGLE_CHARS = 100000  # pretend the single shot is allowed
 
     body = "\n".join(f"第{i}行 " + "内容" * 40 for i in range(20))
     assert len(body) > service.TEXT_CHUNK_CHARS
@@ -263,3 +265,24 @@ async def test_big_body_falls_back_to_human_chunks(env):
     assert calls["n"] > 1              # first shot failed, then the chunks
     joined = "".join(s[2][0]["data"]["text"] for s in adapter.sent)
     assert "第0行" in joined and "第19行" in joined   # nothing lost
+
+
+async def test_long_body_goes_out_as_one_merged_forward(env, monkeypatch, tmp_path):
+    """User requirement 2026-10-24: content that does not fit one safe message
+    must arrive as ONE merged-forward (合并转发) plus the rendered image, not
+    as a burst of separate messages."""
+    service, adapter, cfg, _ = env
+    cfg.reply.forward_chars = 5000     # below the config threshold on purpose
+    fake_png(monkeypatch, service, tmp_path / "m.png")
+    body = "# 报告\n\n" + "\n".join(f"第{i}条 内容" for i in range(120))  # ~1k chars
+    assert len(body) > service.SAFE_SINGLE_CHARS
+
+    ok = await service.send_text("group", 5, body)
+    assert ok is True
+    assert len(adapter.forwarded) == 1              # ONE merged-forward message
+    assert adapter.forwarded[0][0] == "group"
+    chain = chain_text(adapter)
+    assert "第0条" in chain and "第119条" in chain   # complete
+    # the rendered image follows as its own message; no plain-text burst
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][2][0]["type"] == "image"

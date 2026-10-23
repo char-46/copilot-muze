@@ -438,18 +438,29 @@ class ControlService:
         if not plain.strip():
             plain = text
         is_long = rc.forward_chars > 0 and len(plain) > rc.forward_chars
+        # one merged-forward message (合并转发) beats both a single oversized
+        # body (this LLBot's pb builder fails on ~1.8k mixed-unicode texts) and
+        # a burst of separate messages (user requirement 2026-10-24)
+        use_chain = is_long or len(plain) > self.SAFE_SINGLE_CHARS
         want_image = (
             rc.image_markdown
             and len(text) <= rc.image_max_chars
-            and (is_long or has_markdown_structure(text))
+            and (use_chain or has_markdown_structure(text))
         )
         try:
-            if is_long:
+            if use_chain:
                 await self._send_chain(scene, peer_id, plain)
                 if want_image:
                     p = await self._render_png(text)
                     if p:
-                        await self._send_segments(scene, peer_id, [out_image(to_file_uri(p))])
+                        try:
+                            await self._send_segments(
+                                scene, peer_id, [out_image(to_file_uri(p))]
+                            )
+                        except ProtocolError as e:
+                            # the formatted image is a bonus: never let it
+                            # re-send / fail the text delivery
+                            log.warning("image follow-up failed: %s", e)
             else:
                 segs: list[dict] = [out_text(plain)]
                 img_path = await self._render_png(text) if want_image else None
@@ -482,6 +493,9 @@ class ControlService:
 
     TEXT_CHUNK_CHARS = 600  # single-shot bodies above this size kept failing
     TEXT_CHUNK_GAP = (1.0, 2.0)  # human cadence between split parts
+    # measured on the live box (2026-10-24): 561-char bodies always went
+    # through, a 1781-char digest died with "build scratch failed pb=<empty>"
+    SAFE_SINGLE_CHARS = 600
 
     async def _send_text_chunked(self, scene: str, peer_id: int, plain: str) -> bool:
         parts = plain_chunks(plain, self.TEXT_CHUNK_CHARS)
@@ -522,7 +536,7 @@ class ControlService:
             return
         except NotSupported as e:
             log.warning("forward chain unavailable, sequential fallback: %s", e)
-        for chunk in plain_chunks(plain):
+        for chunk in plain_chunks(plain, self.SAFE_SINGLE_CHARS):
             res = await self._send_segments(scene, peer_id, [out_text(chunk)])
             self.chatlog.sent(scene, peer_id, res.message_seq, chunk[:80])
 
