@@ -153,6 +153,13 @@ class Backfiller:
         self._rescan_task: asyncio.Task | None = None
         self._reporter: ProgressReporter | None = None
 
+    @property
+    def initial_task(self) -> asyncio.Task | None:
+        """The boot-time roaming pull (set by start_background). App awaits
+        this before releasing the scheduler so due digests never read a DB
+        that still lacks the messages missed while we were down."""
+        return self._task
+
     # ------------------------------------------------------------ targets
     async def target_conversations(self) -> list[tuple[str, int]]:
         out: list[tuple[str, int]] = []

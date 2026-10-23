@@ -34,13 +34,24 @@ RETRY_SECONDS = 5 * 60      # interval task transient failure -> retry delay
 
 
 class Scheduler:
-    def __init__(self, repo: Repository, service: ControlService, chatlog: ChatLog) -> None:
+    def __init__(
+        self,
+        repo: Repository,
+        service: ControlService,
+        chatlog: ChatLog,
+        *,
+        ready: asyncio.Event | None = None,
+    ) -> None:
         self.repo = repo
         self.service = service
         self.chatlog = chatlog
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._inflight: dict[int, asyncio.Task] = {}
+        # boot gate: hold the first tick until the roaming pull that recovers
+        # messages missed while the process was down has finished, otherwise
+        # a due digest reads a DB that still lacks them (see App._release_sched_gate)
+        self._ready = ready
 
     # ------------------------------------------------------------- control
     async def start(self) -> None:
@@ -97,6 +108,8 @@ class Scheduler:
                 pass
 
     async def _loop(self) -> None:
+        if self._ready is not None:
+            await self._ready.wait()  # boot ordering: backfill before due tasks
         while not self._stop.is_set():
             try:
                 await self.tick()

@@ -109,6 +109,9 @@ class App:
         self._sup_task = None
         self._last_seen_write = 0.0
         self._offline_since: float | None = None  # set on bot_offline, cleared on reconnect
+        self._offline_notice_task: asyncio.Task | None = None  # deferred "we are offline" notice
+        self._sched_gate: asyncio.Event | None = None  # opened after the boot roaming pull
+        self._gate_task: asyncio.Task | None = None
         self._last_activity = time.time()  # in-memory clock for the RAG idle governor
         self.conn = None
         self.repo = None
@@ -326,7 +329,10 @@ class App:
             self.scheduler = _UIN_SCHED[uin]
             self._owns_scheduler = False
         else:
-            self.scheduler = Scheduler(self.repo, self.service, self.chatlog)
+            self._sched_gate = asyncio.Event()
+            self.scheduler = Scheduler(
+                self.repo, self.service, self.chatlog, ready=self._sched_gate
+            )
             self._owns_scheduler = True
             _UIN_SCHED[uin] = self.scheduler
             await self.scheduler.start()
@@ -401,6 +407,31 @@ class App:
         except Exception:
             log.exception("record offline failed")
         log.warning("[%s] 掉线/被下线: %s（重连后自动补齐漏掉的消息）", self.spec.name, reason)
+        self._arm_offline_notice(reason)
+
+    def _arm_offline_notice(self, reason: str) -> None:
+        """Queue the offline notice behind the reconnect grace period.
+
+        A short socket blip must not produce a notice that is still in
+        flight (or lands) once we are online again — the user asked for
+        silence in that case (live incident 2026-10-23: an 11s drop sent
+        "账号掉线" while the bot was already reconnected)."""
+        prev = self._offline_notice_task
+        if prev is not None and not prev.done():
+            prev.cancel()
+        grace = float(getattr(self.cfg.ingest.backfill, "reconnect_gap_sec", 0.0) or 0.0)
+        self._offline_notice_task = asyncio.create_task(
+            self._notify_offline_later(reason, grace)
+        )
+
+    async def _notify_offline_later(self, reason: str, grace: float) -> None:
+        try:
+            if grace > 0:
+                await asyncio.sleep(grace)
+        except asyncio.CancelledError:
+            return
+        if self._offline_since is None:
+            return  # reconnected in the meantime: a blip, stay silent
         await self._notify(f"⚠ 账号掉线/被下线：{reason}\n重连后会自动补拉漏掉的消息。")
 
     async def _on_bot_online(self) -> "asyncio.Task | None":
@@ -409,6 +440,10 @@ class App:
         now = time.time()
         started = self._offline_since
         self._offline_since = None
+        notice = self._offline_notice_task
+        if notice is not None and not notice.done():
+            notice.cancel()  # back online: never announce the outage after the fact
+        self._offline_notice_task = None
         try:
             await self.repo.set_meta("last_online_at", str(now))
         except Exception:
@@ -442,6 +477,57 @@ class App:
         human = human_duration(int(gap)) if gap >= 60 else f"{int(gap)} 秒"
         log.info("[%s] catch-up done: +%s messages (offline %s)", self.spec.name, n, human)
         await self._notify(f"🔁 重连补齐完成：离线 {human}，新增 {n} 条消息。")
+
+    # --------------------------------------------------- boot ordering gate
+    BOOT_BACKFILL_GATE_SEC = 300.0  # hard deadline: a hung pull must not stall tasks
+
+    async def _release_sched_gate(self) -> None:
+        """Open the scheduler only after the boot roaming pull is done.
+
+        The first scheduler tick claims every due task, and due digests read
+        the local DB. If the pull recovering the down-time messages is still
+        in flight, a day looks empty and the digest records a bogus "no
+        activity" verdict (live incident 2026-10-23: the 2.5-day outage day
+        was declared empty seconds before its messages landed). Degraded
+        boots arm the pull on reconnect, so wait for it to appear; the hard
+        deadline releases the gate regardless of a stuck pull."""
+        gate = self._sched_gate
+        if gate is None:
+            return
+        deadline = time.time() + self.BOOT_BACKFILL_GATE_SEC
+        try:
+            while time.time() < deadline and not self._stop.is_set():
+                task = getattr(self.backfiller, "initial_task", None)
+                if task is None:
+                    if not self.degraded:
+                        break  # on_start disabled: nothing to wait for
+                    # degraded boot: no pull can start until login succeeds
+                    await asyncio.sleep(2.0)
+                    continue
+                try:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        log.warning(
+                            "[%s] boot roaming pull still running after %.0fs; "
+                            "releasing scheduler anyway",
+                            self.spec.name, self.BOOT_BACKFILL_GATE_SEC,
+                        )
+                        break
+                    await asyncio.wait_for(asyncio.shield(task), remaining)
+                    log.info(
+                        "[%s] boot roaming pull done; scheduler released", self.spec.name
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "[%s] boot roaming pull still running after %.0fs; "
+                        "releasing scheduler anyway",
+                        self.spec.name, self.BOOT_BACKFILL_GATE_SEC,
+                    )
+                except Exception:
+                    log.exception("boot roaming pull failed; releasing scheduler anyway")
+                break
+        finally:
+            gate.set()
 
     # ---------------------------------------------------------- wake gap
     WAKE_CHECK_SEC = 30
@@ -510,6 +596,8 @@ class App:
             # protocol side down at boot: roaming pulls would only error out;
             # the reconnect loop starts them once the login succeeds
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        # due tasks (nightly/morning digests) must not run on a half-pulled DB
+        self._gate_task = asyncio.create_task(self._release_sched_gate())
         self._mt_task = asyncio.create_task(self._maintenance_loop())
         self._wake_task = asyncio.create_task(self._wake_watchdog())
         self._enrich_task = asyncio.create_task(self._startup_enrich())
