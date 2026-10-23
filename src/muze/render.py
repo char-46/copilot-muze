@@ -193,7 +193,7 @@ def _inline(el) -> str:
     return body + _esc(el.tail or "")
 
 
-def _table_flowable(el, st: dict) -> Table | None:
+def _table_flowable(el, st: dict, page_w: float | None = None) -> Table | None:
     rows: list[list[Paragraph]] = []
     for tr in el.iter("tr"):
         row = [Paragraph(_inline(c), st["cell"])
@@ -202,7 +202,7 @@ def _table_flowable(el, st: dict) -> Table | None:
             rows.append(row)
     if not rows:
         return None
-    usable = A4[0] - 80 - 12
+    usable = (page_w if page_w else A4[0]) - 80 - 12
     colw = [usable / len(rows[0])] * len(rows[0])
     t = Table(rows, colWidths=colw, repeatRows=1, hAlign="LEFT")
     t.setStyle(TableStyle([
@@ -243,7 +243,7 @@ def _list_items(el, st: dict, depth: int, ordered: bool) -> list:
     return out
 
 
-def _flowables(el, st: dict) -> list:
+def _flowables(el, st: dict, page_w: float | None = None) -> list:
     out: list = []
     for c in el:
         tag = c.tag.split("}")[-1] if isinstance(c.tag, str) else ""
@@ -267,7 +267,7 @@ def _flowables(el, st: dict) -> list:
                     if txt:
                         out.append(Paragraph(txt, st["quote"]))
         elif tag == "table":
-            t = _table_flowable(c, st)
+            t = _table_flowable(c, st, page_w)
             if t is not None:
                 out.append(t)
         elif tag == "hr":
@@ -275,7 +275,7 @@ def _flowables(el, st: dict) -> list:
                                   color=HexColor("#bbbbbb"),
                                   spaceBefore=8, spaceAfter=8))
         elif tag == "div":
-            out.extend(_flowables(c, st))
+            out.extend(_flowables(c, st, page_w))
         else:
             txt = _inline(c)
             if txt:
@@ -283,19 +283,23 @@ def _flowables(el, st: dict) -> list:
     return out
 
 
-def _flow_pdf(html_body: str, font: Path | None) -> bytes:
+def _flow_pdf(html_body: str, font: Path | None, *,
+              pagesize: tuple[float, float] | None = None,
+              pad: float = 40.0) -> bytes:
     f = _pick_font(font)
     st = _styles(f)
+    size = pagesize or A4
+    page_w = size[0] - 2 * pad
     try:
         root = ET.fromstring(f"<muzebody>{html_body}</muzebody>")
-        story = _flowables(root, st)
+        story = _flowables(root, st, page_w)
     except ET.ParseError as e:  # raw non-XHTML html slipped through
         log.warning("html parse failed (%s); rendering as plain text", e)
         story = [Paragraph(_esc(html_body), st["body"])]
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-                            leftMargin=40, rightMargin=40,
-                            topMargin=40, bottomMargin=40,
+    doc = SimpleDocTemplate(buf, pagesize=size,
+                            leftMargin=pad, rightMargin=pad,
+                            topMargin=pad, bottomMargin=pad,
                             title="muze", author="muze")
     doc.build(story)
     return buf.getvalue()
@@ -308,6 +312,8 @@ def render_pdf(
     *,
     markdown: bool | None = None,
     font_override: str = "",
+    pagesize: tuple[float, float] | None = None,
+    pad: float = 40.0,
 ) -> bytes:
     """Markdown/plain text -> PDF bytes. ``markdown=None`` auto-detects."""
     if not RENDER_OK:
@@ -319,7 +325,7 @@ def render_pdf(
     else:
         html_body = "<p>" + _esc(text or "").replace("\n", "<br />") + "</p>"
     font = find_user_font(font_dir, font_override)
-    return _flow_pdf(html_body, font)
+    return _flow_pdf(html_body, font, pagesize=pagesize, pad=pad)
 
 
 def render_png(
@@ -331,17 +337,28 @@ def render_png(
     max_pages: int = 8,
     font_override: str = "",
 ) -> bytes | None:
-    """Text -> single tall PNG (A4 pages stitched vertically). None = failed."""
+    """Text -> single tall PNG sized to the CONTENT (no paper margins).
+
+    The page is content-width and very tall so the whole text normally fits
+    one page; whatever page count results is trimmed of white paper borders
+    and stitched tightly (user feedback 2026-10-24: an A4 page left a big
+    white margin around the rendered digest). None = failed."""
     if not RENDER_OK:
         return None
     try:
-        pdf = render_pdf(text, font_dir, markdown=markdown, font_override=font_override)
+        pdf = render_pdf(
+            text, font_dir, markdown=markdown, font_override=font_override,
+            pagesize=(_PNG_PAGE_W, _PNG_PAGE_H), pad=_PNG_PAD,
+        )
         doc = pdfium.PdfDocument(pdf)
         n = min(len(doc), max_pages)
         if n <= 0:
             return None
         s = max(1.0, scale)
-        imgs = [doc[i].render(scale=s).to_pil().convert("RGB") for i in range(n)]
+        imgs = [
+            _trim_white(doc[i].render(scale=s).to_pil().convert("RGB"))
+            for i in range(n)
+        ]
         doc.close()
         if len(imgs) == 1:
             out = imgs[0]
@@ -361,6 +378,32 @@ def render_png(
     except Exception as e:
         log.warning("png render failed: %s", e)
         return None
+
+
+# reply-image page geometry: content width, no paper margins to crop later
+_PNG_PAGE_W = 700.0
+_PNG_PAGE_H = 12000.0  # PDF media box caps at 14400; taller text paginates
+_PNG_PAD = 22.0
+_PNG_TRIM_PAD = 10  # px of breathing room kept around the trimmed content
+
+
+def _trim_white(im, pad: int = _PNG_TRIM_PAD):
+    """Crop the white paper border around rendered content."""
+    from PIL import Image, ImageChops
+
+    bg = Image.new("RGB", im.size, "white")
+    bbox = ImageChops.difference(im, bg).getbbox()
+    if not bbox:
+        return im
+    l, t, r, b = bbox
+    return im.crop(
+        (
+            max(0, l - pad),
+            max(0, t - pad),
+            min(im.width, r + pad),
+            min(im.height, b + pad),
+        )
+    )
 
 
 def png_cache_key(text: str) -> str:

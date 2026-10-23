@@ -91,7 +91,7 @@ def split_forward_nodes(text: str, node_chars: int = 4200) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
-    n = max(600, int(node_chars))
+    n = max(200, int(node_chars))
     if len(text) <= n:
         return [text]
     spans = _fence_spans(text)

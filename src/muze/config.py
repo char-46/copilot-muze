@@ -528,7 +528,7 @@ class ReplyConfig(BaseModel):
 
     # 0 disables chains: long replies then fall back to sequential messages
     forward_chars: int = 5000
-    node_chars: int = 4200  # per-node cap inside a chain
+    node_chars: int = 500  # per-node cap inside a chain (chat-sized nodes)
     strip_markdown: bool = True  # QQ text is plain: strip md markers
     image_markdown: bool = True  # send the rendered formatted image along
     image_max_chars: int = 80000  # render at most this much source text

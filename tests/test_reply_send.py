@@ -286,3 +286,20 @@ async def test_long_body_goes_out_as_one_merged_forward(env, monkeypatch, tmp_pa
     # the rendered image follows as its own message; no plain-text burst
     assert len(adapter.sent) == 1
     assert adapter.sent[0][2][0]["type"] == "image"
+
+async def test_merged_forward_is_split_into_chat_sized_nodes(env):
+    """User requirement 2026-10-24 (2nd round): inside the merged forward the
+    content must be SEVERAL chat-sized items, not one giant node."""
+    service, adapter, cfg, _ = env
+    cfg.reply.image_markdown = False
+    body = "\n\n".join(f"## 第{i}节\n" + "内容" * 150 for i in range(6))  # ~1.9k chars
+    assert len(body) > service.SAFE_SINGLE_CHARS
+
+    ok = await service.send_text("group", 5, body)
+    assert ok is True
+    assert len(adapter.forwarded) == 1          # still ONE merged-forward message
+    nodes = adapter.forwarded[0][2]
+    assert len(nodes) >= 3                      # ...but several items inside
+    assert all(len(n[0]["data"]["text"]) <= cfg.reply.node_chars for n in nodes)
+    joined = "".join(n[0]["data"]["text"] for n in nodes)
+    assert "第0节" in joined and "第5节" in joined
