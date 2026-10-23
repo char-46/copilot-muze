@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import shlex
 import time
 from dataclasses import dataclass, field
@@ -321,29 +322,45 @@ class ControlService:
         )
 
     # ------------------------------------------------------------- sending
-    async def deliver(self, ctx: ControlContext, outcome: CommandOutcome) -> None:
+    async def deliver(self, ctx: ControlContext, outcome: CommandOutcome) -> bool:
         """Send an outcome back into the QQ control conversation (if any).
 
         The main reply goes first (full text: short/long/markdown handled by
         send_text — never truncated), then media images, then each
         extra_chain as its own message.
-        """
+
+        Returns False when something could not be delivered, so the caller
+        (scheduler) can queue a retry instead of recording a lost message as
+        a success (live incident 2026-10-24: the nightly digest vanished with
+        only a WARNING line)."""
         if not ctx.qq_reachable:
-            return
+            return True
+        ok = True
         try:
             if outcome.text:
-                await self.send_text(ctx.scene, ctx.peer_id, outcome.text)
-                self.chatlog.ctrl_reply(
-                    ctx.source, ctx.user_label or ctx.chat_key, outcome.text
-                )
+                ok = await self.send_text(ctx.scene, ctx.peer_id, outcome.text)
+                if ok:
+                    self.chatlog.ctrl_reply(
+                        ctx.source, ctx.user_label or ctx.chat_key, outcome.text
+                    )
             if outcome.media_paths:
                 segs = [out_image(to_file_uri(p)) for p in outcome.media_paths[:9]]
-                await self._send_segments(ctx.scene, ctx.peer_id, segs)
+                try:
+                    await self._send_segments(ctx.scene, ctx.peer_id, segs)
+                except ProtocolError as e:
+                    log.warning("deliver media to %s failed: %s", ctx.chat_key, e)
+                    ok = False
             for chain in outcome.extra_chains[:9]:
                 if chain:
-                    await self._send_segments(ctx.scene, ctx.peer_id, chain)
+                    try:
+                        await self._send_segments(ctx.scene, ctx.peer_id, chain)
+                    except ProtocolError as e:
+                        log.warning("deliver chain to %s failed: %s", ctx.chat_key, e)
+                        ok = False
         except ProtocolError as e:
             log.warning("deliver to %s failed: %s", ctx.chat_key, e)
+            ok = False
+        return ok
 
     async def send_as_bot(
         self, scene: str, peer_id: int, segments: list[dict], preview: str
@@ -399,7 +416,7 @@ class ControlService:
             return await self.adapter.send_group_message(peer_id, segments)
         return await self.adapter.send_private_message(peer_id, segments)
 
-    async def send_text(self, scene: str, peer_id: int, text: str, *, preview: str = "") -> None:
+    async def send_text(self, scene: str, peer_id: int, text: str, *, preview: str = "") -> bool:
         """Send a bot text reply with the full content, QQ-safely.
 
         - plain text: markdown markers stripped (QQ renders none)
@@ -409,9 +426,13 @@ class ControlService:
         - longer than reply.forward_chars: a merged-forward chain carries the
           complete plain text (protocol side without chains -> sequential
           messages, still untruncated)
+
+        Returns True when the content was delivered. A ProtocolError on the
+        single-shot body is recovered by re-sending it as human-sized chunks
+        (see TEXT_CHUNK_CHARS).
         """
         if not text or not text.strip():
-            return
+            return True
         rc = self.cfg.reply
         plain = strip_markdown(text) if rc.strip_markdown else text
         if not plain.strip():
@@ -452,6 +473,37 @@ class ControlService:
                 self.chatlog.sent(scene, peer_id, res.message_seq, preview or plain[:80])
         except ProtocolError as e:
             log.warning("send_text to %s failed: %s", conv_id(scene, peer_id), e)
+            # Big single-shot bodies trip this protocol side's pb builder
+            # ("build scratch failed pb=<empty>" -- live incident 2026-10-24:
+            # a 1781-char digest was silently lost). Recover by sending the
+            # same content as human-sized pieces instead of dropping it.
+            return await self._send_text_chunked(scene, peer_id, plain)
+        return True
+
+    TEXT_CHUNK_CHARS = 600  # single-shot bodies above this size kept failing
+    TEXT_CHUNK_GAP = (1.0, 2.0)  # human cadence between split parts
+
+    async def _send_text_chunked(self, scene: str, peer_id: int, plain: str) -> bool:
+        parts = plain_chunks(plain, self.TEXT_CHUNK_CHARS)
+        if not parts:
+            return True
+        log.warning(
+            "send_text %s: retrying as %s chunk(s)", conv_id(scene, peer_id), len(parts)
+        )
+        ok = True
+        for i, part in enumerate(parts):
+            if i:
+                await asyncio.sleep(random.uniform(*self.TEXT_CHUNK_GAP))
+            try:
+                res = await self._send_segments(scene, peer_id, [out_text(part)])
+                self.chatlog.sent(scene, peer_id, res.message_seq, part[:80])
+            except ProtocolError as e:
+                log.warning(
+                    "chunked send %s part %s/%s failed: %s",
+                    conv_id(scene, peer_id), i + 1, len(parts), e,
+                )
+                ok = False
+        return ok
 
     async def _send_chain(self, scene: str, peer_id: int, plain: str) -> None:
         rc = self.cfg.reply

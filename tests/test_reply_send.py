@@ -235,3 +235,31 @@ async def test_morning_broadcast_full_text(env):
     else:
         joined = "".join(t for _, _, segs in adapter.sent for t in texts(segs))
         assert joined.count("晨报内容。") == 1200
+
+async def test_big_body_falls_back_to_human_chunks(env):
+    """This LLBot build rejects the single-shot body ("build scratch failed
+    pb=<empty>" on a ~1800-char digest) -- the content must arrive in pieces
+    instead of being silently dropped (live incident 2026-10-24 01:01)."""
+    service, adapter, cfg, _ = env
+    cfg.reply.forward_chars = 0        # force the single-shot path
+    cfg.reply.image_markdown = False
+    service.TEXT_CHUNK_GAP = (0.0, 0.0)
+
+    body = "\n".join(f"第{i}行 " + "内容" * 40 for i in range(20))
+    assert len(body) > service.TEXT_CHUNK_CHARS
+
+    calls = {"n": 0}
+    orig = adapter.send_private_message
+
+    async def flaky(user_id, segments):
+        calls["n"] += 1
+        if len(segments[0]["data"]["text"]) > service.TEXT_CHUNK_CHARS:
+            raise ProtocolError("send_private_message: retcode=500 build scratch failed")
+        return await orig(user_id, segments)
+
+    adapter.send_private_message = flaky
+    ok = await service.send_text("friend", 1, body)
+    assert ok is True
+    assert calls["n"] > 1              # first shot failed, then the chunks
+    joined = "".join(s[2][0]["data"]["text"] for s in adapter.sent)
+    assert "第0行" in joined and "第19行" in joined   # nothing lost

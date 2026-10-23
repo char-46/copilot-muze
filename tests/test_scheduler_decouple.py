@@ -26,6 +26,8 @@ class GatedSvc:
         self.executed: list[str] = []
         self.entered = 0
         self.delivered: list[str] = []
+        self.resent: list[str] = []
+        self.deliver_ok = True  # delivery channel health
         self.fail = False
 
     async def execute(self, prompt, ctx):
@@ -38,6 +40,11 @@ class GatedSvc:
 
     async def deliver(self, ctx, outcome):
         self.delivered.append(outcome.text)
+        return self.deliver_ok
+
+    async def send_text(self, scene, peer_id, text, **_kw):
+        self.resent.append(text)
+        return self.deliver_ok
 
 
 @pytest.fixture
@@ -239,3 +246,29 @@ async def test_once_failure_is_terminal(env):
     await s.tick()
     await s.drain()
     assert (await repo.get_task(row["id"]))["status"] == "error"
+
+async def test_failed_delivery_is_parked_and_resent(env):
+    """A digest whose delivery fails must not be recorded as sent and lost:
+    it is parked in meta and the tick loop re-sends it (live incident
+    2026-10-24: 01:00 digest hit retcode=500 PMHQ and vanished)."""
+    repo, conn = env
+    svc = GatedSvc()
+    svc.deliver_ok = False
+    s = Scheduler(repo, svc, ChatLog())
+    s.DELIVERY_RETRY_SEC = 0.0  # no delay/throttle in the test
+    await s.create(prompt="/digest", delay_sec=0, ctx=_ctx())
+    await s.tick()
+    await s.drain()
+
+    keys = await repo.list_meta_prefix("pending_deliver:")
+    assert len(keys) == 1
+    assert "ok: /digest" in keys[0][1]
+    assert svc.delivered == ["ok: /digest"]  # attempted, not delivered
+
+    # channel recovers: the next tick re-sends the parked content
+    svc.deliver_ok = True
+    s._last_delivery_try = 0.0
+    await s.tick()
+    assert await repo.list_meta_prefix("pending_deliver:") == []
+    assert svc.resent == ["ok: /digest"]
+    await s.stop()
