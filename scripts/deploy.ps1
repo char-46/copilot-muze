@@ -82,7 +82,7 @@ if ($InstallTask) {
     # session (and therefore the logon trigger) never fires again
     $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
         -RepetitionInterval (New-TimeSpan -Minutes 5) `
-        -RepetitionDuration ([TimeSpan]::MaxValue)
+        -RepetitionDuration (New-TimeSpan -Days 3650)
     Register-ScheduledTask -TaskName "$TaskName-watch" -Action $action `
         -Trigger $watchTrigger -Settings $settings -Force | Out-Null
     Write-Ok "scheduled task '$TaskName-watch' registered: every 5 min, starts muze if it is down"
