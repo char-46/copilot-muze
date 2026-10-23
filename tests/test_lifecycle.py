@@ -1,5 +1,6 @@
 """App lifecycle: restart intent + idempotent, fault-tolerant shutdown."""
 
+import asyncio
 import logging
 
 from muze.config import AccountSpec, MilkyEndpoint, MuzeConfig
@@ -137,6 +138,7 @@ class _FakeBackfiller:
     def __init__(self):
         self.running = False
         self.calls: list = []
+        self.initial_task = None
 
     async def target_conversations(self):
         return [("friend", 1), ("group", 2)]
@@ -170,6 +172,7 @@ async def test_offline_then_reconnect_triggers_catchup():
     assert app._offline_since is not None
     assert "last_offline_at" in app.repo.meta
     assert "kicked" in app.repo.meta.get("last_offline_reason", "")
+    await asyncio.sleep(0.01)  # notice is armed as a task, not awaited inline
     assert any("被下线" in n for n in app.service.notes)
 
     task = await app._on_bot_online()
@@ -178,6 +181,46 @@ async def test_offline_then_reconnect_triggers_catchup():
     assert app.backfiller.calls == [[("friend", 1), ("group", 2)]]
     assert app._offline_since is None
     assert any("补齐完成" in n for n in app.service.notes)
+
+
+async def test_offline_notice_suppressed_for_short_blip():
+    """An 11s socket drop must not announce "账号掉线" after we are already
+    back online (live incident 2026-10-23)."""
+    app = _offline_app(gap=3600)  # grace far longer than a blip
+    await app._on_bot_offline("websocket disconnected")
+    assert await app._on_bot_online() is None  # below threshold
+    await asyncio.sleep(0.05)
+    assert app.service.notes == []  # notice cancelled by the reconnect
+
+
+async def test_offline_notice_fires_when_outage_outlasts_grace():
+    app = _offline_app(gap=0.02)
+    await app._on_bot_offline("kicked offline")
+    await asyncio.sleep(0.06)  # still offline past the grace: tell the user
+    assert any("被下线" in n for n in app.service.notes)
+
+
+async def test_sched_gate_waits_for_boot_backfill():
+    """Due tasks must not fire while the boot roaming pull is still in
+    flight (the digest would read a DB without the missed messages)."""
+    app = _offline_app(gap=0)
+    app._sched_gate = asyncio.Event()
+    app.backfiller.initial_task = asyncio.create_task(asyncio.sleep(0.05))
+    release = asyncio.create_task(app._release_sched_gate())
+    await asyncio.sleep(0.015)
+    assert not app._sched_gate.is_set()  # still pulling
+    await release
+    assert app._sched_gate.is_set()
+
+
+async def test_sched_gate_releases_after_deadline():
+    """A hung pull must not stall scheduled work forever."""
+    app = _offline_app(gap=0)
+    app.BOOT_BACKFILL_GATE_SEC = 0.02
+    app._sched_gate = asyncio.Event()
+    app.backfiller.initial_task = asyncio.create_task(asyncio.sleep(3600))
+    await app._release_sched_gate()
+    assert app._sched_gate.is_set()
 
 
 async def test_reconnect_below_gap_threshold_does_not_catchup():

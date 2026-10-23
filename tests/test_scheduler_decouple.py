@@ -130,6 +130,27 @@ async def test_startup_recovers_expired_lease(env):
     await s2.stop()
 
 
+async def test_scheduler_holds_first_tick_until_ready(env):
+    """Boot ordering: due tasks must wait for the roaming pull that recovers
+    the down-time messages, otherwise a digest runs against a DB that still
+    looks empty (live incident 2026-10-23: the outage day was declared
+    "no messages" seconds before its backfill landed)."""
+    repo, conn = env
+    svc = GatedSvc()
+    ready = asyncio.Event()
+    s = Scheduler(repo, svc, ChatLog(), ready=ready)
+    await s.create(prompt="/digest", delay_sec=0, ctx=_ctx())
+    await s.start()
+    await asyncio.sleep(0.1)
+    assert svc.entered == 0  # gated: nothing claimed yet
+    ready.set()
+    await asyncio.sleep(0.1)
+    assert svc.entered == 1
+    await s.drain()
+    await s.stop()
+    assert svc.delivered == ["ok: /digest"]
+
+
 async def test_live_lease_is_left_alone(env):
     """A row with an unexpired lease may still have a live owner — startup
     recovery must NOT steal it (would duplicate the run)."""
