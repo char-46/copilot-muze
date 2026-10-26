@@ -590,6 +590,26 @@ class Agent:
                 "长期记忆（做梦沉淀+对话补充，按与当前会话相关性排序）:\n" + "\n".join(lines)
             )
 
+        # --- tracked follow-ups: the user's open TODOs are prime context ---
+        # (2026-10-26 request: whenever a tracked task comes up, FIRST pull
+        # its latest progress -- RAG / archive search -- then speak to it)
+        try:
+            fu_rows = await self.repo.list_followups(status="open", limit=15)
+        except Exception:
+            fu_rows = []
+        if fu_rows:
+            fu_lines = [
+                f"- #{r['id']} [{r.get('subject') or '全局'}] {r['title']}"
+                f"（开于{r['opened_date']}，最后动静{r['last_date'] or r['opened_date']}）"
+                for r in fu_rows
+            ]
+            parts.append(
+                "系统跟踪的未结待办（用户关心的进行中事项）:\n" + "\n".join(fu_lines)
+                + "\n谈及其中任何一条时，先用 search_archive / semantic_search / get_recent_messages"
+                  "（按条目的 subject 定位会话）拉取该事项的最新消息，把最新下落讲清楚；"
+                  "用户确认完成或取消时用 followup_close 关闭。"
+            )
+
         if bg_meta or n_mems:
             log.info(
                 "PROMPT bg   | day=%s week=%s month=%s memories=%s",

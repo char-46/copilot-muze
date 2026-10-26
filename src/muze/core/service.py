@@ -842,9 +842,26 @@ class ControlService:
             if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{4}-W\d{1,2}|\d{4}-\d{2}", sub):
                 return CommandOutcome.err("格式: YYYY-MM-DD / YYYY-Www(周) / YYYY-MM(月)，或 night/now/list")
             row = await self.repo.get_digest(sub)
-            if not row:
-                return CommandOutcome.err(f"{sub} 没有做梦报告；/dream list 查看已有报告")
-            return CommandOutcome(f"[{sub} 做梦报告]\n\n{row['report']}")
+            if row:
+                return CommandOutcome(f"[{sub} 做梦报告]\n\n{row['report']}")
+            if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", sub):
+                # a missing DAY is made on the spot instead of dead-ending the
+                # user (2026-10-26: "/dream 2026-10-24 没有做梦报告" while the
+                # nightly catch-up had failed during an LLM outage)
+                if self.agent is None or not self.agent.llm.configured:
+                    return CommandOutcome.err(f"{sub} 没有做梦报告且 LLM 未配置，无法补做")
+                from muze.digest import run_digest
+
+                try:
+                    report = await run_digest(
+                        self.repo, self.agent.llm, self.cfg, self.chatlog,
+                        date=sub, adapter=self.adapter,
+                        rag=getattr(self.runtime, "rag", None),
+                    )
+                except Exception as e:
+                    return CommandOutcome.err(f"{sub} 补做失败: {e}（/dream list 查看已有报告）")
+                return CommandOutcome(f"[{sub} 做梦报告（刚补做）]\n\n{report}")
+            return CommandOutcome.err(f"{sub} 没有做梦报告；/dream list 查看已有报告")
 
         row = await self.repo.latest_digest()
         if not row:
