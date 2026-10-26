@@ -1124,22 +1124,55 @@ class ControlService:
 
     @slash(
         "full-restart", "/full-restart",
-        "完整重启服务（scripts\\start.ps1 -Restart：先停 daemon+serve 再拉起，比 /restart 彻底；硬杀，瞬时中断）",
+        "完整重启服务（start.ps1 -Restart：先停 daemon+serve 再拉起，比 /restart 彻底；硬杀，瞬时中断）",
         write=True,
     )
     async def cmd_full_restart(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         script = self._scripts_dir() / "start.ps1"
         if not script.is_file():
             return CommandOutcome.err("scripts\\start.ps1 不存在，无法完整重启")
-        log_path = self._script_logs_dir() / f"full-restart-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        d = self._script_logs_dir()
+        log_path = d / f"full-restart-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        via = ""
+        # Preferred: a ONE-SHOT SCHEDULED TASK runs start.ps1 completely
+        # outside the daemon's job (nested jobs make CREATE_BREAKAWAY_FROM_JOB
+        # unreliable -- an sshd- or scheduler-started daemon sits inside an
+        # outer job that may refuse breakaway, and live testing 2026-10-26
+        # showed the runner reaped with the job, the restart finished only
+        # via the 5-minute autostart watch). The Task Scheduler owns the
+        # process; nothing the service does can kill it.
         try:
-            self._spawn_script(script, ["-Restart"], log_path)
+            wrapper = d / "fullrestart-run.cmd"
+            wrapper.write_text(
+                f'@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass '
+                f'-File "{script}" -Restart >> "{log_path}" 2>&1\r\n',
+                encoding="ascii", errors="replace",
+            )
+            st = time.strftime("%H:%M", time.localtime(time.time() + 120))
+            cr = subprocess.run(
+                ["schtasks", "/Create", "/TN", "muze-fullrestart", "/F",
+                 "/SC", "ONCE", "/ST", st, "/TR", str(wrapper)],
+                capture_output=True, text=True, timeout=20,
+            )
+            if cr.returncode == 0:
+                rr = subprocess.run(
+                    ["schtasks", "/Run", "/TN", "muze-fullrestart"],
+                    capture_output=True, text=True, timeout=20,
+                )
+                if rr.returncode == 0:
+                    via = "计划任务 muze-fullrestart（作业外，可靠）"
         except Exception as e:
-            return CommandOutcome.err(f"启动失败: {e}")
+            log.warning("scheduled full-restart setup failed: %s", e)
+        if not via:
+            # fallback: detached runner with job breakaway attempt
+            try:
+                self._spawn_script(script, ["-Restart"], log_path)
+            except Exception as e:
+                return CommandOutcome.err(f"启动失败: {e}")
+            via = "分离进程（若 daemon 的作业不允许脱离，由 muze-autostart-watch 在 5 分钟内拉起）"
         return CommandOutcome(
-            "完整重启已发起（start.ps1 -Restart）：本服务马上被停止再拉起，"
+            f"完整重启已发起（start.ps1 -Restart，{via}）：本服务马上被停止再拉起，"
             "WebUI/隧道瞬断 1-2 分钟自愈。日志: " + str(log_path)
-            + "\n（若 daemon 还是旧版不允许脱离作业，改由 muze-autostart-watch 在 5 分钟内拉起）"
         )
 
     @slash(
