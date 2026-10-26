@@ -88,3 +88,16 @@ def test_render_png_has_no_paper_margins(tmp_path):
     assert l <= R._PNG_TRIM_PAD + 2 and t <= R._PNG_TRIM_PAD + 2
     assert im.width - r <= R._PNG_TRIM_PAD + 2
     assert im.height - b <= R._PNG_TRIM_PAD + 2
+
+def test_render_survives_angle_brackets(tmp_path):
+    """Regression (2026-10-26): '/done <id|关键词>' used to break the XHTML
+    parse and silently degrade the whole document to plain text."""
+    if not R.RENDER_OK:
+        pytest.skip("render deps missing")
+    from muze.render import markdown_to_html
+
+    html = markdown_to_html("# 标题\n\n/done <id|关键词> 标记完成\n\n代码 `List<int>` 不受影响")
+    assert "&lt;id|关键词&gt;" in html          # stray brackets escaped
+    assert "List&lt;int&gt;" in html            # inline code still fine
+    pdf = R.render_pdf("# 待办\n\n/done <id|关键词> 标记完成", tmp_path)
+    assert pdf[:5] == b"%PDF-"                  # full pipeline, no fallback
