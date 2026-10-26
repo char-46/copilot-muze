@@ -469,6 +469,12 @@ class RagConfig(BaseModel):
     window_chars: int = 900  # and/or chars per chat window
     max_doc_chars: int = 2000  # truncate a doc before embedding
     index_interval_min: float = 5.0  # background indexing cadence (still gated)
+    # after a pass is interrupted as busy (or the model was busy-unloaded),
+    # wait this long before even STARTING another pass: during a GPU-bound
+    # game the CPU stays quiet, the idle gate keeps passing, and the indexer
+    # used to load the model every 5 minutes just to be interrupted again
+    # (live churn observed 2026-10-26 evening: load -> interrupt -> unload)
+    busy_backoff_sec: float = 900.0
     # --- auto-inject: semantic hits for each incoming message ---
     auto_inject: bool = True  # retrieve per message and add hits to the prompt
     inject_k: int = 5  # hits per message

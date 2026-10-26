@@ -126,6 +126,7 @@ class RagIndexer:
         self.forced = False  # a run_forced() loop is active
         self.last_index_at = 0.0
         self.last_count = 0
+        self._busy_until = 0.0  # monotonic; indexer backoff after busy hits
 
     @property
     def enabled(self) -> bool:
@@ -157,6 +158,18 @@ class RagIndexer:
         if not self.embedder.healthy:
             log.info("RAG index skipped: embedder unavailable")
             return 0
+        if not force:
+            backoff = max(0.0, float(self.cfg.rag.busy_backoff_sec))
+            now_m = time.monotonic()
+            if now_m < self._busy_until:
+                log.debug("RAG index skipped: busy backoff")
+                return 0
+            # a recent busy-UNLOAD (steward) counts too: don't reload the
+            # model into the same load storm it was just evicted from
+            lu = float(getattr(self.embedder, "_last_busy_unload", 0.0) or 0.0)
+            if backoff and lu and now_m - lu < backoff:
+                log.debug("RAG index skipped: model was busy-unloaded recently")
+                return 0
         if not force and not self._idle():
             log.debug("RAG index skipped: not idle")
             return 0
@@ -218,6 +231,9 @@ class RagIndexer:
                 break
             if not force and not self._idle():
                 log.info("RAG index interrupted after %s docs (busy)", done)
+                self._busy_until = time.monotonic() + max(
+                    60.0, float(self.cfg.rag.busy_backoff_sec)
+                )
                 break
             chunk = docs[i : i + batch]
             try:
