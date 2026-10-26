@@ -174,6 +174,9 @@ class CommandOutcome:
     - media_paths: local image files to attach after the text
     - extra_chains: additional messages, each a raw Milky segment list —
       this is how commands emit message chains / multiple messages
+    - forward_nodes: when the text goes out as a merged forward, ONE entry
+      per forward bubble, in order (e.g. /todo: one follow-up per bubble) —
+      overrides the paragraph-based node splitting
     - is_error: marks the reply as an error for local fronts
     """
 
@@ -181,6 +184,7 @@ class CommandOutcome:
     media_paths: list[str] = field(default_factory=list)
     is_error: bool = False
     extra_chains: list[list[dict]] = field(default_factory=list)
+    forward_nodes: list[str] = field(default_factory=list)
 
     @classmethod
     def err(cls, text: str) -> "CommandOutcome":
@@ -338,7 +342,10 @@ class ControlService:
         ok = True
         try:
             if outcome.text:
-                ok = await self.send_text(ctx.scene, ctx.peer_id, outcome.text)
+                ok = await self.send_text(
+                    ctx.scene, ctx.peer_id, outcome.text,
+                    nodes=list(outcome.forward_nodes) or None,
+                )
                 if ok:
                     self.chatlog.ctrl_reply(
                         ctx.source, ctx.user_label or ctx.chat_key, outcome.text
@@ -416,7 +423,10 @@ class ControlService:
             return await self.adapter.send_group_message(peer_id, segments)
         return await self.adapter.send_private_message(peer_id, segments)
 
-    async def send_text(self, scene: str, peer_id: int, text: str, *, preview: str = "") -> bool:
+    async def send_text(
+        self, scene: str, peer_id: int, text: str, *,
+        preview: str = "", nodes: list[str] | None = None,
+    ) -> bool:
         """Send a bot text reply with the full content, QQ-safely.
 
         - plain text: markdown markers stripped (QQ renders none)
@@ -449,7 +459,7 @@ class ControlService:
         )
         try:
             if use_chain:
-                await self._send_chain(scene, peer_id, plain)
+                await self._send_chain(scene, peer_id, plain, nodes=nodes)
                 if want_image:
                     p = await self._render_png(text)
                     if p:
@@ -519,24 +529,42 @@ class ControlService:
                 ok = False
         return ok
 
-    async def _send_chain(self, scene: str, peer_id: int, plain: str) -> None:
+    async def _send_chain(
+        self, scene: str, peer_id: int, plain: str, *, nodes: list[str] | None = None
+    ) -> None:
         rc = self.cfg.reply
-        chunks = split_forward_nodes(plain, rc.node_chars)
-        nodes = [[out_text(c)] for c in chunks]
+        if nodes:
+            # caller-supplied item-per-bubble layout (e.g. /todo: one
+            # follow-up per node, in order -- user requirement 2026-10-26).
+            # Each node is plainified; an oversized node is still split so a
+            # single huge item can never resurrect the pb-builder failure.
+            chunks: list[str] = []
+            cap = max(self.SAFE_SINGLE_CHARS, rc.node_chars)
+            for n in nodes:
+                n = (strip_markdown(n) if rc.strip_markdown else n or "").strip()
+                if not n:
+                    continue
+                if len(n) > cap:
+                    chunks.extend(split_forward_nodes(n, rc.node_chars))
+                else:
+                    chunks.append(n)
+        else:
+            chunks = split_forward_nodes(plain, rc.node_chars)
+        seg_nodes = [[out_text(c)] for c in chunks]
         head = next((ln.strip() for ln in plain.splitlines() if ln.strip()), "")[:24]
         preview = [ln.strip()[:40] for ln in plain.splitlines() if ln.strip()][:3]
         try:
             res = await self.adapter.send_forward_message(
-                scene, peer_id, nodes,
+                scene, peer_id, seg_nodes,
                 title=head or "长消息",
                 preview=preview,
-                summary=f"完整文本 {len(plain)} 字 · {len(nodes)} 节",
+                summary=f"完整文本 {len(plain)} 字 · {len(seg_nodes)} 节",
             )
             self.chatlog.sent(scene, peer_id, res.message_seq, f"[转发链] {head}")
             return
         except NotSupported as e:
             log.warning("forward chain unavailable, sequential fallback: %s", e)
-        for chunk in plain_chunks(plain, self.SAFE_SINGLE_CHARS):
+        for chunk in plain_chunks("\n\n".join(chunks), self.SAFE_SINGLE_CHARS):
             res = await self._send_segments(scene, peer_id, [out_text(chunk)])
             self.chatlog.sent(scene, peer_id, res.message_seq, chunk[:80])
 
@@ -922,16 +950,25 @@ class ControlService:
         rows = await self.repo.list_followups(status="open", limit=50)
         if not rows:
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
-        lines = []
+        rows.sort(key=lambda r: r["id"])  # 开立顺序，稳定不乱序
+        md_items: list[str] = []
+        node_items: list[str] = []
         for r in rows[:20]:
             subj = r["subject"] or "全局"
-            line = f"#{r['id']} [{subj}] {r['title']}"
+            bits = []
             if r["detail"]:
-                line += f"（{str(r['detail'])[:40]}）"
-            lines.append(f"{line} — 开于{r['opened_date']}，最后动静{r['last_date'] or r['opened_date']}")
+                bits.append(str(r["detail"])[:60])
+            bits.append(f"开于 {r['opened_date']}")
+            last = r["last_date"] or r["opened_date"]
+            if last != r["opened_date"]:
+                bits.append(f"最后动静 {last}")
+            meta = " · ".join(bits)
+            md_items.append(f"**#{r['id']}** `{subj}`\n\n{r['title']}\n\n{meta}")
+            node_items.append(f"#{r['id']} [{subj}] {r['title']}\n{meta}")
+        tail = "/done <id|关键词> 标记完成 · /todo drop <id> 不再跟踪"
         return CommandOutcome(
-            f"未结待办 {len(rows)} 条:\n" + "\n".join(lines)
-            + "\n/done <id|关键词> 标记完成；/todo drop <id> 不再跟踪"
+            f"# 未结待办（{len(rows)} 条）\n\n" + "\n\n---\n\n".join(md_items) + f"\n\n---\n\n{tail}",
+            forward_nodes=[f"未结待办（{len(rows)} 条）"] + node_items + [tail],
         )
 
     @slash(
