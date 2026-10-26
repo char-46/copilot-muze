@@ -80,8 +80,37 @@ def find_user_font(font_dir: Path | None, override: str = "") -> Path | None:
 _MD_EXTENSIONS = ["fenced_code", "tables", "nl2br", "sane_lists"]
 
 
+def _angle_safe(text: str) -> str:
+    """Escape stray < / > outside fenced-code and inline-code spans.
+
+    Raw angle brackets travel unescaped into the XHTML parse and kill it
+    (live 2026-10-26: "/done <id|关键词>" made the whole /todo image fall
+    back to plain text). Our sources (commands, LLM digests) are plain
+    markdown and never embed raw HTML, so escaping every bracket outside
+    code is the predictable rule."""
+    def esc_seg(seg: str) -> str:
+        parts: list[str] = []
+        last = 0
+        for m in re.finditer(r"`[^`\n]+`", seg):  # inline code stays raw
+            parts.append(seg[last:m.start()].replace("<", "&lt;").replace(">", "&gt;"))
+            parts.append(m.group(0))
+            last = m.end()
+        parts.append(seg[last:].replace("<", "&lt;").replace(">", "&gt;"))
+        return "".join(parts)
+
+    out: list[str] = []
+    fences = list(re.finditer(r"```.*?```", text, re.S))
+    pos = 0
+    for f in fences:
+        out.append(esc_seg(text[pos:f.start()]))
+        out.append(f.group(0))  # fenced content passes through untouched
+        pos = f.end()
+    out.append(esc_seg(text[pos:]))
+    return "".join(out)
+
+
 def markdown_to_html(text: str) -> str:
-    return _md.markdown(text or "", extensions=_MD_EXTENSIONS)
+    return _md.markdown(_angle_safe(text or ""), extensions=_MD_EXTENSIONS)
 
 
 _MD_HINTS = [
