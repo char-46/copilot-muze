@@ -164,7 +164,7 @@ async def test_media_asr_ts_column(tmp_path):
             cols = {r[1] for r in await cur.fetchall()}
         assert "asr_ts" in cols
         async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
-            assert (await cur.fetchone())[0] == "13"
+            assert (await cur.fetchone())[0] == "15"
         repo = Repository(conn)
         now = 1700000000
         await repo.add_media({

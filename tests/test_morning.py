@@ -88,7 +88,7 @@ async def test_morning_report_catches_up_when_missing(repo):
     await repo.upsert_message(_mk_msg("friend", 1, 1, y + 100, "昨天的消息"), "昨天的消息", "event")
     llm = FakeLLM()
     text = await morning_report(repo, llm, MuzeConfig(), ChatLog())
-    assert llm.calls == 1 and (await repo.get_digest(yesterday_date())) is not None
+    assert llm.calls == 2 and (await repo.get_digest(yesterday_date())) is not None
 
 
 async def test_morning_report_missing_no_llm(repo):

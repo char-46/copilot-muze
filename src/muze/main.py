@@ -722,7 +722,7 @@ class App:
     async def dispatch(self, ev: Event) -> None:
         try:
             await self._touch_seen()
-            if ev.event_type == "message_receive" and isinstance(ev.data, MessageEventData):
+            if ev.event_type in ("message_receive", "message_send") and isinstance(ev.data, MessageEventData):
                 await self.on_message(ev.data)
             elif ev.event_type == "message_recall" and isinstance(ev.data, MessageRecallData):
                 await self.pipeline.handle_recall(ev.data)

@@ -37,12 +37,19 @@ DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请�
 - 重要：关键结论、新信息、约定达成的过程、关系或立场变化；
 - 一般：普通闲聊、无关紧要的插曲。
 紧急事项必须具体（谁、什么事、什么时限），一般内容可归并带过。
+画像优先：下方「用户画像」标明的身份、主线与优先级**高于**通用排序——与用户主线无关、被画像标为次要/非首要的类别（如与用户学业主线无关的事务性工作）默认降后、归并带过，除非其中出现临近时限/风险/承诺。
+
+# 用户画像（长期记忆中关于用户本人的事实；排序与详略必须遵循，没写的不要臆造）
+{owner}
+
+# 系统跟踪的待办（结构化状态，不是散文；引用表中事项时带上 #id）
+{followups}
 
 # 格式
 ## 概览
 （当天整体在聊什么、最重要的事）
 ## 需要处理
-（按紧急程度排列：等回复的、有时限的、承诺/风险类；每条注明 会话/seq；没有则写"无"）
+（按紧急程度排列：等回复的、有时限的、承诺/风险类；每条注明 会话/seq；系统待办表中今天有下落的事项写明下落；没有则写"无"）
 ## 会话要点
 （当天每个活跃会话一小节 `### <会话>`，同样按重要性排序：关键信息、结论/约定/分歧；每节只保留值得保留的信息，不凑条数。标记"全天均匀采样"的会话为抽样子集，首尾消息必在，未收录部分不代表没有内容）
 ## 值得记住的
@@ -50,10 +57,10 @@ DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请�
 
 # 原则
 - 只依据给出的档案，不要编造；引用关键消息时带 会话/seq。
-- 结合「往日背景」做跟进：往日报告（含周报）中的"需要处理/仍悬置"事项**逐条**在今天给出下落（已解决/有进展/仍悬置/已失效），不得静默丢弃；延续中的话题只写新进展，不重复已知背景；全新线程正常展开。
+- 待办状态以「系统跟踪的待办」表为准：表中事项今天档案有明确下落（完成/推进/失效）的写进"需要处理"并给 会话/seq；没有新证据就如实写"无新进展"，**不要因为挂得久就假装解决或避而不提**——用户可手动关闭（/done），长期无动静的系统自动过期。往日报告中的其他线索如有新进展照常跟进。
 - 会话内以 `> 往日相关:` 开头的行是语义检索到的历史背景（记忆/档案/旧总结），不是今天的消息；用于关联旧线索，不当作当日事实。
 - 语气克制、信息密度高：完整性优先于长度，总长控制在 1000 字内。
-- 如果当天几乎没有消息，直接说明"当日无显著活动"并列出仅有的会话；有往日悬置事项时顺带说明其状态。
+- 如果当天几乎没有消息，直接说明"当日无显著活动"并列出仅有的会话；有待办时顺带说明其状态。
 
 # 往日背景（此前数日的总结，仅供跟进；不是今天的档案）
 {prior}
@@ -83,6 +90,9 @@ ROLLUP_PROMPT = """你是个人 QQ copilot 的"层级做梦"模块。以下是 {
 # 输入（{n} 份子报告）
 {inputs}
 
+# 用户画像（详略与排序遵循；没写的不要臆造）
+{owner}
+
 # 要求
 ## 结构
 - 概览：这段时间的主线、关键结论与当前状态
@@ -92,10 +102,33 @@ ROLLUP_PROMPT = """你是个人 QQ copilot 的"层级做梦"模块。以下是 {
 
 # 原则
 - 压缩率高但信息不丢：细节留在日/周报里，这里只要脉络与结论。
+- 主题脉络的排序与详略遵循用户画像：画像标为次要/非主线的类别压缩归并，除非其中有临近时限或风险。
 - 只依据输入报告，不要编造。控制在 {budget} 字内。"""
 
 
+FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根据今日做梦报告与现有待办表，输出需要执行的状态变更。
+
+# 规则（从严）
+- add：只加"可行动"的新事项（等被控号回应、约定了时限、承诺/风险）；单纯提及、无需行动的不加。标题 ≤40 字，写清 谁+什么事+时限（如有）。
+- close：仅当报告中有**明确证据**该事项已解决或失效（写明依据）；不要因为"挂了几天"就关闭——过期由系统自动处理，用户也会手动关闭。status 用 done（已完成）或 dropped（已失效/不用跟）。
+- keep：今天有新进展但仍未了结的事项（系统会刷新其动静日期）。
+- 拿不准的就不要动它。
+
+# 现有待办（仅 open）
+{open}
+
+# 今日报告（{date}）
+{report}
+
+# 输出（严格 JSON 数组，不要其他文字；最多 {maxn} 条）
+[{{"action":"add","subject":"group/123 或 QQ号 或 空串","title":"…","detail":"…"}},
+ {{"action":"close","id":1,"status":"done","note":"依据"}},
+ {{"action":"keep","id":2}}]"""
+
+
 def local_date(ts: float | None = None) -> str:
+    if ts is None:
+        ts = datetime.now().astimezone().timestamp()
     return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d")
 
 
@@ -255,6 +288,42 @@ def _pick_fitting(lines: list[str], target_chars: int) -> list[str]:
     return best
 
 
+async def owner_context(repo: Repository, cfg: MuzeConfig) -> str:
+    """Owner identity/priority facts from long-term memory.
+
+    The report is FOR the owner, so its ordering must follow who they are
+    (user feedback 2026-10-24: a grad-student + part-time counselor kept
+    getting undergrad affairs leading the digest — the prompt never told
+    the model who reads it, even though the fact lived in `memories`)."""
+    if not cfg.digest.owner_context:
+        return "(未启用)"
+    try:
+        mems = await repo.list_memories(subject="owner", limit=30)
+    except Exception:
+        mems = []
+    lines = []
+    for m in mems:
+        c = (m.get("content") or "").strip().replace("\n", " ")
+        if c:
+            lines.append(f"- [{m.get('kind') or 'fact'}] {c}")
+    txt = "\n".join(lines)[: cfg.digest.owner_max_chars]
+    return txt or "(暂无关于用户本人的记忆；按通用排序，不要臆造画像)"
+
+
+def _format_followups(items: list[dict]) -> str:
+    if not items:
+        return "(无)"
+    out = []
+    for r in items:
+        subj = r.get("subject") or "全局"
+        line = f"- #{r['id']} [{subj}] {r['title']}"
+        if r.get("detail"):
+            line += f"（{str(r['detail'])[:60]}）"
+        last = r.get("last_date") or r.get("opened_date") or "?"
+        out.append(f"{line} — 开于 {r.get('opened_date') or '?'}，最后动静 {last}")
+    return "\n".join(out)
+
+
 def _apply_transcript_budget(conv_lines: list[list[str]], budget: int) -> None:
     """Shrink the per-conversation line lists in place so their total
     joined size fits the global transcript budget. Proportional per-conv
@@ -401,8 +470,17 @@ async def run_digest(
             }
         )
 
+    owner_txt = await owner_context(repo, cfg)
+    open_items: list[dict] = []
+    if dc.followup_extract:
+        try:
+            open_items = await repo.list_followups(status="open", limit=40)
+        except Exception:
+            open_items = []
     prompt = DIGEST_PROMPT.format(
-        date=date, prior=prior_txt, transcript="\n\n".join(blocks)
+        date=date, prior=prior_txt, owner=owner_txt,
+        followups=_format_followups(open_items),
+        transcript="\n\n".join(blocks),
     )
     if not llm.configured:
         raise RuntimeError("LLM 未配置，无法做梦（检查 llm.chat.*）")
@@ -415,6 +493,24 @@ async def run_digest(
     chatlog.log.info(
         "DREAM      | %s saved (%s conversations, %s chars)", date, len(convs), len(report)
     )
+    if dc.followup_extract and llm.configured:
+        # structured follow-up state: sync from the fresh report, then age
+        # out long-untouched items — both best-effort, never fail the dream
+        try:
+            await sync_followups(repo, llm, cfg, date=date, report=report, chatlog=chatlog)
+        except Exception:
+            log.exception("followup sync for %s failed", date)
+        try:
+            cutoff = (
+                datetime.strptime(date, "%Y-%m-%d") - timedelta(days=dc.followup_expire_days)
+            ).strftime("%Y-%m-%d")
+            for r in await repo.expire_followups(cutoff_date=cutoff, closed_date=date):
+                chatlog.log.info(
+                    "FOLLOW     | - #%s expired (untouched since %s): %s",
+                    r["id"], r.get("last_date") or r.get("opened_date"), str(r["title"])[:80],
+                )
+        except Exception:
+            log.exception("followup expiry for %s failed", date)
     return report
 
 
@@ -555,7 +651,8 @@ async def _run_rollup(
     if len(inputs) > 24000:
         inputs = inputs[:24000] + "\n...(截断)"
     prompt = ROLLUP_PROMPT.format(
-        scope=scope, key=key, n=len(subs), inputs=inputs, budget=budget
+        scope=scope, key=key, n=len(subs), inputs=inputs, budget=budget,
+        owner=await owner_context(repo, cfg),
     )
     msg = await llm.chat([{"role": "user", "content": prompt}])
     report = (msg.get("content") or "").strip() or f"({scope}报告为空)"
@@ -625,6 +722,69 @@ async def missing_months(repo: Repository, limit: int = 2) -> list[str]:
         # next month
         cur = (cur + timedelta(days=32)).replace(day=1)
     return out
+
+
+async def sync_followups(
+    repo: Repository, llm, cfg: MuzeConfig, *, date: str, report: str, chatlog: ChatLog
+) -> int:
+    """Keep the structured follow-up table in step with the fresh report.
+
+    Pending items used to live only as prose in past reports, and the only
+    way one ever closed was the digest LLM spotting evidence in a sampled
+    transcript — an item finished outside the archive stayed open forever
+    (user feedback 2026-10-24). Now the table is the state: this pass adds
+    new actionable items, closes ones the report resolves with evidence,
+    and refreshes the "last activity" date of ones that progressed."""
+    if not llm.configured:
+        return 0
+    open_items = await repo.list_followups(status="open", limit=40)
+    prompt = FOLLOWUP_SYNC_PROMPT.format(
+        open=_format_followups(open_items), date=date, report=report[:4000],
+        maxn=cfg.digest.max_memories_per_night,
+    )
+    msg = await llm.chat([{"role": "user", "content": prompt}])
+    raw = (msg.get("content") or "").strip()
+    m = re.search(r"\[.*\]", raw, re.S)
+    if not m:
+        log.warning("followup sync returned non-JSON, skipped: %.200s", raw)
+        return 0
+    try:
+        items = json.loads(m.group(0))
+    except ValueError:
+        log.warning("followup JSON parse failed, skipped")
+        return 0
+
+    changed = 0
+    for item in items[: cfg.digest.max_memories_per_night]:
+        if not isinstance(item, dict):
+            continue
+        action = item.get("action")
+        mid = item.get("id")
+        if action == "add":
+            fid = await repo.add_followup(
+                str(item.get("subject", "") or "").strip(),
+                str(item.get("title", "") or "").strip(),
+                str(item.get("detail", "") or ""),
+                source=f"dream:{date}", opened_date=date,
+            )
+            if fid is not None:
+                changed += 1
+                chatlog.log.info(
+                    "FOLLOW     | + #%s [%s] %s",
+                    fid, item.get("subject", ""), str(item.get("title"))[:80],
+                )
+        elif action == "close" and isinstance(mid, int):
+            st = item.get("status")
+            st = st if st in ("done", "dropped") else "done"
+            if await repo.close_followup(mid, status=st, source=f"dream:{date}", closed_date=date):
+                changed += 1
+                chatlog.log.info(
+                    "FOLLOW     | - #%s closed (%s): %s", mid, st, str(item.get("note", ""))[:80]
+                )
+        elif action == "keep" and isinstance(mid, int):
+            if await repo.touch_followup(mid, date):
+                changed += 1
+    return changed
 
 
 async def extract_memories(

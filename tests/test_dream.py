@@ -33,6 +33,9 @@ class FakeLLM:
 
     async def chat(self, messages, tools=None):
         prompt = messages[-1]["content"]
+        if "待办同步" in prompt:
+            # structured follow-up sync pass (alpha.138): nothing to change
+            return {"role": "assistant", "content": "[]"}
         self.calls.append(prompt)
         if "记忆提炼" in prompt:
             content = (

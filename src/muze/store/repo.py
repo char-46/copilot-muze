@@ -963,6 +963,111 @@ class Repository:
         await self.conn.commit()
         return cur.rowcount > 0
 
+    # --------------------------------------------------------- followups
+    async def add_followup(
+        self, subject: str, title: str, detail: str = "",
+        source: str = "", opened_date: str = "",
+    ) -> int | None:
+        """Open a tracked follow-up. Returns None when an identical open
+        item already exists (dream sync may re-propose the same thing)."""
+        subject, title = (subject or "").strip(), (title or "").strip()
+        if not title:
+            return None
+        async with self.conn.execute(
+            "SELECT id FROM followups WHERE status='open' AND subject=? AND title=?",
+            (subject, title),
+        ) as cur:
+            if await cur.fetchone():
+                return None
+        cur = await self.conn.execute(
+            """
+            INSERT INTO followups
+                (subject, title, detail, status, opened_date, last_date, source,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)
+            """,
+            (subject, title[:120], (detail or "")[:500], opened_date, opened_date,
+             source, _now(), _now()),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid)
+
+    async def list_followups(self, status: str = "open", limit: int = 100) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM followups WHERE status=? ORDER BY updated_at DESC LIMIT ?",
+            (status, max(1, int(limit))),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def find_open_followups(self, q: str, limit: int = 10) -> list[dict]:
+        """Open items matching a keyword (subject/title/detail) -- lets
+        `/done 交表` close the right item without knowing its id."""
+        q = f"%{(q or '').strip()}%"
+        async with self.conn.execute(
+            """
+            SELECT * FROM followups WHERE status='open'
+              AND (title LIKE ? OR detail LIKE ? OR subject LIKE ?)
+            ORDER BY updated_at DESC LIMIT ?
+            """,
+            (q, q, q, max(1, int(limit))),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def close_followup(
+        self, item_id: int, status: str = "done", source: str = "user",
+        closed_date: str = "",
+    ) -> bool:
+        if status not in ("done", "dropped", "expired"):
+            raise ValueError(f"bad followup status: {status}")
+        cur = await self.conn.execute(
+            """
+            UPDATE followups SET status=?, closed_date=?, close_source=?, updated_at=?
+            WHERE id=? AND status='open'
+            """,
+            (status, closed_date, source, _now(), int(item_id)),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def touch_followup(self, item_id: int, last_date: str) -> bool:
+        """Mark an open item as still alive (progress seen on last_date)."""
+        cur = await self.conn.execute(
+            "UPDATE followups SET last_date=?, updated_at=? WHERE id=? AND status='open'",
+            (last_date, _now(), int(item_id)),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def expire_followups(self, cutoff_date: str, closed_date: str = "") -> list[dict]:
+        """Auto-close open items untouched since before cutoff_date.
+
+        An item whose resolution never happened in QQ must not haunt every
+        morning report forever (user feedback 2026-10-24) -- the user closes
+        items explicitly when they know better, staleness handles the rest."""
+        async with self.conn.execute(
+            """
+            SELECT * FROM followups WHERE status='open'
+              AND COALESCE(NULLIF(last_date, ''), opened_date) != ''
+              AND COALESCE(NULLIF(last_date, ''), opened_date) < ?
+            """,
+            (cutoff_date,),
+        ) as cur:
+            rows = await cur.fetchall()
+        stale = [dict(r) for r in rows]
+        if stale:
+            await self.conn.execute(
+                """
+                UPDATE followups SET status='expired', closed_date=?, close_source='auto-expire',
+                     updated_at=?
+                WHERE id IN (%s) AND status='open'
+                """ % ",".join("?" * len(stale)),
+                (closed_date or cutoff_date, _now(), *[r["id"] for r in stale]),
+            )
+            await self.conn.commit()
+        return stale
+
     # --------------------------------------------------------- ai sessions
     async def upsert_ai_session(self, row: dict) -> None:
         """Insert or replace one agent session (id-keyed)."""

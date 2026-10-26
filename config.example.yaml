@@ -53,6 +53,8 @@ ingest:
     concurrency: 2            # conversations pulled in parallel (1 = sequential)
     rescan_interval_min: 30   # periodic rescan (catches self-sent + missed events); 0 = off
     rescan_active_window_h: 24  # rescan only conversations active within this window
+    rescan_full_daily: true     # once a day sweep EVERY conversation (quiet chats heal too)
+    rescan_full_at: "00:05"     # local HH:MM -- keep before digest.at so the dream sees a full day
     reconnect_gap_sec: 60     # after a drop longer than this, reconnect triggers an immediate catch-up pull
     # --- anti-ban pacing ---
     jitter_pct: 0.5           # randomize page/conv delays by +-50% (bot fingerprint avoidance)
@@ -254,6 +256,16 @@ digest:
   rag_hits: 3               # hits per conversation
   rag_chars: 200            # chars per hit
   deliver: true             # send the report to the control conversation
+
+  # structured follow-ups: "需要处理" items live in the followups table,
+  # synced by the nightly dream; close them with /done (the completion
+  # signal) or let them auto-expire
+  followup_extract: true
+  followup_expire_days: 14 # open items untouched this long auto-expire
+
+  # owner personalization: identity/priority memories steer report ordering
+  # (e.g. "研究生+兼职辅导员，本科事务非首要" demotes undergrad noise)
+  owner_context: true
   # morning briefing: at dawn push yesterday's digest to the admins.
   # Targets default to every controller (private) + the control group;
   # override with explicit entries ("friend/123" | "group/456").
