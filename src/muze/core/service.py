@@ -16,8 +16,11 @@ import asyncio
 import json
 import logging
 import random
+import re
 import shlex
+import subprocess
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
@@ -247,6 +250,11 @@ class ControlService:
             line = "/" + line[1:]
         if not line.startswith("/"):
             line = "/" + line
+        # colon form "/script:name.ps1 [args]" -> "/script name.ps1 [args]"
+        if line[1:].lower().startswith("script:"):
+            _, _, rest = line.partition(":")
+            rest = rest.strip()
+            line = "/script " + rest if rest else "/script"
         if not ctx:
             ctx = ControlContext(source="system", chat_key="system", scene="", peer_id=0)
         try:
@@ -999,6 +1007,140 @@ class ControlService:
             return CommandOutcome.err(f"没有匹配「{q}」的未结待办；/todo 看清单")
         cands = "\n".join(f"#{r['id']} {r['title']}" for r in rows[:8])
         return CommandOutcome.err(f"「{q}」匹配 {len(rows)} 条，请用 id:\n{cands}")
+
+    # ------------------------------------------------------- script runner
+    SCRIPT_TIMEOUT_SEC = 600
+
+    def _scripts_dir(self) -> Path:
+        """Deployment convention: the service runs with cwd = repo root
+        (start.ps1), so scripts/ sits next to the config."""
+        return Path.cwd() / "scripts"
+
+    def _script_logs_dir(self) -> Path:
+        d = Path(self.cfg.storage.data_dir) / "script_logs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _spawn_script(self, script: Path, args: list[str], log_path: Path):
+        """Run a PowerShell script DETACHED in its own process group with
+        output teed to a log file. Detached on purpose: scripts like
+        start.ps1 -Restart stop this very service, and the runner must
+        outlive it to finish the job (start.ps1 only kills 'python -m muze'
+        processes, never the PowerShell runner).
+
+        The runner also tries to BREAK AWAY from the daemon's job object
+        (KILL_ON_JOB_CLOSE would otherwise reap it the moment the daemon
+        dies, leaving the restart half-done; daemons since alpha.144 allow
+        breakaway). On an old daemon the breakaway flag fails and we fall
+        back -- the box's muze-autostart-watch then finishes the job."""
+        group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        argv = [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(script), *[str(a) for a in args],
+        ]
+        kw = dict(stdout=None, stderr=None, stdin=subprocess.DEVNULL, close_fds=False)
+        with open(log_path, "wb") as fh:
+            kw["stdout"] = fh
+            kw["stderr"] = subprocess.STDOUT
+            if breakaway:
+                try:
+                    return subprocess.Popen(argv, creationflags=group | breakaway, **kw)
+                except OSError:
+                    pass  # job without BREAKAWAY_OK (pre-alpha.144 daemon)
+            return subprocess.Popen(argv, creationflags=group, **kw)
+
+    async def _watch_script(self, name: str, proc, log_path: Path) -> None:
+        """Best-effort completion notice with the log tail. If the script
+        stops the service (full restart), this dies with us and the log
+        simply persists on disk."""
+        try:
+            rc = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, proc.wait),
+                self.SCRIPT_TIMEOUT_SEC,
+            )
+            status = f"exit={rc}"
+        except asyncio.TimeoutError:
+            status = f"still running after {self.SCRIPT_TIMEOUT_SEC}s（日志持续记录）"
+        except Exception:
+            status = "monitor lost"
+        try:
+            tail = Path(log_path).read_text(encoding="utf-8", errors="replace")[-1500:]
+        except Exception:
+            tail = "(log unreadable)"
+        try:
+            await self.notify_controller(f"[script] {name} -> {status}\nlog: {log_path}\n--- tail ---\n{tail}")
+        except Exception:
+            pass
+
+    @slash(
+        "script", "/script <名称.ps1> [参数...] 或 /script:名称.ps1",
+        "运行 scripts/ 下的 PowerShell 脚本（分离执行；输出落 data/script_logs，完成后推送尾部；/scriptlog 看日志）",
+        write=True,
+    )
+    async def cmd_script(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if not args:
+            d = self._scripts_dir()
+            names = sorted(p.name for p in d.glob("*.ps1")) if d.is_dir() else []
+            if not names:
+                return CommandOutcome(f"scripts 目录（{d}）下没有 .ps1")
+            return CommandOutcome(
+                "可运行脚本（/script 名称 [参数]）:\n- " + "\n- ".join(names[:20])
+            )
+        name = args[0].strip().lstrip("/")
+        extra = [a for a in args[1:] if a]
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+\.ps1", name):
+            return CommandOutcome.err(f"非法脚本名 {name!r}（仅允许 scripts/ 下的 *.ps1，不支持路径）")
+        script = self._scripts_dir() / name
+        if not script.is_file():
+            return CommandOutcome.err(f"scripts\\{name} 不存在；/script 看清单")
+        log_path = self._script_logs_dir() / f"{name[:-4]}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        try:
+            proc = self._spawn_script(script, extra, log_path)
+        except Exception as e:
+            return CommandOutcome.err(f"启动失败: {e}")
+        asyncio.create_task(self._watch_script(name, proc, log_path))
+        arg_note = f" {' '.join(extra)}" if extra else ""
+        return CommandOutcome(
+            f"已分离运行 scripts\\{name}{arg_note}\n日志: {log_path}\n"
+            "完成后推送尾部（若脚本重启了本服务，推送会随之中断，日志保留）"
+        )
+
+    @slash("scriptlog", "/scriptlog [名称前缀]", "查看最近一次脚本运行日志的尾部")
+    async def cmd_scriptlog(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        logs = sorted(
+            self._script_logs_dir().glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if args:
+            pref = args[0].strip().lstrip("/").lower()
+            logs = [p for p in logs if p.name.lower().startswith(pref)] or logs
+        if not logs:
+            return CommandOutcome("还没有任何脚本日志")
+        p = logs[0]
+        tail = p.read_text(encoding="utf-8", errors="replace")[-1200:]
+        return CommandOutcome(f"[{p.name}]\n{tail}")
+
+    @slash(
+        "full-restart", "/full-restart",
+        "完整重启服务（scripts\\start.ps1 -Restart：先停 daemon+serve 再拉起，比 /restart 彻底；硬杀，瞬时中断）",
+        write=True,
+    )
+    async def cmd_full_restart(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        script = self._scripts_dir() / "start.ps1"
+        if not script.is_file():
+            return CommandOutcome.err("scripts\\start.ps1 不存在，无法完整重启")
+        log_path = self._script_logs_dir() / f"full-restart-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        try:
+            self._spawn_script(script, ["-Restart"], log_path)
+        except Exception as e:
+            return CommandOutcome.err(f"启动失败: {e}")
+        return CommandOutcome(
+            "完整重启已发起（start.ps1 -Restart）：本服务马上被停止再拉起，"
+            "WebUI/隧道瞬断 1-2 分钟自愈。日志: " + str(log_path)
+            + "\n（若 daemon 还是旧版不允许脱离作业，改由 muze-autostart-watch 在 5 分钟内拉起）"
+        )
 
     @slash(
         "reenrich",

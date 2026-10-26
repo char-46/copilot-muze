@@ -99,13 +99,22 @@ if os.name == "nt":
     _JobObjectExtendedLimitInformation = 9
     _k32 = ctypes.windll.kernel32
 
+    # allow explicit opt-out children: a runner that must OUTLIVE the job
+    # (e.g. the /full-restart PowerShell executing start.ps1 -Restart, which
+    # kills this daemon) is spawned with CREATE_BREAKAWAY_FROM_JOB. Without
+    # BREAKAWAY_OK on the job that flag fails, and every child of serve
+    # dies with the daemon -- a self-service restart was impossible.
+    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800
+
     def _make_kill_on_close_job():
         """Job handle the OS closes (and kills) when this process dies."""
         h = _k32.CreateJobObjectW(None, None)
         if not h:
             return None
         info = _JELI()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        )
         if not _k32.SetInformationJobObject(
             h, _JobObjectExtendedLimitInformation,
             ctypes.byref(info), ctypes.sizeof(info),
