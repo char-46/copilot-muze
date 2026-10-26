@@ -76,11 +76,45 @@ async def test_script_listing(svc):
     assert not out.is_error and "start.ps1" in out.text  # repo scripts dir
 
 
-async def test_full_restart_runs_start_ps1_restart(svc):
+async def test_full_restart_prefers_scheduled_task(svc, monkeypatch):
+    """schtasks working -> the restart runs OUTSIDE the daemon's job (the
+    breakaway runner proved unreliable under nested jobs, live 2026-10-26)."""
+    import subprocess as _sp
+
+    from muze.core import service as svc_mod
+
     service, spawned = svc
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv[1])
+        import types
+
+        r = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return r
+
+    monkeypatch.setattr(svc_mod.subprocess, "run", fake_run)
     out = await service.run_command("full-restart", ctx(service))
-    assert not out.is_error and "完整重启已发起" in out.text
-    assert spawned[0][0].endswith("start.ps1") and spawned[0][1] == ["-Restart"]
+    assert not out.is_error and "计划任务" in out.text
+    assert calls == ["/Create", "/Run"]  # task created then fired
+    assert spawned == []  # no in-process fallback needed
+
+
+async def test_full_restart_falls_back_when_schtasks_fails(svc, monkeypatch):
+    import subprocess as _sp
+    import types
+
+    from muze.core import service as svc_mod
+
+    service, spawned = svc
+
+    def fake_run(argv, **kw):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="no")
+
+    monkeypatch.setattr(svc_mod.subprocess, "run", fake_run)
+    out = await service.run_command("full-restart", ctx(service))
+    assert not out.is_error and "分离进程" in out.text
+    assert spawned and spawned[0][1] == ["-Restart"]
 
 
 async def test_scriptlog_reads_tail(svc, tmp_path):
