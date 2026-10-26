@@ -720,3 +720,43 @@ async def test_system_prompt_auto_injects_rag_hits(repo):
     cfg.rag.auto_inject = False
     p3 = await agent._system_prompt(ctx, query="谁抱怨过加班")
     assert "语义检索命中" not in p3 and len(rag.queries) == 1
+
+async def test_rag_busy_backoff_blocks_reload_churn(repo):
+    """Live incident 2026-10-26 evening: during a GPU-bound game the CPU
+    stays quiet, the idle gate keeps passing, and the indexer loaded the
+    model every 5 minutes only to be interrupted as busy again. Now an
+    interrupted pass -- or a recent busy-unload -- blocks new passes."""
+    import time as _t
+
+    from muze.config import MuzeConfig
+    from muze.rag import RagIndexer, VecStore
+
+    cfg = MuzeConfig()
+    cfg.rag.enabled = True
+    vec = VecStore(repo)
+    await vec.setup()
+    emb = FakeEmbedder()
+    indexer = RagIndexer(repo, vec, emb, cfg)
+    await repo.upsert_profile("friend/1", "老王", "老王喜欢钓鱼" * 10)
+
+    indexer._idle = None
+    state = {"n": 0}
+
+    def flicker():  # quiet at the pass gate, busy at the batch check
+        state["n"] += 1
+        return state["n"] < 2
+
+    indexer._idle = flicker
+    assert await indexer.run_once() == 0  # interrupted, nothing indexed
+    assert indexer._busy_until > _t.monotonic()
+
+    indexer._idle = lambda: True  # CPU quiet again (GPU still gaming)
+    assert await indexer.run_once() == 0  # ...but the backoff still blocks
+
+    indexer._busy_until = 0.0  # backoff expired
+    assert await indexer.run_once() >= 1
+
+    # a recent busy-UNLOAD (vram steward) blocks reloads the same way
+    emb._last_busy_unload = _t.monotonic()
+    indexer._busy_until = 0.0
+    assert await indexer.run_once() == 0
