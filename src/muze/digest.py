@@ -254,6 +254,28 @@ def missing_dates(repo_latest: str | None, upto: str) -> list[str]:
     return out
 
 
+async def missing_day_holes(repo: Repository, upto: str, limit: int = 7) -> list[str]:
+    """Every missing day between the earliest stored day report and ``upto``
+    (bounded by ``limit`` per night). Unlike :func:`missing_dates` this also
+    catches holes BELOW the latest stored day: a day whose dream failed while
+    a later day succeeded must not stay missing forever (live incident
+    2026-10-26: 10-24 failed on an LLM 402, 10-25 succeeded, and the catch-up
+    never looked back)."""
+    earliest = await repo.earliest_day_digest_date()
+    if not earliest:
+        return [upto]
+    existing = {r["date"] for r in await repo.list_digests(limit=500, period="day")}
+    out: list[str] = []
+    d = datetime.strptime(earliest, "%Y-%m-%d")
+    end = datetime.strptime(upto, "%Y-%m-%d")
+    while d <= end and len(out) < limit:
+        key = d.strftime("%Y-%m-%d")
+        if key not in existing:
+            out.append(key)
+        d += timedelta(days=1)
+    return out
+
+
 # --------------------------------------------------------------------------
 # report generation
 # --------------------------------------------------------------------------
@@ -532,9 +554,12 @@ async def dream_night(
        memory — inputs are child reports, not raw messages);
     3. distill durable memories from the freshest report.
     """
-    latest = await repo.latest_digest(period="day")
     target = yesterday_date()
-    todo = missing_dates(latest["date"] if latest else None, target)
+    # catch up every missing day since the EARLIEST stored day report, not
+    # just since the latest: a day whose dream failed while a LATER day
+    # succeeded used to become a permanent hole (latest advanced past it,
+    # missing_dates never returned it again)
+    todo = await missing_day_holes(repo, target, limit=7)
 
     reports: list[tuple[str, str]] = []
     for d in todo:
@@ -561,7 +586,7 @@ async def dream_night(
                 log.exception("monthly rollup %s failed", m)
 
     if not reports and not rollups:
-        return f"昨天的梦已存在（{target}），周/月报告无缺口。"
+        return f"做梦无缺口（{target} 已存在），周/月报告无待补。"
 
     new_memories = 0
     if cfg.digest.extract_memories and llm.configured and reports:

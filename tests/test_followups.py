@@ -214,7 +214,67 @@ async def test_todo_and_done_commands(svc):
     assert await repo.list_followups(status="dropped")
 
 
-# --------------------------------------------------------- agent tooling
+# ------------------------------------------------- /dream <date> backfills
+async def test_dream_missing_date_is_made_on_the_spot(svc):
+    from muze.digest import day_range
+
+    class _AgentStub:
+        def __init__(self, llm):
+            self.llm = llm
+
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    ts = day_range("2026-10-24")[0] + 3600
+    await _seed_day(repo, ts)
+    service.agent = _AgentStub(SyncLLM())
+
+    out = await service.run_command("dream 2026-10-24", ctx)
+    assert not out.is_error and "刚补做" in out.text
+    assert await repo.get_digest("2026-10-24") is not None
+
+    out = await service.run_command("dream 2026-10-24", ctx)  # now cached
+    assert "做梦报告" in out.text and "刚补做" not in out.text
+
+
+async def test_dream_missing_date_without_llm_is_clear_error(svc):
+    service, _ = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    out = await service.run_command("dream 2026-10-01", ctx)  # no agent configured
+    assert out.is_error and "无法补做" in out.text
+
+
+# ---------------------------------------------------- mid-hole catch-up
+async def test_missing_day_holes_fills_gaps_below_latest(repo):
+    from muze.digest import missing_day_holes
+
+    assert await missing_day_holes(repo, "2026-10-23") == ["2026-10-23"]  # empty store
+    await repo.upsert_digest("2026-10-20", "r", 24.0, {})
+    await repo.upsert_digest("2026-10-22", "r", 24.0, {})
+    holes = await missing_day_holes(repo, "2026-10-23")
+    assert holes == ["2026-10-21", "2026-10-23"]  # 10-21 sits BELOW the latest
+
+
+async def test_missing_day_holes_capped(repo):
+    from muze.digest import missing_day_holes
+
+    await repo.upsert_digest("2026-09-01", "r", 24.0, {})
+    await repo.upsert_digest("2026-09-15", "r", 24.0, {})
+    holes = await missing_day_holes(repo, "2026-09-20", limit=7)
+    assert len(holes) == 7  # bounded per night, not a two-week burst
+
+
+# ----------------------------------------------- agent prompt carries TODOs
+async def test_agent_prompt_lists_open_followups(svc):
+    from muze.ai.agent import Agent
+
+    service, repo = svc
+    await repo.add_followup("group/4242", "交材料", "周五前", "dream:d1", "2026-10-20")
+    agent = Agent(service, repo, None, ChatLog())
+    ctx = ControlContext(source="qq", chat_key="qq:group/99", scene="group", peer_id=99)
+    prompt = await agent._system_prompt(ctx)
+    assert "交材料" in prompt and "#1" in prompt
+    assert "最新下落" in prompt and "followup_close" in prompt  # pull-progress rule
+
 async def test_followup_close_tool_and_gating(svc):
     service, repo = svc
     fid = await repo.add_followup("group/4242", "交材料", "", "dream:d1", "2026-10-20")
