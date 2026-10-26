@@ -85,7 +85,10 @@ Start-Sleep -Seconds 85
 $info = ssh -o BatchMode=yes $Jump "curl -s -m 12 '$RelayApiBase/info?token=copilot'" 2>$null |
     Select-Object -First 1
 if (-not $info) { throw "no /api/info response" }
-if ($info -notmatch [regex]::Escape($Version)) {
+# the box reports the version.py form (0.1.0-alpha.144); accept both it and
+# the pyproject form (0.1.0a144)
+$VerAlt = $Version -replace '^(\d+\.\d+\.\d+)a(\d+)$', '$1-alpha.$2'
+if (($info -notmatch [regex]::Escape($Version)) -and ($info -notmatch [regex]::Escape($VerAlt))) {
     throw "version mismatch after restart: $info"
 }
 Write-Host "[deploy] OK -- box runs $Version"
