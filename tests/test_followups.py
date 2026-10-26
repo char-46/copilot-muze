@@ -263,6 +263,99 @@ async def test_missing_day_holes_capped(repo):
     assert len(holes) == 7  # bounded per night, not a two-week burst
 
 
+# --------------------------------------- /todo merged-forward node layout
+class _Recorder:
+    """Minimal adapter capturing merged forwards (cf. test_reply_send)."""
+
+    def __init__(self):
+        self.sent = []
+        self.forwarded = []
+
+        class _Caps:
+            send_forward = True
+
+        self.caps = _Caps()
+
+    async def send_private_message(self, user_id, segments):
+        from muze.provider.milky.models import SendMessageResult
+
+        self.sent.append(("friend", user_id, segments))
+        return SendMessageResult(message_seq=1, time=1)
+
+    async def send_group_message(self, group_id, segments):
+        from muze.provider.milky.models import SendMessageResult
+
+        self.sent.append(("group", group_id, segments))
+        return SendMessageResult(message_seq=1, time=1)
+
+    async def send_forward_message(self, scene, peer_id, nodes, **kw):
+        from muze.provider.milky.models import SendMessageResult
+
+        self.forwarded.append((scene, peer_id, nodes, kw))
+        return SendMessageResult(message_seq=9, time=1)
+
+    async def ensure_group_name(self, peer):
+        return ""
+
+    async def ensure_friend_name(self, peer):
+        return ""
+
+
+@pytest.fixture
+async def env_todo(tmp_path):
+    conn = await open_db(str(tmp_path / "td.db"))
+    repo = Repository(conn)
+    adapter = _Recorder()
+    cfg = MuzeConfig()
+    cfg.storage.data_dir = str(tmp_path)
+    service = ControlService(cfg, adapter, repo, ChatLog(), Runtime())
+    yield service, adapter, cfg
+    await conn.close()
+
+
+async def test_todo_builds_ordered_item_per_node_forward(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    # add out of order: ids 1..3, but insert 3 first
+    f3 = await repo.add_followup("", "第三件", "", "dream:d1", "2026-10-20")
+    f1 = await repo.add_followup("group/4242", "第一件", "细节甲", "dream:d1", "2026-10-20")
+    f2 = await repo.add_followup("", "第二件", "", "dream:d1", "2026-10-21")
+    out = await service.run_command("todo", ctx)
+    assert not out.is_error
+    assert out.forward_nodes, "todo must carry one-node-per-item layout"
+    items = [n for n in out.forward_nodes if n.startswith("#")]
+    got_ids = [int(n.split(" ", 1)[0][1:]) for n in items]
+    assert got_ids == sorted([f1, f2, f3])  # ascending id = stable opening order
+    assert "**#" in out.text and "# 未结待办" in out.text  # markdown for the image
+
+
+async def test_todo_delivered_as_chain_keeps_order(env_todo):
+    """End-to-end: /todo through deliver() -> ONE merged forward whose nodes
+    stay one-item-each in id order (user requirement 2026-10-26)."""
+    service, adapter, cfg = env_todo
+    from muze.core.service import ControlContext
+
+    titles = ["甲事", "乙事", "丙事", "丁事", "戊事", "己事", "庚事", "辛事"]
+    for t in titles:
+        await service.repo.add_followup("", t, "细节" * 90, "dream:d1", "2026-10-20")
+    cfg.reply.image_markdown = False
+    out = await service.run_command(
+        "todo", ControlContext(source="cli", chat_key="cli", scene="", peer_id=0)
+    )
+    ok = await service.deliver(
+        ControlContext(source="qq", chat_key="qq:group/5", scene="group", peer_id=5),
+        out,
+    )
+    assert ok is True
+    assert len(adapter.forwarded) == 1
+    nodes = adapter.forwarded[0][2]
+    texts = [n[0]["data"]["text"] for n in nodes]
+    assert len(texts) == len(titles) + 2  # header + one per item + tail, in order
+    assert texts[0].startswith("未结待办")
+    for i, t in enumerate(titles, start=1):
+        assert t in texts[i]
+    assert "/done" in texts[-1]
+
 # ----------------------------------------------- agent prompt carries TODOs
 async def test_agent_prompt_lists_open_followups(svc):
     from muze.ai.agent import Agent
@@ -274,6 +367,36 @@ async def test_agent_prompt_lists_open_followups(svc):
     prompt = await agent._system_prompt(ctx)
     assert "交材料" in prompt and "#1" in prompt
     assert "最新下落" in prompt and "followup_close" in prompt  # pull-progress rule
+
+
+async def test_memories_ordered_by_topic_similarity(svc):
+    """Resident memory injection picks by vector similarity to the query
+    (2026-10-26 request); the conversation heuristic only breaks ties."""
+    from muze.ai.agent import Agent
+
+    service, repo = svc
+    await repo.add_memory("identity", "owner", "研究生主线事实")  # heuristic rank 1
+    await repo.add_memory("fact", "999", "无关会话的事实")  # heuristic rank 3
+
+    seen: dict = {}
+
+    class _Rag:
+        enabled = True
+
+        async def search(self, query, k=None, *, kind=None, **kw):
+            # record instead of asserting here: a raising mock would be
+            # swallowed by the code-under-test's best-effort except
+            seen.update(query=query, kind=kind, k=k)
+            return [{"kind": "memory", "ref": "memory:2", "text": "[fact] 999: 无关会话的事实"}]
+
+    service.runtime.rag = _Rag()
+    agent = Agent(service, repo, None, ChatLog())
+    ctx = ControlContext(source="qq", chat_key="qq:group/99", scene="group", peer_id=99)
+    prompt = await agent._system_prompt(ctx, query="运动会照片发了吗")
+    i_hit = prompt.index("无关会话的事实")
+    i_owner = prompt.index("研究生主线事实")
+    assert i_hit < i_owner  # topic-similar memory leads despite heuristic rank
+    assert seen.get("kind") == "memory" and "运动会照片" in str(seen.get("query", ""))
 
 async def test_followup_close_tool_and_gating(svc):
     service, repo = svc

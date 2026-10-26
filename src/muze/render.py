@@ -144,23 +144,26 @@ def _pick_font(font: Path | None) -> str:
 
 
 def _styles(f: str) -> dict[str, ParagraphStyle]:
-    kw = dict(fontName=f, fontSize=12, leading=18, wordWrap="CJK")
-    body = ParagraphStyle("body", spaceAfter=6, **kw)
+    # breathing room: line + paragraph spacing opened up after user feedback
+    # (2026-10-26: "/todo 的图密密麻麻全是字看不清")
+    kw = dict(fontName=f, fontSize=12, leading=21, wordWrap="CJK")
+    body = ParagraphStyle("body", spaceAfter=12, **kw)
     return {
         "body": body,
-        "h1": ParagraphStyle("h1", parent=body, fontSize=19, leading=28,
-                             spaceBefore=16, spaceAfter=8),
-        "h2": ParagraphStyle("h2", parent=body, fontSize=16, leading=24,
-                             spaceBefore=12, spaceAfter=6),
-        "h3": ParagraphStyle("h3", parent=body, fontSize=14, leading=21,
-                             spaceBefore=10, spaceAfter=5),
+        "h1": ParagraphStyle("h1", parent=body, fontSize=19, leading=30,
+                             spaceBefore=20, spaceAfter=12),
+        "h2": ParagraphStyle("h2", parent=body, fontSize=16, leading=26,
+                             spaceBefore=16, spaceAfter=10),
+        "h3": ParagraphStyle("h3", parent=body, fontSize=14, leading=23,
+                             spaceBefore=14, spaceAfter=8),
         "quote": ParagraphStyle("quote", parent=body, leftIndent=16,
                                 textColor=HexColor("#444444")),
-        "code": ParagraphStyle("code", parent=body, fontSize=11, leading=16,
+        "code": ParagraphStyle("code", parent=body, fontSize=11, leading=17,
                                backColor=HexColor("#f0f0f0"), borderPadding=6,
-                               leftIndent=6, spaceBefore=4, spaceAfter=8),
-        "li0": ParagraphStyle("li0", parent=body, leftIndent=20, bulletIndent=4),
-        "cell": ParagraphStyle("cell", parent=body, fontSize=11, leading=16,
+                               leftIndent=6, spaceBefore=6, spaceAfter=12),
+        "li0": ParagraphStyle("li0", parent=body, leftIndent=20, bulletIndent=4,
+                              spaceAfter=9),
+        "cell": ParagraphStyle("cell", parent=body, fontSize=11, leading=17,
                                spaceAfter=0),
     }
 

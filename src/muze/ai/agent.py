@@ -558,6 +558,8 @@ class Agent:
                 )
 
         # --- long-term memories, relevance-ordered for this conversation ---
+        rc = getattr(self.service.cfg, "rag", None)
+        rag = getattr(self.service.runtime, "rag", None)
         try:
             mems = await self.repo.list_memories(limit=200)
         except Exception:
@@ -582,7 +584,28 @@ class Agent:
                     return 2
                 return 3
 
-            ordered = sorted(mems, key=rank)
+            # semantic ordering (2026-10-26 request): when a query is in hand
+            # and RAG is live, resident memories are picked by TOPIC
+            # similarity first -- the vector search reuses the local embedder
+            # (no API cost); the conversation heuristic only breaks ties and
+            # orders what the topic didn't cover
+            sem_rank: dict[int, int] = {}
+            if query and rag is not None and getattr(rag, "enabled", False):
+                try:
+                    for i, h in enumerate(
+                        await rag.search(query, k=60, kind="memory")
+                    ):
+                        ref = str(h.get("ref") or "")
+                        if ref.startswith("memory:"):
+                            try:
+                                sem_rank[int(ref.split(":", 1)[1])] = i
+                            except ValueError:
+                                pass
+                except Exception:
+                    sem_rank = {}
+            ordered = sorted(
+                mems, key=lambda m: (sem_rank.get(m["id"], 100_000), rank(m))
+            )
             picked = ordered[: dc.inject_max_memories]
             n_mems = len(picked)
             lines = [f"- [{m['subject']}] {m['content']}" for m in picked]
@@ -633,8 +656,6 @@ class Agent:
                     + "\n".join(lines)
                 )
         # --- semantic RAG hits for THIS message (auto-inject) ---
-        rc = getattr(self.service.cfg, "rag", None)
-        rag = getattr(self.service.runtime, "rag", None)
         if (
             query
             and rc is not None
