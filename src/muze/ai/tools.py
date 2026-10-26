@@ -23,7 +23,7 @@ log = logging.getLogger("muze.ai")
 # the controller's session but are routed to the controller for approval in
 # any other conversation (see ControlService.requires_approval).
 # send_message routes itself via ControlService.request_send.
-WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update"}
+WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update", "followup_close"}
 
 SPEC = [
     {
@@ -531,6 +531,42 @@ SPEC = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "followup_list",
+            "description": (
+                "查看系统跟踪的未结待办（做梦从消息中提取，含 id/所属会话/开立日期/最后动静）。"
+                "用户问\"我还有什么没办\"\"最近有什么待办\"时用它或 cli todo。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "可选：按关键词过滤"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "followup_close",
+            "description": (
+                "关闭一条跟踪待办——这就是\"完成信号\"。用户说某事已经完成/搞定了/不用再跟了"
+                "（如「表交了」「这事别记了」）时必须调用。id 与 query 至少给一个；"
+                "query 匹配多条时会返回候选清单。status: done=已完成, dropped=失效/不再跟踪。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "待办 id（followup_list 查）"},
+                    "query": {"type": "string", "description": "关键词匹配待办（id 缺省时用）"},
+                    "status": {"type": "string", "enum": ["done", "dropped"]},
+                    "note": {"type": "string", "description": "关闭依据（用户原话更好）"},
+                },
+            },
+        },
+    },
 ]
 
 # Sub-agents run with a READ-ONLY tool set: they research, they never act.
@@ -539,7 +575,7 @@ SPEC = [
 _SUBAGENT_EXCLUDE = {
     "send_message", "send_media", "schedule_task", "remember",
     "memory_update", "memory_delete", "profile_update",
-    "make_chart",
+    "followup_close", "make_chart",
 }
 # NOTE: "subagent" is deliberately NOT excluded — sub-agents may nest up to
 # MAX_SUB_DEPTH levels (enforced at runtime in Agent.run_subagent, not by
@@ -602,6 +638,9 @@ class ToolRunner:
             return f"执行命令: /{args.get('command', '')}"
         if name == "profile_update":
             return f"更新身份档案 [{args.get('subject', '')}]: {str(args.get('content', ''))[:120]}"
+        if name == "followup_close":
+            st = args.get("status") or "done"
+            return f"关闭待办 {'#' + str(args.get('id')) if args.get('id') else str(args.get('query', ''))[:60]} ({st}): {str(args.get('note', ''))[:80]}"
         return f"{name}({_args_brief(args)})"
 
     async def _gate(self, name: str, args: dict) -> str:
@@ -1377,6 +1416,52 @@ class ToolRunner:
         await self.repo.upsert_profile(subject, str(args.get("name", "") or ""), content)
         log.info("PROFILE    | updated %s (%s chars)", subject, len(content))
         return {"ok": True, "subject": subject}
+
+    async def t_followup_list(self, args: dict) -> dict:
+        q = str(args.get("query", "") or "").strip()
+        rows = await self.repo.list_followups(status="open", limit=50)
+        if q:
+            rows = [
+                r for r in rows
+                if q in r["title"] or q in (r["detail"] or "") or q in r["subject"]
+            ]
+        return {
+            "count": len(rows),
+            "followups": [
+                {
+                    "id": r["id"], "subject": r["subject"], "title": r["title"],
+                    "detail": r["detail"], "opened_date": r["opened_date"],
+                    "last_date": r["last_date"],
+                }
+                for r in rows[:30]
+            ],
+            "hint": "用户确认完成/取消时用 followup_close 关闭",
+        }
+
+    async def t_followup_close(self, args: dict) -> dict:
+        st = args.get("status")
+        st = st if st in ("done", "dropped") else "done"
+        fid = args.get("id")
+        if fid is None or not str(fid).isdigit():
+            q = str(args.get("query", "") or "").strip()
+            if not q:
+                return {"error": "id 或 query 至少给一个（followup_list 查 id）"}
+            rows = await self.repo.find_open_followups(q)
+            if len(rows) != 1:
+                return {
+                    "error": f"「{q}」匹配 {len(rows)} 条未结待办，需明确 id",
+                    "candidates": [
+                        {"id": r["id"], "title": r["title"]} for r in rows[:8]
+                    ],
+                    "hint": "followup_list 查全量",
+                }
+            fid = rows[0]["id"]
+        ok = await self.repo.close_followup(int(fid), status=st, source="user")
+        if not ok:
+            return {"error": f"待办 #{fid} 不存在或已关闭"}
+        log.info("FOLLOW     | - #%s closed (%s, via tool): %s",
+                 fid, st, str(args.get("note", ""))[:80])
+        return {"closed": True, "id": int(fid), "status": st}
 
 
 def _args_brief(args: dict) -> str:

@@ -159,7 +159,7 @@ class MilkyAdapter(ProtocolAdapter):
     async def events(self) -> AsyncIterator[Event]:
         async for raw in self.client.ws_events():
             ev = Event.from_raw(raw)
-            if ev.event_type == "message_receive":
+            if ev.event_type in ("message_receive", "message_send"):
                 # Assume file segments actually arrive if one shows up.
                 seg_types = {getattr(s, "type", "") for s in ev.data.segments}
                 if "file" in seg_types:

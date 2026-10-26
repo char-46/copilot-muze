@@ -669,12 +669,36 @@ class Backfiller:
 
     async def _rescan_loop(self) -> None:
         bf = self.cfg.ingest.backfill
+        full_done: str | None = None  # date key of the last daily full sweep
         while not self._stop.is_set():
             await asyncio.sleep(bf.rescan_interval_min * 60)
             if self._stop.is_set():
                 break
             try:
-                targets = await self._rescan_targets()
+                full_key = None
+                if bf.rescan_full_daily:
+                    from datetime import datetime
+
+                    now = datetime.now().astimezone()
+                    hh, _, mm = (bf.rescan_full_at or "00:05").partition(":")
+                    try:
+                        cutoff = now.replace(
+                            hour=int(hh) % 24, minute=int(mm) % 60,
+                            second=0, microsecond=0,
+                        )
+                    except ValueError:
+                        cutoff = now.replace(hour=0, minute=5, second=0, microsecond=0)
+                    key = now.strftime("%Y-%m-%d")
+                    if now >= cutoff and full_done != key:
+                        full_key = key
+                if full_key is not None:
+                    rows = await self.repo.list_conversations(limit=1000)
+                    targets = [(r["scene"], r["peer_id"]) for r in rows]
+                    targets.extend(await self.repo.pending_bf_conversations())
+                    full_done = full_key
+                    log.info("daily full sweep: %s conversations", len(targets))
+                else:
+                    targets = await self._rescan_targets()
                 if targets:
                     await self.run_once(targets, background=True)
             except Exception as e:

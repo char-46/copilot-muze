@@ -409,9 +409,11 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v11_rag(conn)
         await _migrate_v12_value(conn)
         await _migrate_v13_media_asr_ts(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '13')")
+        await _migrate_v14_tasks_lease(conn)
+        await _migrate_v15_followups(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '15')")
         await conn.commit()
-        log.info("database created (schema v13)")
+        log.info("database created (schema v15)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -467,6 +469,44 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v14 (scheduled task claim leases)")
         version = 14
+    if version < 15:
+        await _migrate_v15_followups(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '15')")
+        await conn.commit()
+        log.info("database migrated to schema v15 (structured follow-up tracking)")
+        version = 15
+
+
+async def _migrate_v15_followups(conn: aiosqlite.Connection) -> None:
+    """followups: structured TODO state distilled from dream reports.
+
+    Pending items used to live only as prose inside past digests, and the
+    prompt forced the LLM to re-derive their status from each day's
+    (budget-sampled) transcript — an item whose completion signal never
+    appeared in QQ stayed "仍悬置" forever (user feedback 2026-10-24).
+    The table is the single source of truth now: the dream syncs it, the
+    user can close items explicitly (/done, followup_close), and stale
+    items auto-expire."""
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS followups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject     TEXT NOT NULL DEFAULT '',
+            title       TEXT NOT NULL,
+            detail      TEXT NOT NULL DEFAULT '',
+            status      TEXT NOT NULL DEFAULT 'open',
+            opened_date TEXT NOT NULL DEFAULT '',
+            last_date   TEXT NOT NULL DEFAULT '',
+            closed_date TEXT NOT NULL DEFAULT '',
+            close_source TEXT NOT NULL DEFAULT '',
+            source      TEXT NOT NULL DEFAULT '',
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_followups_status ON followups (status, updated_at);
+        """
+    )
+    await conn.commit()
 
 
 async def _migrate_v14_tasks_lease(conn: aiosqlite.Connection) -> None:

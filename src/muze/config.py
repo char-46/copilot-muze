@@ -102,6 +102,13 @@ class BackfillConfig(BaseModel):
     concurrency: int = 2
     rescan_interval_min: float = 30.0
     rescan_active_window_h: float = 24.0
+    # once per calendar day, sweep EVERY conversation (the 30-min rescan only
+    # covers recently-active chats, so a push miss in a quiet one stays a
+    # hole until it wakes up; measured on the live box: a third of a day's
+    # messages arrived via backfill, not push). Scheduled before digest.at so
+    # the nightly dream reads a complete day; same jitter/budget/risk guards.
+    rescan_full_daily: bool = True
+    rescan_full_at: str = "00:05"
     reconnect_gap_sec: float = 60.0  # min offline gap before a reconnect
     # triggers an immediate catch-up pull (smaller blips wait for rescan)
     # --- pull pacing / account-safety (anti-ban) ---
@@ -496,6 +503,17 @@ class DigestConfig(BaseModel):
     rag_hits: int = 3  # hits per conversation
     rag_chars: int = 200  # chars per hit
     deliver: bool = True
+    # --- structured follow-up tracking ("需要处理" items become DB state) ---
+    # the dream syncs open items each night; the user closes them via /done
+    # or the followup_close tool (the completion signal QQ never carried);
+    # untouched items expire after followup_expire_days
+    followup_extract: bool = True
+    followup_expire_days: int = 14
+    # --- personalization: owner memories steer the report's ordering ---
+    # (the report is FOR the owner: identity/priorities from long-term
+    # memory decide what leads, not just generic urgency)
+    owner_context: bool = True
+    owner_max_chars: int = 900
     # --- morning briefing: push yesterday's digest to the admins at dawn ---
     morning_enabled: bool = True
     morning_at: str = "06:00"  # local HH:MM

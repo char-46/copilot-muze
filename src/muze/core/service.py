@@ -887,6 +887,66 @@ class ControlService:
         return CommandOutcome(f"已停用记忆 #{args[0]}")
 
     @slash(
+        "todo", "/todo [drop <id>]",
+        "系统跟踪的待办清单（做梦提取；/done <id|关键词> 标记完成，drop=不再跟踪）",
+    )
+    async def cmd_todo(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        from muze.digest import local_date as _local_date
+
+        if args and args[0].lower() in ("drop", "del", "rm", "off"):
+            if len(args) < 2 or not args[1].isdigit():
+                return CommandOutcome.err("用法: /todo drop <id>（/todo 看 id）")
+            ok = await self.repo.close_followup(
+                int(args[1]), status="dropped", source="user", closed_date=_local_date()
+            )
+            if not ok:
+                return CommandOutcome.err(f"#{args[1]} 不存在或已关闭")
+            return CommandOutcome(f"已不再跟踪待办 #{args[1]}")
+        rows = await self.repo.list_followups(status="open", limit=50)
+        if not rows:
+            return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
+        lines = []
+        for r in rows[:20]:
+            subj = r["subject"] or "全局"
+            line = f"#{r['id']} [{subj}] {r['title']}"
+            if r["detail"]:
+                line += f"（{str(r['detail'])[:40]}）"
+            lines.append(f"{line} — 开于{r['opened_date']}，最后动静{r['last_date'] or r['opened_date']}")
+        return CommandOutcome(
+            f"未结待办 {len(rows)} 条:\n" + "\n".join(lines)
+            + "\n/done <id|关键词> 标记完成；/todo drop <id> 不再跟踪"
+        )
+
+    @slash(
+        "done", "/done <id|关键词>",
+        "标记某条跟踪待办已完成——这就是\"完成信号\"（/todo 看清单）", write=True,
+    )
+    async def cmd_done(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        from muze.digest import local_date as _local_date
+
+        if not args:
+            return CommandOutcome.err("用法: /done <id|关键词>（/todo 看清单）")
+        if args[0].isdigit():
+            ok = await self.repo.close_followup(
+                int(args[0]), status="done", source="user", closed_date=_local_date()
+            )
+            if not ok:
+                return CommandOutcome.err(f"#{args[0]} 不存在或已关闭")
+            return CommandOutcome(f"已完成待办 #{args[0]}，明早日报不再跟它")
+        q = " ".join(args)
+        rows = await self.repo.find_open_followups(q)
+        if len(rows) == 1:
+            r = rows[0]
+            await self.repo.close_followup(
+                r["id"], status="done", source="user", closed_date=_local_date()
+            )
+            return CommandOutcome(f"已完成待办 #{r['id']}: {r['title']}")
+        if not rows:
+            return CommandOutcome.err(f"没有匹配「{q}」的未结待办；/todo 看清单")
+        cands = "\n".join(f"#{r['id']} {r['title']}" for r in rows[:8])
+        return CommandOutcome.err(f"「{q}」匹配 {len(rows)} 条，请用 id:\n{cands}")
+
+    @slash(
         "reenrich",
         "/reenrich <scene/peer> [record|image|all] [天数]",
         "重置旧媒体结果让后台重新理解：record=重新转写语音(含逐词时间戳)，"

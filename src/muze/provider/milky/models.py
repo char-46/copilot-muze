@@ -335,6 +335,14 @@ class Event(_M):
         typed: Any
         if et == "message_receive":
             typed = MessageEventData.from_raw(data)
+        elif et == "message_send":
+            # Some Milky implementations report the account's own outgoing
+            # messages (typed on another client, e.g. the owner's phone) as
+            # this separate event type. Archive them exactly like receive
+            # events -- is_self=True keeps them off the control-trigger path
+            # (LLBot currently reuses message_receive for these, which is why
+            # self replies already land in the archive in real time).
+            typed = MessageEventData.from_raw({**data, "is_self": True})
         elif et == "bot_offline":
             typed = BotOfflineData.model_validate(data)
         elif et == "message_recall":
