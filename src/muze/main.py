@@ -590,6 +590,10 @@ class App:
         self._loop = asyncio.get_running_loop()
         if getattr(self, "agent", None) is not None:
             await self.agent.load_sessions()  # restore suspended/continued turns
+            try:
+                await self.agent.auto_resume()  # continue restart-checkpointed turns
+            except Exception:
+                log.exception("auto-resume of interrupted sessions failed")
         if not self.degraded:
             await self.backfiller.start_background()
         else:
@@ -1153,6 +1157,11 @@ class App:
         if self.pipeline is not None:
             await _safe("drain_media", self.pipeline.drain_media(timeout=5), 7)
         if getattr(self, "agent", None) is not None:
+            # checkpoint BEFORE aclose cancels the tasks: running sessions
+            # flip to restart-marked suspend so the next boot auto-resumes
+            # them instead of losing the turn (user requirement 2026-10-26:
+            # /restart or updates must not waste the tokens already spent)
+            await _safe("agent.checkpoint", self.agent.checkpoint(), 5)
             await _safe("agent.aclose", self.agent.aclose(), 5)
         if self.adapter is not None:
             await _safe("adapter.close", self.adapter.close(), 5)

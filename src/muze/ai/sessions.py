@@ -253,6 +253,9 @@ class SessionStore:
     def recent(self, n: int = 8) -> list[Session]:
         return list(self._sessions.values())[-n:]
 
+    def all(self) -> list[Session]:
+        return list(self._sessions.values())
+
     def latest(self, n: int = 10) -> list[Session]:
         return sorted(self._sessions.values(), key=lambda s: s.updated, reverse=True)[:n]
 
