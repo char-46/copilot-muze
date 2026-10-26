@@ -492,6 +492,70 @@ class Agent:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    # ------------------------------------------------- restart continuity
+    CHECKPOINT_EVENT = "restart-ckpt"
+
+    async def checkpoint(self, note: str = "进程重启，已保存断点") -> int:
+        """Graceful-shutdown hook: flip RUNNING sessions to suspend with a
+        restart marker. Loop messages are already persisted per step, so the
+        next boot resumes the LLM conversation exactly at the break —
+        completed turns replay from the provider's prompt cache instead of
+        being regenerated (no token waste on /restart or updates)."""
+        n = 0
+        for s in self.sessions.all():
+            if s.status != RUNNING:
+                continue
+            s.status = SUSPEND
+            if not s.result_preview:
+                s.result_preview = f"第 {s.step} 轮中断"
+            s.event(self.CHECKPOINT_EVENT, note)
+            await self._persist(s)
+            n += 1
+        if n:
+            log.info("checkpoint: %d running session(s) saved for auto-resume", n)
+        return n
+
+    async def auto_resume(self) -> int:
+        """Boot hook: continue sessions the previous process was interrupted
+        in. Only restart-marked suspends (or stale 'running' rows left by a
+        hard exit — the per-account instance lock guarantees no other live
+        owner) are resumed; user-paused suspends stay paused."""
+        resumed = 0
+        for s in self.sessions.all():
+            if s.status == RUNNING:
+                # zombie from a hard-killed process
+                s.status = SUSPEND
+                s.event(self.CHECKPOINT_EVENT, "上个进程硬退出，按断点续跑")
+                await self._persist(s)
+            if s.status != SUSPEND:
+                continue
+            if not any(e[1] == self.CHECKPOINT_EVENT for e in s.events):
+                continue  # user-paused: /sess go resumes it on demand
+            ctx = self._ctx_for(s)
+            if ctx is None:
+                continue  # web/cli origins: resumable via /sess, no QQ push
+            s.event("resume", "重启后自动续跑")
+            self.resume(s, ctx)
+            resumed += 1
+        if resumed:
+            log.info("auto-resume: continuing %d interrupted session(s)", resumed)
+        return resumed
+
+    def _ctx_for(self, s: Session) -> ControlContext | None:
+        """Rebuild a deliverable control ctx from a persisted chat_key
+        ('qq:group:123' / legacy 'qq:group/123')."""
+        key = s.chat_key or ""
+        if not key.startswith("qq:"):
+            return None
+        rest = key[3:].replace("/", ":")
+        scene, _, peer = rest.partition(":")
+        if scene in ("group", "friend") and peer.isdigit():
+            return ControlContext(
+                source="qq", chat_key=key, scene=scene, peer_id=int(peer),
+                user_label="restart-resume",
+            )
+        return None
+
     def reset(self, chat_key: str) -> None:
         self._histories.pop(chat_key, None)
 
