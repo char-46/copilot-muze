@@ -1131,7 +1131,9 @@ class ControlService:
         script = self._scripts_dir() / "start.ps1"
         if not script.is_file():
             return CommandOutcome.err("scripts\\start.ps1 不存在，无法完整重启")
-        d = self._script_logs_dir()
+        d = self._script_logs_dir().resolve()  # ABSOLUTE: the scheduled task
+        # runs with cwd=System32, any relative path in the action fails (live
+        # finding 2026-10-26: LastTaskResult=1, nothing happened)
         log_path = d / f"full-restart-{time.strftime('%Y%m%d-%H%M%S')}.log"
         via = ""
         # Preferred: a ONE-SHOT SCHEDULED TASK runs start.ps1 completely
