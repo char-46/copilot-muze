@@ -162,6 +162,23 @@ async def test_capability_wish_tool_gated_and_files(svc):
     assert rows[0]["context"] == "截半段语音"
 
 
+async def test_evolve_command_uses_agent_llm(svc):
+    """/evolve must not assume ControlService owns an llm (live error
+    2026-10-28: 'ControlService' object has no attribute 'llm')."""
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    stale = await repo.add_memory("fact", "muze", "待办用数据库id 关闭")
+
+    class AgentStub:
+        def __init__(self, llm):
+            self.llm = llm
+
+    service.agent = AgentStub(EvolveLLM(f'[{{"action":"retire","id":{stale},"content":"旧写法"}}]'))
+    out = await service.run_command("evolve", ctx)
+    assert not out.is_error and "习惯已同步" in out.text and "1 条变更" in out.text
+    assert await repo.retire_memory(stale) is False  # retired by the pass
+
+
 async def test_agent_prompt_injects_habits_not_changelog(svc):
     from muze.ai.agent import Agent
 

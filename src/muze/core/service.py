@@ -1074,13 +1074,17 @@ class ControlService:
 
     @slash(
         "evolve", "/evolve",
-        "手动触发自进化：对照变更日志修自己的习惯记忆（正常随版本启动自动跑一次）", write=True,
+        "手动校正习惯：对照版本变更日志清理过时记忆、补上新习惯（每次版本更新后自动跑一次）", write=True,
     )
     async def cmd_evolve(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.evolve import evolve_if_due
+        from muze.version import BASE_VERSION
 
-        changed = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog, force=True)
-        return CommandOutcome(f"自进化完成：{changed} 条记忆/习惯变更（0 = 本次没有要改的）")
+        llm = getattr(self.agent, "llm", None) if getattr(self, "agent", None) else None
+        if llm is None:
+            llm = getattr(self.runtime, "llm", None)
+        changed = await evolve_if_due(self.repo, llm, self.cfg, self.chatlog, force=True)
+        return CommandOutcome(f"习惯已同步到 {BASE_VERSION}：{changed} 条变更（清理过时条目 / 补上新习惯；0 = 本次无需改动）")
 
     @slash(
         "wishes", "/wishes [close <序号> [resolved|rejected] | all]",
