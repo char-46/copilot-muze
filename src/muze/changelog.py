@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.162",
+        "date": "2026-10-28",
+        "changes": [
+            "待办截止日补齐：布置原文写明活动/交付日期时必须填 due_date——「成稿后交/完成后发我」不再被视为无截止，同一活动布置给多人时逐条填相同日期；模型回短格式（10-30、10月30日15:30）也会归一化为 YYYY-MM-DD 再入库（此前会原样存储导致逾期判断失灵）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.161",
         "date": "2026-10-28",
         "changes": [

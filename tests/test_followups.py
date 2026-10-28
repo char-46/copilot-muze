@@ -155,6 +155,28 @@ async def test_sync_garbage_is_best_effort(repo):
     assert len(await repo.list_followups()) == 1  # untouched
 
 
+async def test_sync_normalizes_short_due_date(repo):
+    """User feedback 2026-10-28: three delegations for the same 10-30 event,
+    only one got a due date. Two fixes are pinned here: (1) the prompt now
+    forbids leaving due_date empty when the 布置原文 names a date, even if
+    the task says 成稿后交; (2) whatever form the model echoes ("10-30",
+    "10月30日15:30") is normalized to YYYY-MM-DD on the way in."""
+    from muze.digest import FOLLOWUP_SYNC_PROMPT
+
+    assert "每一条都要填相同的 due_date" in FOLLOWUP_SYNC_PROMPT
+    assert "不填的理由" in FOLLOWUP_SYNC_PROMPT
+
+    llm = SyncLLM(sync_json=(
+        '[{"action":"add","subject":"friend/1684728923","title":"熊潞嘉写稿",'
+        '"assignee":"friend/1684728923","due_date":"10-30"}]'
+    ))
+    await sync_followups(
+        repo, llm, MuzeConfig(), date="2026-10-23", report="", chatlog=ChatLog()
+    )
+    items = await repo.list_followups()
+    assert items[0]["due_date"].endswith("-10-30")  # year borrowed, zero-padded
+
+
 async def test_run_digest_survives_sync_crash(repo):
     class CrashSyncLLM(SyncLLM):
         async def chat(self, messages, tools=None, **kw):
