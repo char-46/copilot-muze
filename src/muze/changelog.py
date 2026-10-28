@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.152",
+        "date": "2026-10-28",
+        "changes": [
+            "修复：自进化启动任务因未持引用被垃圾回收，从未执行（现持有引用并留日志）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.151",
         "date": "2026-10-28",
         "changes": [
