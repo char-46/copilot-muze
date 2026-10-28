@@ -554,8 +554,9 @@ SPEC = [
             "name": "followup_add",
             "description": (
                 "登记一条新的跟踪待办——用户下达任务/委托/约定时（\"这个活动需要写稿\"\"帮我记着周三是 deadline\"）"
-                "必须立即调用，不要等夜里做梦。标题写清 谁+什么事+时限（如有）；含明确时间点时"
-                "可再配 schedule_task 定提醒。"
+                "必须立即调用，不要等夜里做梦；**用户布置给别人去办的事同样登记**（assignee=受托人，"
+                "如\"让小王写推送\"→assignee=小王，完成以TA交付为准）。标题写清 谁+什么事+时限（如有）；"
+                "有明确截止日填 due_date（10-30/10月30日/2026-10-30 均可）；临近时限可再配 schedule_task 定提醒。"
             ),
             "parameters": {
                 "type": "object",
@@ -563,6 +564,8 @@ SPEC = [
                     "title": {"type": "string", "description": "待办标题（≤40字，谁+什么事+时限）"},
                     "subject": {"type": "string", "description": "相关会话: group/123 或 QQ号，可空"},
                     "detail": {"type": "string", "description": "补充细节（时间地点等）"},
+                    "assignee": {"type": "string", "description": "负责人：布置给别人时填受托人；用户自办则空"},
+                    "due_date": {"type": "string", "description": "截止日：10-30 / 10月30日 / 2026-10-30"},
                 },
                 "required": ["title"],
             },
@@ -1472,21 +1475,28 @@ class ToolRunner:
 
     async def t_followup_add(self, args: dict) -> dict:
         from muze.digest import local_date as _local_date
+        from muze.digest import parse_due_date as _parse_due
 
         title = str(args.get("title", "") or "").strip()
         if len(title) < 4:
             return {"error": "标题太短，写清 谁+什么事+时限"}
+        assignee = str(args.get("assignee", "") or "").strip()
+        due = _parse_due(str(args.get("due_date", "") or ""))
         fid = await self.repo.add_followup(
             str(args.get("subject", "") or "").strip(),
             title,
             str(args.get("detail", "") or ""),
             source="user", opened_date=_local_date(),
+            assignee=assignee, due_date=due,
         )
         if fid is None:
             return {"error": "已有一模一样的未结待办"}
-        log.info("FOLLOW     | + #%s [%s] %s (via tool)",
-                 fid, args.get("subject", ""), title[:80])
-        return {"added": True, "title": title, "hint": "已入待办，每晚做梦前自动检查完成度"}
+        log.info("FOLLOW     | + #%s [%s] %s (via tool, assignee=%s due=%s)",
+                 fid, args.get("subject", ""), title[:80], assignee or "-", due or "-")
+        hint = "已入待办，每晚做梦前自动检查完成度"
+        if assignee:
+            hint = f"已入待办（负责人 {assignee}，等TA交付），每晚做梦前自动检查完成度"
+        return {"added": True, "title": title, "assignee": assignee, "due_date": due, "hint": hint}
 
     async def t_followup_close(self, args: dict) -> dict:
         from muze.digest import numbered_followups

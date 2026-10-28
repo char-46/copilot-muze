@@ -605,3 +605,97 @@ async def test_followup_list_tool_filters(svc):
     runner = ToolRunner(service, repo, service.adapter, None, inside)
     out = __import__("json").loads(await runner.run("followup_list", {"query": "张三"}))
     assert out["count"] == 1 and out["followups"][0]["title"] == "回张三"
+
+
+# ------------------------------------------------ delegated tasks (2026-10-28)
+async def test_v16_columns_and_assignee_roundtrip(repo):
+    async with repo.conn.execute("PRAGMA table_info(followups)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    assert {"assignee", "due_date"} <= cols
+    fid = await repo.add_followup(
+        "group/1079442732", "交推送初稿", "配图另算", "user", "2026-10-28",
+        assignee="小王", due_date="2026-10-30",
+    )
+    row = (await repo.list_followups())[0]
+    assert row["id"] == fid and row["assignee"] == "小王" and row["due_date"] == "2026-10-30"
+
+
+async def test_parse_due_date_forms():
+    from muze.digest import parse_due_date
+
+    assert parse_due_date("2026-10-30", "2026-10-28") == "2026-10-30"
+    assert parse_due_date("10-30", "2026-10-28") == "2026-10-30"
+    assert parse_due_date("10.30", "2026-10-28") == "2026-10-30"
+    assert parse_due_date("10月30日15:30", "2026-10-28") == "2026-10-30"
+    assert parse_due_date("下个月", "2026-10-28") == ""  # unparseable -> keep in title
+
+
+async def test_todo_add_assignee_and_due(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    out = await service.run_command(
+        "todo add @小王 10-30前交推送初稿 due:10-30", ctx
+    )
+    assert not out.is_error and "小王" in out.text and "10-30" in out.text
+    rows = await repo.list_followups()
+    assert rows[0]["assignee"] == "小王" and rows[0]["due_date"] == "2026-10-30"
+    assert "due:" not in rows[0]["title"]  # the token is parsed out, not left in
+    assert "@" not in rows[0]["title"]
+
+    # display: delegated tag + due + overdue flag + header count
+    from muze.digest import local_date
+
+    await repo.add_followup("", "自办事项", "", "user", local_date())
+    out = await service.run_command("todo", ctx)
+    assert "已布置给他人" in out.text and "负责人 小王" in out.text
+    assert "截止 2026-10-30" in out.text
+    # overdue path: due yesterday
+    await repo.close_followup(rows[0]["id"], status="dropped", closed_date=local_date())
+    await repo.add_followup(
+        "", "过期的事", "", "user", "2026-10-01", assignee="小王", due_date="2026-10-02"
+    )
+    out = await service.run_command("todo", ctx)
+    assert "⚠已逾期" in out.text
+
+
+async def test_followup_add_tool_carries_assignee(svc):
+    import json
+
+    service, repo = svc
+    inside = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    runner = ToolRunner(service, repo, service.adapter, None, inside)
+    out = json.loads(await runner.run(
+        "followup_add",
+        {"title": "让班长收医保回执", "assignee": "班长", "due_date": "11月1日"},
+    ))
+    assert out.get("added") is True and out["assignee"] == "班长"
+    assert out["due_date"].endswith("-11-01")
+    row = (await repo.list_followups())[0]
+    assert row["assignee"] == "班长" and row["due_date"].endswith("-11-01")
+
+
+async def test_format_and_sweep_show_assignee(repo):
+    from muze.digest import _format_followups, check_followups, local_date
+
+    await repo.add_followup(
+        "", "交推送终稿", "", "user", "2026-10-28", assignee="小王", due_date="2026-10-30"
+    )
+    txt = _format_followups(await repo.list_followups())
+    assert "→负责人:小王" in txt and "截止 2026-10-30" in txt
+
+    llm = CheckLLM(check_json="[]")
+    await check_followups(repo, llm, MuzeConfig(), date=local_date(), chatlog=ChatLog())
+    p = llm.check_prompts[0]
+    assert "→负责人:小王" in p and "交推送终稿" in p
+
+
+async def test_sync_add_passes_assignee_due(repo):
+    llm = SyncLLM(
+        sync_json=(
+            '[{"action":"add","subject":"group/4242","title":"小王交推送初稿",'
+            '"assignee":"小王","due_date":"2026-10-30"}]'
+        )
+    )
+    await sync_followups(repo, llm, MuzeConfig(), date="2026-10-28", report="", chatlog=ChatLog())
+    row = (await repo.list_followups())[0]
+    assert row["assignee"] == "小王" and row["due_date"] == "2026-10-30"

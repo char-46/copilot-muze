@@ -967,9 +967,15 @@ class Repository:
     async def add_followup(
         self, subject: str, title: str, detail: str = "",
         source: str = "", opened_date: str = "",
+        assignee: str = "", due_date: str = "",
     ) -> int | None:
         """Open a tracked follow-up. Returns None when an identical open
-        item already exists (dream sync may re-propose the same thing)."""
+        item already exists (dream sync may re-propose the same thing).
+
+        assignee: who OWNS the action -- empty means the user themself; a
+        named person means the user DELEGATED it downward and is waiting
+        for their delivery (user request 2026-10-28). due_date: optional
+        YYYY-MM-DD deadline for 催办/overdue flags."""
         subject, title = (subject or "").strip(), (title or "").strip()
         if not title:
             return None
@@ -983,11 +989,12 @@ class Repository:
             """
             INSERT INTO followups
                 (subject, title, detail, status, opened_date, last_date, source,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)
+                 assignee, due_date, created_at, updated_at)
+            VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
             """,
             (subject, title[:120], (detail or "")[:500], opened_date, opened_date,
-             source, _now(), _now()),
+             source, (assignee or "").strip()[:60], (due_date or "").strip()[:10],
+             _now(), _now()),
         )
         await self.conn.commit()
         return int(cur.lastrowid)
