@@ -48,6 +48,13 @@ def test_dense_numbering_language_in_prompts():
     assert "#N 是序号" in FOLLOWUP_CHECK_PROMPT
 
 
+def test_no_permission_asking_rule_is_pinned():
+    # user direction 2026-10-28: 不要主动询问要不要怎么做 -- the agent acts
+    # and reports, it does not end turns with 要不要我…/需要我…吗
+    assert "不要主动征求许可" in SYSTEM_PROMPT
+    assert "要不要我" in SYSTEM_PROMPT and "需要我" in SYSTEM_PROMPT
+
+
 def test_digest_prompt_defers_to_owner_profile():
     assert "画像" in DIGEST_PROMPT
 

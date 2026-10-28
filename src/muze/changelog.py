@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.161",
+        "date": "2026-10-28",
+        "changes": [
+            "系统提示词禁止主动征求许可：不再问「要不要我…」「需要我…吗」「你希望我怎么处理」，能做的直接做完再汇报结果；只有缺少无法从档案/上下文推断的关键信息时才提一个具体问题并附默认方案（代发消息的系统确认流程不受影响）。漂移守卫测试锁定该规则。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.160",
         "date": "2026-10-28",
         "changes": [
