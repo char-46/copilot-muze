@@ -57,9 +57,10 @@ def make_chart(
     f_title = _font(22)
     f_small = _font(13)
 
-    d.text((width // 2, 16), str(title)[:80], fill=_FG, font=f_title, anchor="ma")
+    # outer breathing room (user feedback 2026-10-28: 图片加总体 padding)
+    d.text((width // 2, 26), str(title)[:80], fill=_FG, font=f_title, anchor="ma")
 
-    ml, mr, mt, mb = 60, 30, 60, 70
+    ml, mr, mt, mb = 74, 44, 74, 86
     x0, y0 = ml, height - mb
     x1, y1 = width - mr, mt
     d.line([(x0, y1), (x0, y0)], fill=_GRID, width=1)  # y axis

@@ -115,7 +115,7 @@ FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根�
 - close：仅当报告中有**明确证据**该事项已解决或失效（写明依据）；不要因为"挂了几天"就关闭——过期由系统自动处理，用户也会手动关闭。status 用 done（已完成）或 dropped（已失效/不用跟）。
 - keep：今天有新进展但仍未了结的事项（系统会刷新其动静日期）。
 
-# 现有待办（仅 open；#N 为序号，引用时原样使用）
+# 现有待办（仅 open；#N 为序号，子任务为 #3.1 形式，引用时原样使用）
 {open}
 
 # 今日报告（{date}；LLM 摘要，安静会话可能被省略，以【当日原始布置】为准）
@@ -336,20 +336,65 @@ async def owner_context(repo: Repository, cfg: MuzeConfig) -> str:
     return txt or "(暂无关于用户本人的记忆；按通用排序，不要臆造画像)"
 
 
-def numbered_followups(items: list[dict]) -> list[tuple[int, dict]]:
-    """Dense 1..N display numbering over open followups, stable open order.
+def numbered_followups(items: list[dict]) -> list[tuple[str, dict]]:
+    """Dense display numbering over open followups, with subtask levels.
 
-    The DB id stays internal: after closes the raw ids go sparse (#3, #7,
-    #12...) which reads badly and confuses the LLM callers. Every surface
-    (/todo, digest, agent injection, tools) shows THIS number instead, and
-    every resolver maps it back positionally (user feedback 2026-10-28:
-    按序号排序，done 之后避免稀疏)."""
-    return list(enumerate(sorted(items, key=lambda r: r["id"]), 1))
+    Top-level items get 1..N in stable id order; children of an OPEN parent
+    follow it as n.1, n.2 (deeper levels nest the same way). A child whose
+    parent is closed/missing is promoted to top level -- a dangling 3.1
+    would be unclosable. The DB id stays internal: every surface (/todo,
+    digest, agent injection, tools) shows THIS number, and every resolver
+    maps it back (user feedback 2026-10-28: 按序号排序，done 之后避免稀疏;
+    same day: 同一任务的子任务用分级的方式表示)."""
+    rows = sorted(items, key=lambda r: r["id"])
+    by_id = {r["id"]: r for r in rows}
+    kids: dict[int, list[dict]] = {}
+    roots: list[dict] = []
+    for r in rows:
+        pid = int(r.get("parent_id") or 0)
+        if pid and pid in by_id and pid != r["id"]:
+            kids.setdefault(pid, []).append(r)
+        else:
+            roots.append(r)
+    out: list[tuple[str, dict]] = []
+    seen: set[int] = set()
+
+    def walk(r: dict, label: str) -> None:
+        if r["id"] in seen:  # cycle guard (defensive: data is user-editable)
+            return
+        seen.add(r["id"])
+        out.append((label, r))
+        for j, c in enumerate(kids.get(r["id"], []), 1):
+            walk(c, f"{label}.{j}")
+
+    for i, r in enumerate(roots, 1):
+        walk(r, str(i))
+    for r in rows:  # any leftover (cycle) still shows up rather than vanish
+        if r["id"] not in seen:
+            walk(r, str(len(out) + 1))
+    return out
 
 
-def followup_no_map(items: list[dict]) -> dict[int, int]:
-    """display number -> DB id, for mapping LLM/user answers back."""
+def followup_no_map(items: list[dict]) -> dict[str, int]:
+    """display number ("3" or "3.1") -> DB id, for mapping answers back."""
     return {n: r["id"] for n, r in numbered_followups(items)}
+
+
+def _followup_no(v) -> str | None:
+    """Normalize an LLM/user id reply to the display-number string.
+
+    Accepts 3, "3", 3.0, "3.1"; rejects bools/garbage. Dotted numbers are
+    SUBTASK numbers (#3.1) and map through the same table."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    s = str(v).strip().lstrip("#")
+    import re as _re
+
+    return s if _re.fullmatch(r"\d+(?:\.\d+)*", s) else None
 
 
 def parse_due_date(s: str, today: str | None = None) -> str:
@@ -947,9 +992,7 @@ async def sync_followups(
         if not isinstance(item, dict):
             continue
         action = item.get("action")
-        mid = item.get("id")
-        if isinstance(mid, bool) or not isinstance(mid, int):
-            mid = None
+        mid = _followup_no(item.get("id"))
         real_id = id_map.get(mid) if mid is not None else None
         if action == "add":
             raw_due = str(item.get("due_date", "") or "").strip()
@@ -993,7 +1036,7 @@ FOLLOWUP_CHECK_PROMPT = """你是个人 QQ copilot 的"待办完成度检查"模
 - close dropped：证据明确表明事项取消/不再需要跟。
 - touch：其他新进展但仍未了结（含承诺在做）。
 - 证据不足或无证据：**不要输出该条**。宁可漏判，不可臆造——依据必须来自消息原文。
-- #N 是序号，输出时原样引用。
+- #N 是序号，输出时原样引用（子任务是 #3.1 这样的形式，同样原样使用；子任务完成不等于父任务完成，除非用户验收确认）。
 
 # 未结待办与当日证据（{date}）
 {blocks}
@@ -1123,8 +1166,8 @@ async def check_followups(
     for item in items[:40]:
         if not isinstance(item, dict):
             continue
-        no = item.get("no")
-        if isinstance(no, bool) or not isinstance(no, int):
+        no = _followup_no(item.get("no"))
+        if no is None:
             continue
         real_id = id_map.get(no)
         if real_id is None:

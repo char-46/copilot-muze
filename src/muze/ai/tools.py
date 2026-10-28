@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from muze.chatlog import epoch_iso
 from muze.core.service import ControlContext, ControlService
@@ -557,6 +558,7 @@ SPEC = [
                 "必须立即调用，不要等夜里做梦；**用户布置给别人去办的事同样登记**（assignee=受托人，"
                 "如\"让小王写推送\"→assignee=小王，完成以TA交付为准）。标题写清 谁+什么事+时限（如有）；"
                 "有明确截止日填 due_date（10-30/10月30日/2026-10-30 均可）；临近时限可再配 schedule_task 定提醒。"
+                "同一活动的多个子任务（拍照/写稿/排版）用 parent 挂在父条目下，显示为 #3.1/#3.2，关闭父任务会一并关闭。"
             ),
             "parameters": {
                 "type": "object",
@@ -566,6 +568,7 @@ SPEC = [
                     "detail": {"type": "string", "description": "补充细节（时间地点等）"},
                     "assignee": {"type": "string", "description": "负责人：布置给别人时填受托人；用户自办则空"},
                     "due_date": {"type": "string", "description": "截止日：10-30 / 10月30日 / 2026-10-30"},
+                    "parent": {"type": "string", "description": "父任务序号（followup_list 里的 #3 / #3.1）；作为其子任务，可空"},
                 },
                 "required": ["title"],
             },
@@ -1481,9 +1484,10 @@ class ToolRunner:
         # after closes; the DB id never leaks out
         from muze.digest import numbered_followups
 
-        nos = {r["id"]: n for n, r in numbered_followups(
-            await self.repo.list_followups(status="open", limit=50)
-        )}
+        all_rows = await self.repo.list_followups(status="open", limit=50)
+        pairs = numbered_followups(all_rows)
+        nos = {r["id"]: n for n, r in pairs}
+        # parent display number for nesting (empty = top level)
         return {
             "count": len(rows),
             "followups": [
@@ -1493,10 +1497,11 @@ class ToolRunner:
                     "last_date": r["last_date"], "assignee": r.get("assignee") or "",
                     "due_date": r.get("due_date") or "",
                     "delivered_date": r.get("delivered_date") or "",
+                    "parent": nos.get(int(r.get("parent_id") or 0), ""),
                 }
                 for r in rows[:30]
             ],
-            "hint": "id 为序号；交付≠完成：有负责人且 delivered_date 非空的在等用户验收，验收确认后才能 followup_close；用户委托新任务用 followup_add 登记",
+            "hint": "id 为序号（子任务是 3.1 形式）；交付≠完成：有负责人且 delivered_date 非空的在等用户验收，验收确认后才能 followup_close；用户委托新任务用 followup_add 登记（子任务用 parent）",
         }
 
     async def t_followup_add(self, args: dict) -> dict:
@@ -1508,21 +1513,38 @@ class ToolRunner:
             return {"error": "标题太短，写清 谁+什么事+时限"}
         assignee = str(args.get("assignee", "") or "").strip()
         due = _parse_due(str(args.get("due_date", "") or ""))
+        parent_id = 0
+        parent_raw = str(args.get("parent", "") or "").strip().lstrip("#")
+        if parent_raw:
+            # parent is a DISPLAY number (#3 / 3.1) from followup_list
+            from muze.digest import followup_no_map
+
+            open_rows = await self.repo.list_followups(status="open", limit=50)
+            pid = followup_no_map(open_rows).get(parent_raw)
+            if pid is None:
+                return {"error": f"父任务 #{parent_raw} 不存在（followup_list 查序号，子任务用 parent）"}
+            parent_id = pid
         fid = await self.repo.add_followup(
             str(args.get("subject", "") or "").strip(),
             title,
             str(args.get("detail", "") or ""),
             source="user", opened_date=_local_date(),
-            assignee=assignee, due_date=due,
+            assignee=assignee, due_date=due, parent_id=parent_id,
         )
         if fid is None:
             return {"error": "已有一模一样的未结待办"}
-        log.info("FOLLOW     | + #%s [%s] %s (via tool, assignee=%s due=%s)",
-                 fid, args.get("subject", ""), title[:80], assignee or "-", due or "-")
+        log.info("FOLLOW     | + #%s [%s] %s (via tool, assignee=%s due=%s parent=%s)",
+                 fid, args.get("subject", ""), title[:80], assignee or "-", due or "-",
+                 parent_raw or "-")
         hint = "已入待办，每晚做梦前自动检查完成度"
         if assignee:
             hint = f"已入待办（负责人 {assignee}，等TA交付），每晚做梦前自动检查完成度"
-        return {"added": True, "title": title, "assignee": assignee, "due_date": due, "hint": hint}
+        if parent_id:
+            hint += f"；作为 #{parent_raw} 的子任务（关闭父任务会一并关闭）"
+        return {
+            "added": True, "title": title, "assignee": assignee, "due_date": due,
+            "parent": parent_raw or "", "hint": hint,
+        }
 
     async def t_capability_wish(self, args: dict) -> dict:
         title = str(args.get("title", "") or "").strip()
@@ -1548,7 +1570,10 @@ class ToolRunner:
         st = args.get("status")
         st = st if st in ("done", "dropped") else "done"
         fid = args.get("id")
-        if fid is None or not str(fid).isdigit():
+        # display numbers may be dotted (#3.1 = a subtask); digits resolve
+        # positionally over the open list, never as the raw DB id
+        strfid = str(fid).strip().lstrip("#") if fid is not None else ""
+        if not re.fullmatch(r"\d+(?:\.\d+)*", strfid):
             q = str(args.get("query", "") or "").strip()
             if not q:
                 return {"error": "id 或 query 至少给一个（followup_list 查序号）"}
@@ -1566,19 +1591,19 @@ class ToolRunner:
                 }
             fid = rows[0]["id"]
         else:
-            # digits are DENSE display numbers -- resolve positionally over
-            # the open list (open order), never as the raw DB id
             open_rows = await self.repo.list_followups(status="open", limit=50)
-            target = dict(numbered_followups(open_rows)).get(int(fid))
+            target = dict(numbered_followups(open_rows)).get(strfid)
             if not target:
-                return {"error": f"序号 {fid} 不存在（followup_list 查当前序号）"}
+                return {"error": f"序号 {strfid} 不存在（followup_list 查当前序号）"}
             fid = target["id"]
         ok = await self.repo.close_followup(int(fid), status=st, source="user")
         if not ok:
             return {"error": f"待办 #{fid} 不存在或已关闭"}
-        log.info("FOLLOW     | - #%s closed (%s, via tool): %s",
-                 fid, st, str(args.get("note", ""))[:80])
-        return {"closed": True, "status": st}
+        kids = await self.repo.list_children(int(fid), status="open")
+        for c in kids:
+            await self.repo.close_followup(c["id"], status=st, source="user")
+        log.info("FOLLOW     | - #%s closed (%s, via tool): %s", fid, st, str(args.get("note", ""))[:80])
+        return {"closed": True, "status": st, "children_closed": len(kids)}
 
 
 def _args_brief(args: dict) -> str:

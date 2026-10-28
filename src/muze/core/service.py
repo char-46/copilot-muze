@@ -953,7 +953,7 @@ class ControlService:
 
     @slash(
         "todo", "/todo [add <事项> | drop <序号>]",
-        "系统跟踪的待办清单（/todo add 登记新事项；/done <序号|关键词> 标记完成，drop=不再跟踪）",
+        "系统跟踪的待办清单（/todo add [@负责人] <事项> [due:10-30] [under:<序号>] 登记；子任务显示为 #3.1；/done <序号|关键词> 标记完成，drop=不再跟踪）",
     )
     async def cmd_todo(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
@@ -973,47 +973,65 @@ class ControlService:
             if m:
                 due = _parse_due(m.group(1))
                 title = (title[: m.start()] + " " + title[m.end():]).strip()
+            parent_id = 0
+            parent_no = ""
+            m = re.search(r"(?:^|\s)under[:：]\s*(\d+(?:\.\d+)*)", title, re.IGNORECASE)
+            if m:
+                parent_no = m.group(1)
+                title = (title[: m.start()] + " " + title[m.end():]).strip()
             if len(title) < 4:
                 return CommandOutcome.err(
-                    "用法: /todo add [@负责人] <事项> [due:10-30]"
-                    "（如：/todo add @小王 10-30前交推送初稿 due:10-30；自办事项不带 @）"
+                    "用法: /todo add [@负责人] <事项> [due:10-30] [under:<序号>]"
+                    "（如：/todo add @小王 交推送初稿 due:10-30；under:3 = 作为 #3 的子任务）"
                 )
+            if parent_no:
+                prow = await self._todo_resolve(ctx, parent_no)
+                if prow is None:
+                    return CommandOutcome.err(
+                        f"找不到父任务 #{parent_no}（/todo 看当前序号；子任务不能挂到已关闭的条目上）"
+                    )
+                parent_id = int(prow["id"])
             fid = await self.repo.add_followup(
                 "", title, "", source="user", opened_date=_local_date(),
-                assignee=assignee, due_date=due,
+                assignee=assignee, due_date=due, parent_id=parent_id,
             )
             if fid is None:
                 return CommandOutcome.err("已有一模一样的未结待办，不重复登记")
             who = f"（负责人 {assignee}，等TA交付）" if assignee else ""
             when = f"，截止 {due}" if due else ""
+            under = f"，挂在 #{parent_no} 下" if parent_id else ""
             return CommandOutcome(
-                f"已登记待办{when}: {title}{who}"
+                f"已登记待办{when}: {title}{who}{under}"
                 "\n（/done <序号> 完成后关闭；每晚做梦前自动检查完成度）"
             )
         if args and args[0].lower() in ("drop", "del", "rm", "off"):
-            if len(args) < 2 or not args[1].isdigit():
-                return CommandOutcome.err("用法: /todo drop <序号>（/todo 看序号）")
-            rows = await self.repo.list_followups(status="open", limit=50)
-            target = dict(numbered_followups(rows)).get(int(args[1]))
+            if len(args) < 2 or not re.fullmatch(r"\d+(?:\.\d+)*", args[1]):
+                return CommandOutcome.err("用法: /todo drop <序号>（/todo 看序号；子任务用 3.1 形式）")
+            target = await self._todo_resolve(ctx, args[1])
             if not target:
-                return CommandOutcome.err(f"序号 {args[1]} 不存在（/todo 看当前序号）")
+                return CommandOutcome.err(f"序号 {args[1]} 不存在或已关闭（/todo 看当前序号）")
             ok = await self.repo.close_followup(
                 target["id"], status="dropped", source="user", closed_date=_local_date()
             )
             if not ok:
-                return CommandOutcome.err(f"序号 {args[1]} 不存在或已关闭")
-            return CommandOutcome(f"已不再跟踪: {target['title']}")
+                return CommandOutcome.err(f"序号 {args[1]} 已关闭")
+            kids = await self._close_children(target["id"], "dropped", _local_date())
+            extra = f"\n（含 {len(kids)} 条子任务一并停止跟踪）" if kids else ""
+            return CommandOutcome(f"已不再跟踪: {target['title']}{extra}")
         rows = await self.repo.list_followups(status="open", limit=50)
         if not rows:
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
+        # remember what THIS chat saw, so a later /done resolves against the
+        # exact ids on screen instead of whatever the list looks like then
+        await self._todo_save_view(ctx, rows)
         md_items: list[str] = []
         node_items: list[str] = []
         from muze.digest import followup_due_tag, followup_state_tag
 
         today = _local_date()
         delegated = 0
-        # dense display numbering (#1..#N over the open list, stable open
-        # order) -- raw DB ids go sparse after closes and read badly
+        # dense display numbering with subtasks (#3 -> #3.1, #3.2); raw DB
+        # ids go sparse after closes and read badly
         for n, r in numbered_followups(rows)[:20]:
             subj = r["subject"] or "全局"
             bits = []
@@ -1035,40 +1053,100 @@ class ControlService:
             if last != r["opened_date"]:
                 bits.append(f"最后动静 {last}")
             meta = " · ".join(bits)
-            md_items.append(f"**#{n}** `{subj}`{who}\n\n{r['title']}\n\n{meta}")
-            node_items.append(f"#{n} [{subj}]{who} {r['title']}\n{meta}")
+            if "." in n:
+                # subtask: visibly nested under its parent
+                md_items.append(f"↳ **#{n}** `{subj}`{who}\n\n{r['title']}\n\n{meta}")
+                node_items.append(f"  ↳ #{n} [{subj}]{who} {r['title']}\n{meta}")
+            else:
+                md_items.append(f"**#{n}** `{subj}`{who}\n\n{r['title']}\n\n{meta}")
+                node_items.append(f"#{n} [{subj}]{who} {r['title']}\n{meta}")
         n_all = len(rows)
         head_plain = f"未结待办（{n_all} 条" + (f"，{delegated} 条已布置给他人" if delegated else "") + "）"
-        tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add [@负责人] <事项> [due:10-30] 登记"
+        tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add [@负责人] <事项> [due:10-30] [under:<序号>] 登记"
         return CommandOutcome(
             f"# {head_plain}\n\n" + "\n\n---\n\n".join(md_items) + f"\n\n---\n\n{tail}",
             forward_nodes=[head_plain] + node_items + [tail],
         )
 
+    # ---------------------------------------------------- todo resolution
+    _TODO_VIEW_TTL = 12 * 3600  # a view older than this is not trusted
+    _TODO_VIEW_KEY = "todo_view:last"  # ONE owner: last view wins, any front
+
+    async def _todo_save_view(self, ctx: ControlContext, rows: list[dict]) -> None:
+        """Remember the numbering the user just saw.
+
+        One global slot (not per chat): the user is one person and may view
+        in the CLI and close in the WebUI -- both must agree on '#3'."""
+        try:
+            from muze.digest import numbered_followups
+
+            items = {n: int(r["id"]) for n, r in numbered_followups(rows)}
+            await self.repo.set_meta(
+                self._TODO_VIEW_KEY,
+                json.dumps({"at": int(time.time()), "items": items}, ensure_ascii=False),
+            )
+        except Exception:
+            log.debug("todo view snapshot failed", exc_info=True)
+
+    async def _todo_resolve(self, ctx: ControlContext, no: str) -> dict | None:
+        """Display number -> the row the user MEANT.
+
+        Snapshot first: the number they saw in the LAST /todo, even if the
+        list changed since (another session closed/added items, the dream
+        added or expired rows). Closing by that exact id means a shifted
+        list can never silently hit the wrong item; if it is already closed
+        we say so instead of resolving the new occupant of that position."""
+        try:
+            raw = await self.repo.get_meta(self._TODO_VIEW_KEY)
+            snap = json.loads(raw) if raw else {}
+        except Exception:
+            snap = {}
+        items = snap.get("items") or {}
+        fresh = int(time.time()) - int(snap.get("at") or 0) <= self._TODO_VIEW_TTL
+        if fresh and no in items:
+            async with self.repo.conn.execute(
+                "SELECT * FROM followups WHERE id=? AND status='open'", (int(items[no]),)
+            ) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
+        rows = await self.repo.list_followups(status="open", limit=50)
+        from muze.digest import numbered_followups
+
+        return dict(numbered_followups(rows)).get(no)
+
+    async def _close_children(self, parent_id: int, status: str, date: str) -> list[dict]:
+        """Closing a parent closes its open subtasks too (one task = one unit)."""
+        kids = await self.repo.list_children(parent_id, status="open")
+        for c in kids:
+            await self.repo.close_followup(c["id"], status=status, source="user", closed_date=date)
+        return kids
+
     @slash(
         "done", "/done <序号|关键词>",
-        "标记某条跟踪待办已完成——这就是\"完成信号\"（/todo 看清单）", write=True,
+        "标记某条跟踪待办已完成——这就是\"完成信号\"（/todo 看清单；子任务用 #3.1 形式）", write=True,
     )
     async def cmd_done(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
-        from muze.digest import numbered_followups
 
         if not args:
             return CommandOutcome.err("用法: /done <序号|关键词>（/todo 看清单）")
-        if args[0].isdigit():
-            # the number the user sees is the DENSE display number from
-            # /todo -- resolve it positionally over the open list (open
-            # order), never as the raw DB id
-            rows = await self.repo.list_followups(status="open", limit=50)
-            target = dict(numbered_followups(rows)).get(int(args[0]))
+        if re.fullmatch(r"\d+(?:\.\d+)*", args[0]):
+            # resolve against what THIS chat LAST SAW (exact id), not against
+            # today's positions -- otherwise a close/dream in between shifts
+            # every number and /done hits the wrong item
+            target = await self._todo_resolve(ctx, args[0])
             if not target:
-                return CommandOutcome.err(f"序号 {args[0]} 不存在（/todo 看当前序号）")
+                return CommandOutcome.err(
+                    f"序号 {args[0]} 不存在或已关闭（清单可能已变化，/todo 刷新后再操作）"
+                )
             ok = await self.repo.close_followup(
                 target["id"], status="done", source="user", closed_date=_local_date()
             )
             if not ok:
-                return CommandOutcome.err(f"序号 {args[0]} 不存在或已关闭")
-            return CommandOutcome(f"已完成: {target['title']}\n（明早日报不再跟它）")
+                return CommandOutcome.err(f"序号 {args[0]} 已关闭")
+            kids = await self._close_children(target["id"], "done", _local_date())
+            extra = f"\n（含 {len(kids)} 条子任务一并关闭）" if kids else ""
+            return CommandOutcome(f"已完成: {target['title']}{extra}\n（明早日报不再跟它）")
         q = " ".join(args)
         rows = await self.repo.find_open_followups(q)
         if len(rows) == 1:
@@ -1076,9 +1154,13 @@ class ControlService:
             await self.repo.close_followup(
                 r["id"], status="done", source="user", closed_date=_local_date()
             )
-            return CommandOutcome(f"已完成待办: {r['title']}")
+            kids = await self._close_children(r["id"], "done", _local_date())
+            extra = f"\n（含 {len(kids)} 条子任务一并关闭）" if kids else ""
+            return CommandOutcome(f"已完成待办: {r['title']}{extra}")
         if not rows:
             return CommandOutcome.err(f"没有匹配「{q}」的未结待办；/todo 看清单")
+        from muze.digest import numbered_followups
+
         open_rows = await self.repo.list_followups(status="open", limit=50)
         nos = {r["id"]: n for n, r in numbered_followups(open_rows)}
         cands = "\n".join(f"#{nos[r['id']]} {r['title']}" for r in rows[:8])

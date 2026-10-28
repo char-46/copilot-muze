@@ -14,6 +14,15 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.163",
+        "date": "2026-10-28",
+        "changes": [
+            "待办序号漂移防护：清单中途变化（别的会话 done、做梦增删、自动过期）后 /done 不会误关其它条目——系统记住你最近一次 /todo 看到的编号，按当时那条精确关闭；那条已被关闭就拒绝并提示刷新。/todo 与 /done 仍是纯数据库操作，零 token。",
+            "待办子任务分级：同一任务下用 /todo add ... under:<序号> 或 followup_add 的 parent 挂子任务，显示为 #3.1/#3.2；/done 3.1 单独关闭，关闭父任务连带关闭其子任务；父任务已关的子任务自动升为顶层，不会出现无法关闭的孤儿编号。",
+            "输出图片统一外边距：渲染图四周固定白边（多页之间留间隔），图表边距加大，不再贴边。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.162",
         "date": "2026-10-28",
         "changes": [
