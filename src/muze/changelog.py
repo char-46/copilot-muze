@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.156",
+        "date": "2026-10-28",
+        "changes": [
+            "待办同步强制登记：【当日原始布置】里每条明确的任务布置一律登记（同一件事布置给不同人的按人分别记），不再由模型自行判断\"可能不用跟\"。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.155",
         "date": "2026-10-28",
         "changes": [

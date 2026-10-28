@@ -50,3 +50,12 @@ def test_dense_numbering_language_in_prompts():
 
 def test_digest_prompt_defers_to_owner_profile():
     assert "画像" in DIGEST_PROMPT
+
+
+def test_sync_prompt_forces_every_directive_to_be_filed():
+    # the 10-23 case: three delegations were fed but NONE was filed because
+    # the model judged "maybe not worth tracking" -- rules now invert that
+    assert "都要登记" in FOLLOWUP_SYNC_PROMPT
+    assert "不要替用户判断" in FOLLOWUP_SYNC_PROMPT
+    assert "按人分别登记" in FOLLOWUP_SYNC_PROMPT
+    assert "{directives}" in FOLLOWUP_SYNC_PROMPT
