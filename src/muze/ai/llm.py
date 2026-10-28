@@ -127,6 +127,11 @@ async def bg_chat(llm, messages: list[dict], **kw):
     - otherwise it is a plain chat(); a fresh account fault is recorded on
       the client (so later passes are short-circuited too) and surfaces as
       LLMAccountFault for the caller to skip.
+
+    User-initiated commands (/dream, /balance) call `llm.clear_fault()`
+    first: the user may have just topped up, and the live incident on
+    2026-10-28 showed a stale 402 gate blocking /dream for half an hour
+    after the balance landed (the request itself worked again).
     """
     if llm is None:
         raise LLMAccountFault("no llm configured")

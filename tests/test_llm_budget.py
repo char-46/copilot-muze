@@ -49,6 +49,10 @@ class FakeLLM:
         self._fault_until = time.time() + cooldown_s
         return True
 
+    def clear_fault(self):
+        self._fault_reason = ""
+        self._fault_until = 0.0
+
 
 class BoomLLM(FakeLLM):
     """Raises an account-level error, like the real 402."""
@@ -106,6 +110,19 @@ async def test_bg_chat_propagates_non_account_errors():
     with pytest.raises(RuntimeError):
         await bg_chat(llm, [{"role": "user", "content": "hi"}])
     assert not llm.faulted  # transient, not an account problem
+
+
+async def test_bg_chat_resumes_after_user_clears_fault():
+    """User-initiated commands (/dream, /balance) clear the gate first: a
+    stale 402 must not block a dream for 30 min after a top-up (live
+    incident 2026-10-28)."""
+    llm = FakeLLM()
+    llm.note_fault(RuntimeError("402 insufficient"))
+    assert llm.faulted is True
+    llm.clear_fault()
+    assert llm.faulted is False
+    out = await bg_chat(llm, [{"role": "user", "content": "hi"}])
+    assert out["content"] == "ok" and llm.calls == 1
 
 
 # ------------------------------------------- profiles: incremental + abort

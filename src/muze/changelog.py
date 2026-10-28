@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.160",
+        "date": "2026-10-28",
+        "changes": [
+            "充值后不再被旧熔断挡住：用户主动命令 /dream、/balance 会先解除账户熔断再尝试（实测充值到账后半小时内 /dream 仍被缓存的 402 拒绝；若账户确实没钱，第一次调用失败会立即重新熔断）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.159",
         "date": "2026-10-28",
         "changes": [
