@@ -329,6 +329,7 @@ class App:
         try:
             from muze.evolve import evolve_if_due
 
+            log.info("self-evolution check scheduled (20s)")
             await asyncio.sleep(20)
             changed = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog)
             if changed:
@@ -355,8 +356,11 @@ class App:
 
         # self-evolution: once per deployed version, AFTER boot settles --
         # the agent rewrites its own habit memories against the release
-        # notes (cost paid here, never per LLM call; see muze.evolve)
-        asyncio.create_task(self._evolve_if_due())
+        # notes (cost paid here, never per LLM call; see muze.evolve).
+        # KEEP the task reference: an unreferenced pending task gets
+        # garbage-collected mid-sleep and silently never runs (live
+        # finding 2026-10-28: evolved_version stayed None, zero log lines)
+        self._evolve_task = asyncio.create_task(self._evolve_if_due())
 
         self.reloader = Reloader(
             config_path=self.config_path,
