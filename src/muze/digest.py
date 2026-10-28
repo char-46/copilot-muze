@@ -121,8 +121,11 @@ FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根�
 # 现有待办（仅 open；#N 为序号，引用时原样使用）
 {open}
 
-# 今日报告（{date}）
+# 今日报告（{date}；LLM 摘要，安静会话可能被省略，以【当日原始布置】为准）
 {report}
+
+# 当日原始布置（用户自己发出、含任务语义的消息原文；**add 的主要依据**，报告里没写但这里有的一律照登）
+{directives}
 
 # 输出（严格 JSON 数组，不要其他文字；最多 {maxn} 条）
 [{{"action":"add","subject":"group/123 或 QQ号 或 空串","title":"…","detail":"…","assignee":"布置给谁（用户自己办则空）","due_date":"YYYY-MM-DD 或空"}},
@@ -436,8 +439,12 @@ async def run_digest(
     date: str,
     adapter=None,
     rag=None,
+    self_id: int = 0,
 ) -> str:
-    """Generate (and store) the report for one calendar day."""
+    """Generate (and store) the report for one calendar day.
+
+    self_id: the controlled account's own QQ (needed to recognise the
+    owner's own delegations for the follow-up bypass)."""
     dc = cfg.digest
     start_ts, end_ts = day_range(date)
     # full coverage by default: top_conversations=0 -> EVERY active
@@ -583,7 +590,19 @@ async def run_digest(
         # structured follow-up state: sync from the fresh report, then age
         # out long-untouched items — both best-effort, never fail the dream
         try:
-            await sync_followups(repo, llm, cfg, date=date, report=report, chatlog=chatlog)
+            # the report is an LLM summary that drops quiet conversations;
+            # delegations live in exactly those, so feed the RAW owner
+            # messages alongside it (see collect_directives)
+            directives = await collect_directives(repo, cfg, date=date, self_id=self_id)
+            if directives:
+                chatlog.log.info(
+                    "DREAM      | %s directives fed to followup sync (%d chars)",
+                    date, len(directives),
+                )
+            await sync_followups(
+                repo, llm, cfg, date=date, report=report, chatlog=chatlog,
+                directives=directives,
+            )
         except Exception:
             log.exception("followup sync for %s failed", date)
         try:
@@ -611,6 +630,7 @@ async def dream_night(
     *,
     adapter=None,
     rag=None,
+    self_id: int = 0,
 ) -> str:
     """The nightly builtin:
     1. catch up every missing day up to yesterday (per-day windows);
@@ -639,7 +659,9 @@ async def dream_night(
     reports: list[tuple[str, str]] = []
     for d in todo:
         try:
-            reports.append((d, await run_digest(repo, llm, cfg, chatlog, date=d, adapter=adapter, rag=rag)))
+            reports.append((d, await run_digest(
+                repo, llm, cfg, chatlog, date=d, adapter=adapter, rag=rag, self_id=self_id,
+            )))
         except Exception as e:
             log.exception("dream for %s failed", d)
             reports.append((d, f"(做梦失败: {e})"))
@@ -825,8 +847,52 @@ async def missing_months(repo: Repository, limit: int = 2) -> list[str]:
     return out
 
 
+DIRECTIVE_HINTS = (
+    "需要", "记得", "务必", "尽快", "安排", "对接", "交给", "负责",
+    "完成", "截止", "之前", "之前发", "发我", "给我", "审核", "备份",
+    "帮我", "请", "deadline", "due",
+)
+
+
+async def collect_directives(
+    repo: Repository, cfg: MuzeConfig, *, date: str, self_id: int = 0, limit: int = 60
+) -> str:
+    """Raw messages where the OWNER hands out a task, taken straight from
+    the archive -- independent of the day report.
+
+    Why this exists (live finding 2026-10-28): a delegation is usually ONE
+    or TWO short lines in an otherwise quiet chat. The digest LLM drops
+    quiet conversations wholesale ("归并带过"/"忽略" in its own words), so
+    on 2026-10-23 three real delegations (拍照/写稿/排版 for the 10-30
+    event, in three 1-2 message chats) never reached the report and the
+    sync pass could not file them -- re-running the dream did not help
+    because the report is the ONLY input it had. This bypass is cheap and
+    targets exactly the sentences the report is most likely to omit."""
+    start_ts, end_ts = day_range(date)
+    try:
+        rows = await repo.owner_messages_between(start_ts, end_ts, self_id=self_id, limit=limit)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    out = []
+    for m in rows:
+        text = (m.get("text_content") or "").strip()
+        if len(text) < 8:
+            continue
+        if not any(h in text for h in DIRECTIVE_HINTS):
+            continue
+        out.append(
+            f"[{m.get('scene')}/{m.get('peer_id')}][{epoch_iso(m['time'])}] {text[:220]}"
+        )
+        if len(out) >= 25:
+            break
+    return "\n".join(out)
+
+
 async def sync_followups(
-    repo: Repository, llm, cfg: MuzeConfig, *, date: str, report: str, chatlog: ChatLog
+    repo: Repository, llm, cfg: MuzeConfig, *, date: str, report: str, chatlog: ChatLog,
+    directives: str = "",
 ) -> int:
     """Keep the structured follow-up table in step with the fresh report.
 
@@ -841,6 +907,7 @@ async def sync_followups(
     open_items = await repo.list_followups(status="open", limit=40)
     prompt = FOLLOWUP_SYNC_PROMPT.format(
         open=_format_followups(open_items), date=date, report=report[:4000],
+        directives=directives or "(无)",
         maxn=cfg.digest.max_memories_per_night,
     )
     msg = await llm.chat([{"role": "user", "content": prompt}])

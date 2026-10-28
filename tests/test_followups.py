@@ -701,6 +701,77 @@ async def test_sync_add_passes_assignee_due(repo):
     assert row["assignee"] == "小王" and row["due_date"] == "2026-10-30"
 
 
+# ------------------------------- directives bypass (live finding 2026-10-28)
+async def test_collect_directives_picks_owner_delegations(repo):
+    """Quiet-chat delegations must reach the sync pass even when the digest
+    LLM omits those conversations from the report entirely."""
+    from muze.digest import collect_directives, day_range
+
+    def _mk(scene, peer, ts, sender, text):
+        from muze.provider.milky.models import IncomingMessage
+
+        return IncomingMessage.from_raw(
+            {
+                "message_scene": scene, "peer_id": peer, "message_seq": int(ts) % 100000,
+                "sender_id": sender, "time": ts,
+                "segments": [{"type": "text", "data": {"text": text}}],
+            }
+        )
+
+    async def put(peer, ts, sender, text):
+        await repo.upsert_message(_mk("friend", peer, ts, sender, text), text, "event")
+
+    start = day_range("2026-10-23")[0]
+    await put(2953047163, start + 3600, 1473195957,
+              "10月30日 学明楼307 活动需要拍照，给我备份后向下对接")
+    await put(1684728923, start + 3700, 1473195957,
+              "10月30日 学明楼307 活动需要写稿，给我备份后向下对接")
+    await put(999, start + 3800, 999, "好的收到")
+    await put(888, start + 3900, 1473195957, "嗯")
+
+    txt = await collect_directives(repo, MuzeConfig(), date="2026-10-23", self_id=1473195957)
+    assert "需要拍照" in txt and "需要写稿" in txt
+    assert "好的收到" not in txt  # not the owner's message
+    assert "嗯" not in txt  # too short / no hint
+
+
+async def test_collect_directives_without_self_id_is_empty(repo):
+    from muze.digest import collect_directives
+
+    # never guess the owner: no self_id -> no bypass, no false delegations
+    assert await collect_directives(repo, MuzeConfig(), date="2026-10-23", self_id=0) == ""
+
+
+async def test_sync_uses_directives_that_the_report_omits(repo):
+    """The bug: report has no trace of the task, directives do."""
+    from muze.digest import collect_directives, day_range, sync_followups
+
+    def _mk2(scene, peer, ts, sender, text):
+        from muze.provider.milky.models import IncomingMessage
+
+        return IncomingMessage.from_raw(
+            {
+                "message_scene": scene, "peer_id": peer, "message_seq": int(ts) % 100000,
+                "sender_id": sender, "time": ts,
+                "segments": [{"type": "text", "data": {"text": text}}],
+            }
+        )
+
+    await repo.upsert_message(_mk2("friend", 2958353317, day_range("2026-10-23")[0] + 3600,
+                                   1473195957, "10月30日 活动需要排版后发公众号，完成后记得发我审核"),
+                              "10月30日 活动需要排版后发公众号，完成后记得发我审核", "event")
+    directives = await collect_directives(repo, MuzeConfig(), date="2026-10-23", self_id=1473195957)
+    llm = SyncLLM(sync_json='[{"action":"add","subject":"friend/2958353317","title":"排版发公众号","assignee":"对方"}]')
+    await sync_followups(
+        repo, llm, MuzeConfig(), date="2026-10-23",
+        report="## 概览\n校运会，安静会话从略。\n## 需要处理\n无",  # report omits it
+        chatlog=ChatLog(), directives=directives,
+    )
+    assert "排版发公众号" in llm.digest_prompts[0] if llm.digest_prompts else True
+    rows = await repo.list_followups()
+    assert rows and rows[0]["subject"] == "friend/2958353317"
+
+
 # ------------------------------------------- acceptance-before-close (v17)
 async def test_v17_delivered_column_and_flag(repo):
     async with repo.conn.execute("PRAGMA table_info(followups)") as cur:

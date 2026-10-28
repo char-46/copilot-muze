@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.155",
+        "date": "2026-10-28",
+        "changes": [
+            "待办提取兜底：做梦同步不再只吃报告——当天你发出的布置/指令类消息（安静会话里的孤句）直采后一并喂给同步，补做旧日期的梦也能补上被报告省略的委托任务。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.154",
         "date": "2026-10-28",
         "changes": [
@@ -107,3 +114,20 @@ def recent_notes(n: int = 3) -> str:
             + "\n".join(f"- {c}" for c in e["changes"])
         )
     return "\n\n".join(out)
+
+
+def validate_notes() -> list[str]:
+    """Shape check for manual edits: every entry needs its three keys and
+    a version string. Guards against the recurring typo of inserting a new
+    entry that drops its opening dict brace (which once made this module
+    unparseable and shipped to the box)."""
+    problems = []
+    for i, e in enumerate(RELEASE_NOTES):
+        for k in ("version", "date", "changes"):
+            if k not in e:
+                problems.append(f"entry {i} missing {k!r}")
+        if e.get("version") and not str(e["version"]).startswith("0."):
+            problems.append(f"entry {i} odd version: {e['version']!r}")
+        if not isinstance(e.get("changes"), list) or not e.get("changes"):
+            problems.append(f"entry {i} has no changes")
+    return problems

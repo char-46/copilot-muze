@@ -860,12 +860,14 @@ class ControlService:
                     text = await dream_night(
                         self.repo, self.agent.llm, self.cfg, self.chatlog,
                         adapter=self.adapter, rag=getattr(self.runtime, "rag", None),
+                        self_id=int(self.runtime.self_id or 0),
                     )
                 else:
                     report = await run_digest(
                         self.repo, self.agent.llm, self.cfg, self.chatlog,
                         date=_local_date(), adapter=self.adapter,
                         rag=getattr(self.runtime, "rag", None),
+                        self_id=int(self.runtime.self_id or 0),
                     )
                     text = f"[{_local_date()} 做梦报告]\n\n{report}"
             except Exception as e:
@@ -893,6 +895,7 @@ class ControlService:
                         self.repo, self.agent.llm, self.cfg, self.chatlog,
                         date=sub, adapter=self.adapter,
                         rag=getattr(self.runtime, "rag", None),
+                        self_id=int(self.runtime.self_id or 0),
                     )
                 except Exception as e:
                     return CommandOutcome.err(f"{sub} 补做失败: {e}（/dream list 查看已有报告）")
