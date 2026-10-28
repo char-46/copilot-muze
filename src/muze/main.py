@@ -323,20 +323,6 @@ class App:
         self.skills.reload()
         self.runtime.skills = self.skills
 
-    async def _evolve_if_due(self) -> None:
-        """Best-effort self-evolution pass (see muze.evolve). Runs a moment
-        after boot so a slow/failing LLM call never blocks startup."""
-        try:
-            from muze.evolve import evolve_if_due
-
-            log.info("self-evolution check scheduled (20s)")
-            await asyncio.sleep(20)
-            changed = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog)
-            if changed:
-                self.chatlog.log.info("EVOLVE     | self-evolution applied %s change(s)", changed)
-        except Exception:
-            log.exception("self-evolution pass failed (will retry next boot)")
-
         # same-QQ instances share one scheduler (tasks live in the shared
         # repo; running it twice fired /dream morning twice per boot)
         if uin in _UIN_SCHED:
@@ -353,14 +339,6 @@ class App:
             await self.scheduler.ensure_daily_digest()
             await self.scheduler.ensure_morning_digest()
         self.runtime.scheduler = self.scheduler
-
-        # self-evolution: once per deployed version, AFTER boot settles --
-        # the agent rewrites its own habit memories against the release
-        # notes (cost paid here, never per LLM call; see muze.evolve).
-        # KEEP the task reference: an unreferenced pending task gets
-        # garbage-collected mid-sleep and silently never runs (live
-        # finding 2026-10-28: evolved_version stayed None, zero log lines)
-        self._evolve_task = asyncio.create_task(self._evolve_if_due())
 
         self.reloader = Reloader(
             config_path=self.config_path,
@@ -832,6 +810,20 @@ class App:
                 self._last_profile_refresh = time.time()
                 if n:
                     log.info("[%s] profiles refreshed: %s", self.spec.name, n)
+            # self-evolution: once per deployed version the agent rewrites
+            # its own habit memories against the release notes (cost paid
+            # here, never per LLM call; see muze.evolve). It rides the
+            # existing enrichment pipeline on purpose -- a lone
+            # create_task in setup() never ran on the box (live finding
+            # 2026-10-28: evolved_version stayed None, zero log lines)
+            try:
+                from muze.evolve import evolve_if_due
+
+                n = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog)
+                if n:
+                    log.info("[%s] self-evolution applied %s change(s)", self.spec.name, n)
+            except Exception:
+                log.exception("self-evolution pass failed (will retry next boot)")
             if getattr(self, "rag", None) is not None and self.rag.enabled:
                 n = await self.rag.run_once()
                 if n:

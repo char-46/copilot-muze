@@ -14,7 +14,12 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
-        "version": "0.1.0-alpha.152",
+        "version": "0.1.0-alpha.153",
+        "date": "2026-10-28",
+        "changes": [
+            "修复：自进化改挂到启动富集流水线（与身份档案/RAG 索引同一条已验证路径），此前独立任务在盒上从未执行。",
+        ],
+    },
         "date": "2026-10-28",
         "changes": [
             "修复：自进化启动任务因未持引用被垃圾回收，从未执行（现持有引用并留日志）。",
