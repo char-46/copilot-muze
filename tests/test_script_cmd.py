@@ -98,6 +98,10 @@ async def test_full_restart_prefers_scheduled_task(svc, monkeypatch):
     assert not out.is_error and "计划任务" in out.text
     assert calls == ["/Create", "/Run"]  # task created then fired
     assert spawned == []  # no in-process fallback needed
+    # the task action launches a WINDOWLESS wscript launcher, not the .cmd
+    vbs = service._script_logs_dir() / "fullrestart-run.vbs"
+    body = vbs.read_text(encoding="utf-8", errors="replace")
+    assert "WScript.Shell" in body and ", 0, False" in body and "start.ps1" in body
 
 
 async def test_full_restart_falls_back_when_schtasks_fails(svc, monkeypatch):
@@ -159,4 +163,7 @@ async def test_spawn_script_breakaway_with_fallback(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert calls[0] & brk and not (calls[1] & brk)  # breakaway, then fallback
     assert calls[1] & grp  # still its own process group
+    no_win = getattr(_sp, "CREATE_NO_WINDOW", 0)
+    if no_win:
+        assert calls[0] & no_win and calls[1] & no_win  # never a visible console
 
