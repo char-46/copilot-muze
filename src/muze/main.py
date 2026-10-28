@@ -810,8 +810,8 @@ class App:
                 self._last_profile_refresh = time.time()
                 if n:
                     log.info("[%s] profiles refreshed: %s", self.spec.name, n)
-            # self-evolution: once per deployed version the agent rewrites
-            # its own habit memories against the release notes (cost paid
+            # habit recalibration: once per deployed version the agent
+            # rewrites its own habit memories against the release notes (cost paid
             # here, never per LLM call; see muze.evolve). It rides the
             # existing enrichment pipeline on purpose -- a lone
             # create_task in setup() never ran on the box (live finding
@@ -821,7 +821,7 @@ class App:
 
                 n = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog)
                 if n:
-                    log.info("[%s] self-evolution applied %s change(s)", self.spec.name, n)
+                    log.info("[%s] habits recalibrated: %s change(s)", self.spec.name, n)
             except Exception:
                 log.exception("self-evolution pass failed (will retry next boot)")
             if getattr(self, "rag", None) is not None and self.rag.enabled:

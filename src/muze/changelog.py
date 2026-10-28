@@ -14,10 +14,17 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.154",
+        "date": "2026-10-28",
+        "changes": [
+            "修复：/evolve 取 LLM 客户端的方式（此前报 ControlService 无 llm 属性）；部署脚本增加 wheel 内源码可解析校验，杜绝陈轮/坏轮上盒。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.153",
         "date": "2026-10-28",
         "changes": [
-            "修复：自进化改挂到启动富集流水线（与身份档案/RAG 索引同一条已验证路径），此前独立任务在盒上从未执行。",
+            "修复：版本更新后的习惯校准改挂到启动富集流水线（与身份档案/RAG 索引同一条已验证路径），此前独立任务在盒上从未执行。",
         ],
     },
     {
@@ -31,7 +38,7 @@ RELEASE_NOTES: list[dict] = [
         "version": "0.1.0-alpha.151",
         "date": "2026-10-28",
         "changes": [
-            "自进化：每次版本更新后自动对照变更日志修自己的习惯记忆（retire 过时用法、沉淀新习惯 /evolve 可手动触发）；习惯以小段固定块注入，不再每条消息携带变更日志。",
+            "习惯校准：版本更新后自动对照变更日志清理过时记忆、补上新用法习惯（/evolve 手动触发）。",
             "能力需求清单：工作中遇到能力缺口或被迫奇技淫巧时用 capability_wish 上报（自动去重）；/wishes 查看、/wishes close <序号> 关闭。",
             "提示词单一注册表 muze/prompts.py（共 10 个）+ 漂移守卫测试：新工具没教、关键规则离开提示词会直接挂测试。",
         ],

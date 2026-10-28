@@ -50,6 +50,39 @@ if (-not (Test-Path $Wheel)) {
     if (-not (Test-Path $Wheel)) { throw "build did not produce $Wheel" }
 }
 
+# A STALE wheel is otherwise silently shipped: dist\ keeps every old build,
+# and a wheel made from a momentarily-broken tree (live incident 2026-10-28:
+# a SyntaxError shipped to the box and every /evolve failed) looks fine to
+# this script. Byte-compile-check the packaged sources before scp.
+Write-Host "[deploy] sanity: compile-check packaged sources"
+$sanity = @"
+import sys, zipfile, compileall, py_compile, tempfile, os
+w = r'''$($PWD)\$Wheel'''
+z = zipfile.ZipFile(w)
+d = tempfile.mkdtemp()
+bad = []
+for n in z.namelist():
+    if n.endswith('.py'):
+        p = os.path.join(d, n)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, 'wb').write(z.read(n))
+        try:
+            py_compile.compile(p, doraise=True)
+        except py_compile.PyCompileError as e:
+            bad.append(str(e)[:200])
+print('BAD' if bad else 'OK')
+for b in bad[:5]:
+    print(b)
+"@
+$sanityFile = Join-Path $env:TEMP "muze_wheel_sanity.py"
+Set-Content -Path $sanityFile -Value $sanity -Encoding ascii
+$sanityOut = & python $sanityFile 2>$null
+Remove-Item $sanityFile -ErrorAction SilentlyContinue
+if (($sanityOut -join "`n") -notmatch 'OK') {
+    Write-Host ($sanityOut -join "`n")
+    throw "wheel contains unparseable sources; delete $Wheel and rebuild"
+}
+
 # ---- 2. copy to the box through the relay --------------------------------
 Write-Host "[deploy] scp wheel -> box"
 $scpOk = $false

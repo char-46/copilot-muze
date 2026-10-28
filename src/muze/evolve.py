@@ -1,4 +1,4 @@
-"""One-shot self-evolution at version change.
+"""One-shot habit recalibration at version change.
 
 Cost model (user direction 2026-10-28): never carry update knowledge in
 every LLM call -- it inflates each request and breaks prompt-cache reuse of
@@ -24,7 +24,7 @@ from muze.version import BASE_VERSION
 
 log = logging.getLogger("muze.evolve")
 
-EVOLVE_PROMPT = """你是 muze（个人 QQ copilot）的自进化模块。系统刚完成一次版本更新。请对照【变更日志】检查你的现有记忆与操作习惯，让未来的你按新行为工作。
+EVOLVE_PROMPT = """你是 muze（个人 QQ copilot）的习惯校准模块。系统刚更新到一个新版本。请对照【变更日志】检查你的现有记忆与操作习惯，让未来的你按新版行为工作。
 
 # 规则
 - retire：记忆/习惯描述的用法已被变更替换（教了废弃的命令写法、旧流程、旧限制），输出 {{"action":"retire","id":该记忆id,"content":"被 <版本> 替换：一句话"}}。
@@ -58,8 +58,8 @@ def _notes_since(old_version: str, cap: int = 8) -> str:
 
 
 async def evolve_if_due(repo, llm, cfg, chatlog=None, *, force: bool = False) -> int:
-    """Run the self-evolution pass once per version. Returns the number of
-    memory changes applied (0 = not due / nothing to do / failed safely)."""
+    """Run the habit-recalibration pass once per version. Returns the number
+    of memory changes applied (0 = not due / nothing to do / failed safely)."""
     current = (await repo.get_meta("evolved_version") or "").strip()
     if current == BASE_VERSION and not force:
         return 0
@@ -120,5 +120,5 @@ async def evolve_if_due(repo, llm, cfg, chatlog=None, *, force: bool = False) ->
                 if chatlog:
                     chatlog.log.info("EVOLVE     | + [muze/habit] %s", content[:80])
     await repo.set_meta("evolved_version", BASE_VERSION)
-    log.info("self-evolution applied %s change(s) for %s", changed, BASE_VERSION)
+    log.info("habit recalibration applied %s change(s) for %s", changed, BASE_VERSION)
     return changed
