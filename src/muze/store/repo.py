@@ -963,6 +963,20 @@ class Repository:
         await self.conn.commit()
         return cur.rowcount > 0
 
+    # ------------------------------------------------------------ meta kv
+    async def get_meta(self, key: str) -> str | None:
+        async with self.conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return str(row[0]) if row else None
+
+    async def set_meta(self, key: str, value: str) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value))
+        )
+        await self.conn.commit()
+
     # --------------------------------------------------------- followups
     async def add_followup(
         self, subject: str, title: str, detail: str = "",
@@ -1060,6 +1074,52 @@ class Repository:
         async with self.conn.execute(
             "UPDATE followups SET delivered_date=?, updated_at=? WHERE id=? AND status='open'",
             (d, _now(), int(item_id)),
+        ) as cur:
+            ok = cur.rowcount > 0
+        await self.conn.commit()
+        return ok
+
+    # ---------------------------------------------------- capability wishes
+    async def add_wish(
+        self, title: str, context: str = "", workaround: str = "", source: str = ""
+    ) -> int | None:
+        """File a capability gap the model hit while working. Returns None
+        when an identical open wish exists (no spam from repeated hits)."""
+        title = (title or "").strip()
+        if not title:
+            return None
+        async with self.conn.execute(
+            "SELECT id FROM capability_wishes WHERE status='open' AND title=?",
+            (title,),
+        ) as cur:
+            if await cur.fetchone():
+                return None
+        cur = await self.conn.execute(
+            """
+            INSERT INTO capability_wishes (title, context, workaround, status, source,
+                                           created_at, updated_at)
+            VALUES (?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (title[:120], (context or "")[:500], (workaround or "")[:500],
+             (source or "")[:120], _now(), _now()),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid)
+
+    async def list_wishes(self, status: str = "open", limit: int = 50) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM capability_wishes WHERE status=? ORDER BY id ASC LIMIT ?",
+            (status, max(1, int(limit))),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def close_wish(self, item_id: int, status: str = "resolved") -> bool:
+        if status not in ("resolved", "rejected"):
+            raise ValueError(f"bad wish status: {status}")
+        async with self.conn.execute(
+            "UPDATE capability_wishes SET status=?, updated_at=? WHERE id=? AND status='open'",
+            (status, _now(), int(item_id)),
         ) as cur:
             ok = cur.rowcount > 0
         await self.conn.commit()

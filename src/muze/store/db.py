@@ -413,9 +413,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v15_followups(conn)
         await _migrate_v16_followup_assignee(conn)
         await _migrate_v17_followup_delivered(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '17')")
+        await _migrate_v18_capability_wishes(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '18')")
         await conn.commit()
-        log.info("database created (schema v17)")
+        log.info("database created (schema v18)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -489,6 +490,39 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v17 (followup delivered/acceptance state)")
         version = 17
+    if version < 18:
+        await _migrate_v18_capability_wishes(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '18')")
+        await conn.commit()
+        log.info("database migrated to schema v18 (capability wishlist)")
+        version = 18
+
+
+async def _migrate_v18_capability_wishes(conn: aiosqlite.Connection) -> None:
+    """capability_wishes: the model's own gap list.
+
+    While working, the agent sometimes hits "I need X and don't have it" or
+    resorts to contorted workarounds (奇技淫巧). Instead of silently
+    suffering, it files a wish (user request 2026-10-28: 模型在完成某项工作
+    时思考自己需要什么能力，没有或绕得太狠就记入列表); the maintainer
+    reviews the list each maintenance cycle and decides: new capability,
+    change an existing one, or reject."""
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS capability_wishes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT NOT NULL,
+            context     TEXT NOT NULL DEFAULT '',
+            workaround  TEXT NOT NULL DEFAULT '',
+            status      TEXT NOT NULL DEFAULT 'open',
+            source      TEXT NOT NULL DEFAULT '',
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wishes_status ON capability_wishes (status, updated_at);
+        """
+    )
+    await conn.commit()
 
 
 async def _migrate_v17_followup_delivered(conn: aiosqlite.Connection) -> None:

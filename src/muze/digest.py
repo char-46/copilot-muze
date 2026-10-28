@@ -75,9 +75,13 @@ MEMORY_PROMPT = """你是个人 QQ copilot 的"记忆提炼"模块。基于做�
 - 单次闲聊、临时话题、易变状态（今天心情）不要。
 - subject 用 'owner'（被控号主人本人）、'<QQ号>'（某联系人）或 'group/<群号>'。
 - 新事实与现有记忆矛盾时，输出 {{"action":"retire","id":旧记忆id,"content":"矛盾原因"}} 再加新条。
+- **过时功能记忆也要 retire**：现有记忆描述的系统用法/命令/流程若与【近期变更】矛盾（教了已被替换的旧写法），输出 {{"action":"retire","id":该记忆id,"content":"与 <版本号> 变更冲突：旧写法已废弃"}}；确有必要可按新行为补一条。
 
 # 现有记忆
 {existing}
+
+# 近期变更（系统的现行行为，冲突时以此为准）
+{changes}
 
 # 做梦报告（{date}）
 {report}
@@ -1081,8 +1085,11 @@ async def extract_memories(
     existing_txt = "\n".join(
         f"- #{m['id']} [{m['subject']}/{m['kind']}] {m['content']}" for m in existing
     ) or "(暂无)"
+    from muze.changelog import recent_notes
+
     prompt = MEMORY_PROMPT.format(
         existing=existing_txt, report=report[:4000], date=date,
+        changes=recent_notes(5),
         maxn=cfg.digest.max_memories_per_night,
     )
     msg = await llm.chat([{"role": "user", "content": prompt}])

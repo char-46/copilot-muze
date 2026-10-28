@@ -323,6 +323,19 @@ class App:
         self.skills.reload()
         self.runtime.skills = self.skills
 
+    async def _evolve_if_due(self) -> None:
+        """Best-effort self-evolution pass (see muze.evolve). Runs a moment
+        after boot so a slow/failing LLM call never blocks startup."""
+        try:
+            from muze.evolve import evolve_if_due
+
+            await asyncio.sleep(20)
+            changed = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog)
+            if changed:
+                self.chatlog.log.info("EVOLVE     | self-evolution applied %s change(s)", changed)
+        except Exception:
+            log.exception("self-evolution pass failed (will retry next boot)")
+
         # same-QQ instances share one scheduler (tasks live in the shared
         # repo; running it twice fired /dream morning twice per boot)
         if uin in _UIN_SCHED:
@@ -339,6 +352,11 @@ class App:
             await self.scheduler.ensure_daily_digest()
             await self.scheduler.ensure_morning_digest()
         self.runtime.scheduler = self.scheduler
+
+        # self-evolution: once per deployed version, AFTER boot settles --
+        # the agent rewrites its own habit memories against the release
+        # notes (cost paid here, never per LLM call; see muze.evolve)
+        asyncio.create_task(self._evolve_if_due())
 
         self.reloader = Reloader(
             config_path=self.config_path,
