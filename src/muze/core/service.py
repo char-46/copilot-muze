@@ -940,28 +940,48 @@ class ControlService:
         return CommandOutcome(f"已停用记忆 #{args[0]}")
 
     @slash(
-        "todo", "/todo [drop <id>]",
-        "系统跟踪的待办清单（做梦提取；/done <id|关键词> 标记完成，drop=不再跟踪）",
+        "todo", "/todo [add <事项> | drop <序号>]",
+        "系统跟踪的待办清单（/todo add 登记新事项；/done <序号|关键词> 标记完成，drop=不再跟踪）",
     )
     async def cmd_todo(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
+        from muze.digest import numbered_followups
 
+        if args and args[0].lower() == "add":
+            title = " ".join(args[1:]).strip()
+            if len(title) < 4:
+                return CommandOutcome.err(
+                    "用法: /todo add <事项>（写清 谁+什么事+时限，如：/todo add 10月30日15:30 学明楼307 活动写稿）"
+                )
+            fid = await self.repo.add_followup(
+                "", title, "", source="user", opened_date=_local_date()
+            )
+            if fid is None:
+                return CommandOutcome.err("已有一模一样的未结待办，不重复登记")
+            return CommandOutcome(
+                f"已登记待办: {title}\n（/done <序号> 完成后关闭；每晚做梦前自动检查完成度）"
+            )
         if args and args[0].lower() in ("drop", "del", "rm", "off"):
             if len(args) < 2 or not args[1].isdigit():
-                return CommandOutcome.err("用法: /todo drop <id>（/todo 看 id）")
+                return CommandOutcome.err("用法: /todo drop <序号>（/todo 看序号）")
+            rows = await self.repo.list_followups(status="open", limit=50)
+            target = dict(numbered_followups(rows)).get(int(args[1]))
+            if not target:
+                return CommandOutcome.err(f"序号 {args[1]} 不存在（/todo 看当前序号）")
             ok = await self.repo.close_followup(
-                int(args[1]), status="dropped", source="user", closed_date=_local_date()
+                target["id"], status="dropped", source="user", closed_date=_local_date()
             )
             if not ok:
-                return CommandOutcome.err(f"#{args[1]} 不存在或已关闭")
-            return CommandOutcome(f"已不再跟踪待办 #{args[1]}")
+                return CommandOutcome.err(f"序号 {args[1]} 不存在或已关闭")
+            return CommandOutcome(f"已不再跟踪: {target['title']}")
         rows = await self.repo.list_followups(status="open", limit=50)
         if not rows:
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
-        rows.sort(key=lambda r: r["id"])  # 开立顺序，稳定不乱序
         md_items: list[str] = []
         node_items: list[str] = []
-        for r in rows[:20]:
+        # dense display numbering (#1..#N over the open list, stable open
+        # order) -- raw DB ids go sparse after closes and read badly
+        for n, r in numbered_followups(rows)[:20]:
             subj = r["subject"] or "全局"
             bits = []
             if r["detail"]:
@@ -971,30 +991,38 @@ class ControlService:
             if last != r["opened_date"]:
                 bits.append(f"最后动静 {last}")
             meta = " · ".join(bits)
-            md_items.append(f"**#{r['id']}** `{subj}`\n\n{r['title']}\n\n{meta}")
-            node_items.append(f"#{r['id']} [{subj}] {r['title']}\n{meta}")
-        tail = "/done <id|关键词> 标记完成 · /todo drop <id> 不再跟踪"
+            md_items.append(f"**#{n}** `{subj}`\n\n{r['title']}\n\n{meta}")
+            node_items.append(f"#{n} [{subj}] {r['title']}\n{meta}")
+        tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add <事项> 登记"
         return CommandOutcome(
             f"# 未结待办（{len(rows)} 条）\n\n" + "\n\n---\n\n".join(md_items) + f"\n\n---\n\n{tail}",
             forward_nodes=[f"未结待办（{len(rows)} 条）"] + node_items + [tail],
         )
 
     @slash(
-        "done", "/done <id|关键词>",
+        "done", "/done <序号|关键词>",
         "标记某条跟踪待办已完成——这就是\"完成信号\"（/todo 看清单）", write=True,
     )
     async def cmd_done(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         from muze.digest import local_date as _local_date
+        from muze.digest import numbered_followups
 
         if not args:
-            return CommandOutcome.err("用法: /done <id|关键词>（/todo 看清单）")
+            return CommandOutcome.err("用法: /done <序号|关键词>（/todo 看清单）")
         if args[0].isdigit():
+            # the number the user sees is the DENSE display number from
+            # /todo -- resolve it positionally over the open list (open
+            # order), never as the raw DB id
+            rows = await self.repo.list_followups(status="open", limit=50)
+            target = dict(numbered_followups(rows)).get(int(args[0]))
+            if not target:
+                return CommandOutcome.err(f"序号 {args[0]} 不存在（/todo 看当前序号）")
             ok = await self.repo.close_followup(
-                int(args[0]), status="done", source="user", closed_date=_local_date()
+                target["id"], status="done", source="user", closed_date=_local_date()
             )
             if not ok:
-                return CommandOutcome.err(f"#{args[0]} 不存在或已关闭")
-            return CommandOutcome(f"已完成待办 #{args[0]}，明早日报不再跟它")
+                return CommandOutcome.err(f"序号 {args[0]} 不存在或已关闭")
+            return CommandOutcome(f"已完成: {target['title']}\n（明早日报不再跟它）")
         q = " ".join(args)
         rows = await self.repo.find_open_followups(q)
         if len(rows) == 1:
@@ -1002,11 +1030,13 @@ class ControlService:
             await self.repo.close_followup(
                 r["id"], status="done", source="user", closed_date=_local_date()
             )
-            return CommandOutcome(f"已完成待办 #{r['id']}: {r['title']}")
+            return CommandOutcome(f"已完成待办: {r['title']}")
         if not rows:
             return CommandOutcome.err(f"没有匹配「{q}」的未结待办；/todo 看清单")
-        cands = "\n".join(f"#{r['id']} {r['title']}" for r in rows[:8])
-        return CommandOutcome.err(f"「{q}」匹配 {len(rows)} 条，请用 id:\n{cands}")
+        open_rows = await self.repo.list_followups(status="open", limit=50)
+        nos = {r["id"]: n for n, r in numbered_followups(open_rows)}
+        cands = "\n".join(f"#{nos[r['id']]} {r['title']}" for r in rows[:8])
+        return CommandOutcome.err(f"「{q}」匹配 {len(rows)} 条，请用序号:\n{cands}")
 
     # ------------------------------------------------------- script runner
     SCRIPT_TIMEOUT_SEC = 600

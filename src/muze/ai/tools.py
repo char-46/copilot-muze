@@ -23,7 +23,7 @@ log = logging.getLogger("muze.ai")
 # the controller's session but are routed to the controller for approval in
 # any other conversation (see ControlService.requires_approval).
 # send_message routes itself via ControlService.request_send.
-WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update", "followup_close"}
+WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update", "followup_add", "followup_close"}
 
 SPEC = [
     {
@@ -536,7 +536,8 @@ SPEC = [
         "function": {
             "name": "followup_list",
             "description": (
-                "查看系统跟踪的未结待办（做梦从消息中提取，含 id/所属会话/开立日期/最后动静）。"
+                "查看系统跟踪的未结待办（做梦从消息中提取 + 用户委托登记，含序号/所属会话/"
+                "开立日期/最后动静；序号是稠密编号 1..N，done 后自动补位不稀疏）。"
                 "用户问\"我还有什么没办\"\"最近有什么待办\"时用它或 cli todo。"
             ),
             "parameters": {
@@ -550,16 +551,37 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "followup_add",
+            "description": (
+                "登记一条新的跟踪待办——用户下达任务/委托/约定时（\"这个活动需要写稿\"\"帮我记着周三是 deadline\"）"
+                "必须立即调用，不要等夜里做梦。标题写清 谁+什么事+时限（如有）；含明确时间点时"
+                "可再配 schedule_task 定提醒。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "待办标题（≤40字，谁+什么事+时限）"},
+                    "subject": {"type": "string", "description": "相关会话: group/123 或 QQ号，可空"},
+                    "detail": {"type": "string", "description": "补充细节（时间地点等）"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "followup_close",
             "description": (
                 "关闭一条跟踪待办——这就是\"完成信号\"。用户说某事已经完成/搞定了/不用再跟了"
                 "（如「表交了」「这事别记了」）时必须调用。id 与 query 至少给一个；"
+                "id 是 followup_list 显示的序号（稠密编号）；"
                 "query 匹配多条时会返回候选清单。status: done=已完成, dropped=失效/不再跟踪。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "integer", "description": "待办 id（followup_list 查）"},
+                    "id": {"type": "integer", "description": "待办序号（followup_list 查）"},
                     "query": {"type": "string", "description": "关键词匹配待办（id 缺省时用）"},
                     "status": {"type": "string", "enum": ["done", "dropped"]},
                     "note": {"type": "string", "description": "关闭依据（用户原话更好）"},
@@ -638,6 +660,8 @@ class ToolRunner:
             return f"执行命令: /{args.get('command', '')}"
         if name == "profile_update":
             return f"更新身份档案 [{args.get('subject', '')}]: {str(args.get('content', ''))[:120]}"
+        if name == "followup_add":
+            return f"登记待办: {str(args.get('title', ''))[:120]}"
         if name == "followup_close":
             st = args.get("status") or "done"
             return f"关闭待办 {'#' + str(args.get('id')) if args.get('id') else str(args.get('query', ''))[:60]} ({st}): {str(args.get('note', ''))[:80]}"
@@ -1425,43 +1449,82 @@ class ToolRunner:
                 r for r in rows
                 if q in r["title"] or q in (r["detail"] or "") or q in r["subject"]
             ]
+        # id = the DENSE display number (1..N over the open list in open
+        # order), so what the model sees matches /todo and stays compact
+        # after closes; the DB id never leaks out
+        from muze.digest import numbered_followups
+
+        nos = {r["id"]: n for n, r in numbered_followups(
+            await self.repo.list_followups(status="open", limit=50)
+        )}
         return {
             "count": len(rows),
             "followups": [
                 {
-                    "id": r["id"], "subject": r["subject"], "title": r["title"],
+                    "id": nos[r["id"]], "subject": r["subject"], "title": r["title"],
                     "detail": r["detail"], "opened_date": r["opened_date"],
                     "last_date": r["last_date"],
                 }
                 for r in rows[:30]
             ],
-            "hint": "用户确认完成/取消时用 followup_close 关闭",
+            "hint": "id 为序号；用户确认完成/取消时用 followup_close 关闭；用户委托新任务用 followup_add 登记",
         }
 
+    async def t_followup_add(self, args: dict) -> dict:
+        from muze.digest import local_date as _local_date
+
+        title = str(args.get("title", "") or "").strip()
+        if len(title) < 4:
+            return {"error": "标题太短，写清 谁+什么事+时限"}
+        fid = await self.repo.add_followup(
+            str(args.get("subject", "") or "").strip(),
+            title,
+            str(args.get("detail", "") or ""),
+            source="user", opened_date=_local_date(),
+        )
+        if fid is None:
+            return {"error": "已有一模一样的未结待办"}
+        log.info("FOLLOW     | + #%s [%s] %s (via tool)",
+                 fid, args.get("subject", ""), title[:80])
+        return {"added": True, "title": title, "hint": "已入待办，每晚做梦前自动检查完成度"}
+
     async def t_followup_close(self, args: dict) -> dict:
+        from muze.digest import numbered_followups
+
         st = args.get("status")
         st = st if st in ("done", "dropped") else "done"
         fid = args.get("id")
         if fid is None or not str(fid).isdigit():
             q = str(args.get("query", "") or "").strip()
             if not q:
-                return {"error": "id 或 query 至少给一个（followup_list 查 id）"}
+                return {"error": "id 或 query 至少给一个（followup_list 查序号）"}
             rows = await self.repo.find_open_followups(q)
             if len(rows) != 1:
+                nos = {r["id"]: n for n, r in numbered_followups(
+                    await self.repo.list_followups(status="open", limit=50)
+                )}
                 return {
-                    "error": f"「{q}」匹配 {len(rows)} 条未结待办，需明确 id",
+                    "error": f"「{q}」匹配 {len(rows)} 条未结待办，需明确 id（序号）",
                     "candidates": [
-                        {"id": r["id"], "title": r["title"]} for r in rows[:8]
+                        {"id": nos[r["id"]], "title": r["title"]} for r in rows[:8]
                     ],
                     "hint": "followup_list 查全量",
                 }
             fid = rows[0]["id"]
+        else:
+            # digits are DENSE display numbers -- resolve positionally over
+            # the open list (open order), never as the raw DB id
+            open_rows = await self.repo.list_followups(status="open", limit=50)
+            target = dict(numbered_followups(open_rows)).get(int(fid))
+            if not target:
+                return {"error": f"序号 {fid} 不存在（followup_list 查当前序号）"}
+            fid = target["id"]
         ok = await self.repo.close_followup(int(fid), status=st, source="user")
         if not ok:
             return {"error": f"待办 #{fid} 不存在或已关闭"}
         log.info("FOLLOW     | - #%s closed (%s, via tool): %s",
                  fid, st, str(args.get("note", ""))[:80])
-        return {"closed": True, "id": int(fid), "status": st}
+        return {"closed": True, "status": st}
 
 
 def _args_brief(args: dict) -> str:
