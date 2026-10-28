@@ -309,6 +309,7 @@ class LLMClient:
         tools: list[dict] | None = None,
         on_chunk=None,
         role: str = "chat",
+        feature: str = "",
     ) -> dict:
         """One chat.completions call (streamed); returns the assembled choice
         message dict.
@@ -323,6 +324,10 @@ class LLMClient:
         `role` picks the model chain (llm.roles); on failure the next entry
         in the chain answers instead (failover), and per-entry rpm/concurrency
         limits are honored along the way.
+
+        `feature` tags the call in the per-feature cost ledger ("dream",
+        "value", "profile", "agent"...) so /cost can answer "what does each
+        feature cost" -- the per-model ledger mixes them.
         """
         chain = self.resolve(role)
         if tools and chain:
@@ -339,7 +344,8 @@ class LLMClient:
                 await lim.acquire()
                 try:
                     out = await self._round(
-                        self._client_for(name, e), e, name, messages, tools, on_chunk
+                        self._client_for(name, e), e, name, messages, tools, on_chunk,
+                        feature=feature,
                     )
                     if self._fault_reason:
                         log.info("LLM account fault cleared (a call succeeded)")
@@ -368,6 +374,7 @@ class LLMClient:
         messages: list[dict],
         tools: list[dict] | None,
         on_chunk,
+        feature: str = "",
     ) -> dict:
         # never echo provider-side extras (reasoning_content/finish_reason)
         # back to the API on later rounds — servers may reject unknown fields
@@ -480,11 +487,12 @@ class LLMClient:
                 completion_tokens=int(usage_d.get("completion_tokens") or 0),
                 images=_count_images(messages),
             ),
+            feature=feature,
         )
         return msg
 
     # ------------------------------------------------------------ ledger
-    def record_usage(self, name: str, usage, when=None) -> None:
+    def record_usage(self, name: str, usage, when=None, feature: str = "") -> None:
         """Cost bookkeeping: usage + computed price into the ledger.
         Never raises — accounting must not take down a live answer."""
         if self.costs is None:
@@ -499,7 +507,7 @@ class LLMClient:
                     cost = pricing.cost(usage, when)
                 elif callable(pricing):
                     cost = float(pricing(usage, when))
-            self.costs.record(name, usage, cost, when)
+            self.costs.record(name, usage, cost, when, feature)
         except Exception:
             log.debug("cost recording failed for %s", name, exc_info=True)
 

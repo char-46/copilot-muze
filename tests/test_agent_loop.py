@@ -21,7 +21,7 @@ class ScriptLLM:
         self.script = list(script)
         self.calls = 0
 
-    async def chat(self, messages, tools=None, on_chunk=None):
+    async def chat(self, messages, tools=None, on_chunk=None, **kw):
         self.calls += 1
         # copy: the agent mutates its request list in place (tool results,
         # final answer) and we assert on the REQUEST as sent
@@ -42,7 +42,7 @@ class SlowLLM(ScriptLLM):
         self.cfg = cfg
         self.delay = delay
 
-    async def chat(self, messages, tools=None, on_chunk=None):
+    async def chat(self, messages, tools=None, on_chunk=None, **kw):
         import time as _t
 
         self.calls += 1
@@ -362,7 +362,7 @@ async def test_same_conversation_sessions_run_in_parallel(env):
             self.entered = 0
             self.release = asyncio.Event()
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             self.entered += 1
             if self.entered >= 2:
                 self.release.set()
@@ -390,7 +390,7 @@ async def test_failed_turn_retracts_only_its_own_entry(env):
     class BoomLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             raise RuntimeError("boom")
 
     agent = Agent(service, repo, BoomLLM(), ChatLog(), 3)
@@ -413,7 +413,7 @@ async def test_concurrent_replies_commit_in_prompt_order(env):
     class OrderLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             p = messages[-1]["content"]
             await asyncio.sleep(0.1 if p == "慢" else 0.0)
             return {"role": "assistant", "content": f"答:{p}"}
@@ -439,7 +439,7 @@ async def test_turn_cap_refuses_when_queue_full(env):
     class GateLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             await release.wait()
             return {"role": "assistant", "content": "ok"}
 
@@ -465,7 +465,7 @@ async def test_turn_cap_queues_extra_turns(env):
     class GateLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             entered.append(messages[-1]["content"])
             if len(entered) < 2:
                 await gate.wait()
@@ -494,7 +494,7 @@ async def test_reset_midturn_does_not_leak_context(env):
     class GateLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             seen.append([m["content"] for m in messages if m["role"] == "user"])
             await release.wait()
             return {"role": "assistant", "content": "答"}
@@ -522,7 +522,7 @@ async def test_aclose_cancels_inflight_session(env):
     class BlockLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             await never.wait()
             return {"role": "assistant", "content": "不会到这里"}
 
@@ -608,7 +608,7 @@ async def test_sess_id_message_continues_done_session(env):
     class RecLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             seen.append([m["content"] for m in messages if m["role"] == "user"])
             return {"role": "assistant", "content": f"答{len(seen)}"}
 
@@ -938,7 +938,7 @@ async def test_sess_stop_cancels_running_session(env):
     class BlockLLM:
         configured = True
 
-        async def chat(self, messages, tools=None, on_chunk=None):
+        async def chat(self, messages, tools=None, on_chunk=None, **kw):
             await never.wait()
             return {"role": "assistant", "content": "x"}
 

@@ -1605,7 +1605,10 @@ class ControlService:
     async def cmd_version(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         return CommandOutcome(get_version())
 
-    @slash("cost", "/cost [today|month|all]", "LLM 用量与费用（模型定价含峰谷；无定价模型只计 token）", scope="app")
+    @slash(
+        "cost", "/cost [today|month|all]",
+        "LLM 用量与费用：按模型 + 按功能（dream/value/profile/agent…）分解", scope="app",
+    )
     async def cmd_cost(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         llm = self.agent.llm if self.agent is not None else None
         if llm is None or llm.costs is None:
@@ -1620,24 +1623,40 @@ class ControlService:
         rows = llm.costs.summary(prefix)
         if not rows:
             return CommandOutcome(f"{scope}: 暂无用量记录")
-        lines = [f"LLM 用量（{scope}）:"]
-        total = 0.0
-        has_free = False
-        for m, r in sorted(rows.items(), key=lambda kv: -(kv[1][5] or 0)):
-            p_tok, c_tok, img, audio_s, calls, cost = r
-            bits = f"{m}: {p_tok:,}入/{c_tok:,}出 tok, {calls}次"
-            if img:
-                bits += f", 图{img}"
-            if audio_s:
-                bits += f", 音频{audio_s / 60:.1f}min"
-            if cost:
-                bits += f" -> ¥{cost:.4f}"
-                total += cost
-            else:
-                has_free = True
-            lines.append(bits)
-        lines.append(f"合计: ¥{total:.4f}" + ("（无定价模型仅计 token）" if has_free else ""))
-        return CommandOutcome("\n".join(lines))
+
+        def _table(items: dict[str, list]) -> tuple[list[str], float, bool]:
+            lines_, total_, free_ = [], 0.0, False
+            for m, r in sorted(items.items(), key=lambda kv: -(kv[1][5] or 0)):
+                p_tok, c_tok, img, audio_s, calls, cost = r
+                bits = f"{m}: {p_tok:,}入/{c_tok:,}出 tok, {calls}次"
+                if img:
+                    bits += f", 图{img}"
+                if audio_s:
+                    bits += f", 音频{audio_s / 60:.1f}min"
+                if cost:
+                    bits += f" -> ¥{cost:.4f}"
+                    total_ += cost
+                else:
+                    free_ = True
+                lines_.append(bits)
+            return lines_, total_, free_
+
+        lines, total, has_free = _table(rows)
+        out = [f"LLM 用量（{scope}）:"] + lines
+        # per-feature breakdown (which feature burns the money) -- separate
+        # ledger, only rows since feature tagging landed (2026-10-28)
+        try:
+            feats = llm.costs.feature_summary(prefix)
+        except Exception:
+            feats = {}
+        if feats:
+            flines, ftotal, ffree = _table(feats)
+            out.append("按功能:")
+            out.extend(flines)
+            if ffree:
+                out.append("（部分功能无定价模型仅计 token）")
+        out.append(f"合计: ¥{total:.4f}" + ("（无定价模型仅计 token）" if has_free else ""))
+        return CommandOutcome("\n".join(out))
 
     @slash("balance", "/balance [模型名]", "查询各 LLM 端点的账户余额（llm.models 注册项）", scope="app")
     async def cmd_balance(self, args: list[str], ctx: ControlContext) -> CommandOutcome:

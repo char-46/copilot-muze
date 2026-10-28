@@ -14,6 +14,14 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.159",
+        "date": "2026-10-28",
+        "changes": [
+            "身份档案进一步降频：默认改为夜间做梦捎带刷新（一天最多一次，六小时维护循环触发已关），且增量归纳只喂老档案+自上次归纳以来的新消息，不再重读整个窗口。",
+            "新增成本统计模块：每笔 LLM 调用打功能标签（做梦/价值打分/档案/代理/总结等，账本另存 costs.features.json），/cost 输出按模型+按功能双分解，可回答某功能总花多少。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.158",
         "date": "2026-10-28",
         "changes": [

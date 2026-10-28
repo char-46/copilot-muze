@@ -21,7 +21,7 @@ class EvolveLLM:
         self.out = out
         self.prompts: list[str] = []
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **kw):
         self.prompts.append(messages[-1]["content"])
         return {"role": "assistant", "content": self.out}
 
@@ -68,7 +68,7 @@ async def test_evolve_retires_stale_and_adds_habit(repo):
 
 async def test_evolve_llm_failure_leaves_version_unset(repo):
     class Boom(EvolveLLM):
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **kw):
             raise RuntimeError("api down")
 
     assert await evolve_if_due(repo, Boom(), MuzeConfig(), ChatLog()) == 0

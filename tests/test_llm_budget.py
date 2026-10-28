@@ -28,11 +28,13 @@ class FakeLLM:
         self.exc = exc
         self.reply = reply
         self.calls = 0
+        self.seen: list[str] = []  # user prompts, for delta assertions
         self._fault_until = 0.0
         self._fault_reason = ""
 
     async def chat(self, messages, tools=None, **kw):
         self.calls += 1
+        self.seen.append(str(messages[-1].get("content") if messages else ""))
         if self.exc is not None:
             raise self.exc
         return {"role": "assistant", "content": self.reply}
@@ -148,7 +150,7 @@ async def test_profiles_refresh_when_new_messages_arrive(repo):
     from muze.config import MuzeConfig
 
     now = int(time.time())
-    await _seed(repo, 222, now - 60, "乙：稿子我今晚发你，记得查收一下")
+    await _seed(repo, 222, now - 60, "乙：稿子我今晚发你，写完记得查收一下，谢谢配合")
     await repo.upsert_profile("friend/222", "", "旧档案")
     await repo.conn.execute(
         "UPDATE profiles SET updated_at=? WHERE subject='friend/222'", (now - 7200,)
@@ -158,6 +160,51 @@ async def test_profiles_refresh_when_new_messages_arrive(repo):
     llm = FakeLLM(reply="新档案")
     n = await refresh_profiles(repo, llm, MuzeConfig(), None, since_h=48)
     assert n == 1 and llm.calls == 1
+
+
+async def test_profiles_delta_prompt_is_old_doc_plus_new_only(repo):
+    """老的profile+新消息应该足够: the prompt must contain ONLY messages
+    newer than the stored doc -- old (already-summarized) messages are never
+    re-read, so the call folds in genuinely new material only."""
+    from muze.config import MuzeConfig
+
+    now = int(time.time())
+    old_marker = "这是上个月就已经归纳过的旧话题甲乙丙丁"
+    new_marker = "这是今天才发生的新事件戊己庚辛壬癸子丑寅卯"
+    await _seed(repo, 555, now - 30 * 86400, f"甲：{old_marker}")
+    await repo.upsert_profile("friend/555", "", "旧档案：只有旧话题")
+    await repo.conn.execute(
+        "UPDATE profiles SET updated_at=? WHERE subject='friend/555'", (now - 86400,)
+    )
+    await repo.conn.commit()
+    await _seed(repo, 555, now - 120, f"乙：{new_marker}")
+
+    llm = FakeLLM(reply="合并后的档案")
+    n = await refresh_profiles(repo, llm, MuzeConfig(), None, since_h=48)
+    assert n == 1 and llm.calls == 1
+    prompt = llm.seen[0]
+    assert new_marker in prompt          # the new message is fed
+    assert old_marker not in prompt      # the pre-doc message is NOT re-read
+    assert "旧档案" in prompt            # the doc itself travels along
+    assert "新消息" in prompt            # the prompt says it is a delta
+
+
+async def test_profiles_tiny_delta_waits_for_more(repo):
+    """A one-word delta is not worth a call: it stays pending and folds into
+    a later pass once more has accumulated."""
+    from muze.config import MuzeConfig
+
+    now = int(time.time())
+    await repo.upsert_profile("friend/666", "", "旧档案")
+    await repo.conn.execute(
+        "UPDATE profiles SET updated_at=? WHERE subject='friend/666'", (now - 3600,)
+    )
+    await repo.conn.commit()
+    await _seed(repo, 666, now - 60, "好")
+
+    llm = FakeLLM(reply="档案")
+    assert await refresh_profiles(repo, llm, MuzeConfig(), None, since_h=48) == 0
+    assert llm.calls == 0
 
 
 async def test_profiles_abort_on_account_fault(repo):
@@ -191,3 +238,59 @@ async def test_profiles_daily_budget_caps_the_pass(repo):
     llm2 = FakeLLM(reply="档案")
     assert await refresh_profiles(repo, llm2, cfg, None, since_h=48) == 0
     assert llm2.calls == 0
+
+
+# ------------------------------------------------------ per-feature ledger
+def _tracker(tmp_path):
+    from muze.model_catalog import CostTracker, Usage
+
+    return CostTracker(tmp_path / "costs.json"), Usage
+
+
+def test_feature_ledger_separates_features(tmp_path):
+    """The cost-stat module: same model, different features -- the per-model
+    ledger mixes them, the feature ledger answers 价值打分总cost多少."""
+    import datetime as dt
+
+    tr, Usage = _tracker(tmp_path)
+    u1 = Usage(prompt_tokens=1000, completion_tokens=100, calls=1)
+    u2 = Usage(prompt_tokens=2000, completion_tokens=200, calls=1)
+    tr.record("m", u1, 0.10, dt.datetime(2026, 10, 28, 10), feature="value")
+    tr.record("m", u2, 0.20, dt.datetime(2026, 10, 28, 11), feature="dream")
+    tr.record("m", u1, 0.10, dt.datetime(2026, 10, 28, 12))  # untagged
+
+    feats = tr.feature_summary("2026-10-28")
+    assert feats["value"][5] == 0.10 and feats["value"][4] == 1
+    assert feats["dream"][5] == 0.20 and feats["dream"][0] == 2000
+    assert "value" in feats and "dream" in feats and len(feats) == 2
+
+    # per-model ledger unchanged in shape: one row, all three calls merged
+    rows = tr.summary("2026-10-28")
+    assert rows["m"][4] == 3 and abs(rows["m"][5] - 0.40) < 1e-9
+
+
+def test_feature_ledger_persists_and_scopes(tmp_path):
+    import datetime as dt
+
+    tr, Usage = _tracker(tmp_path)
+    u = Usage(prompt_tokens=10, completion_tokens=1, calls=1)
+    tr.record("m", u, 0.01, dt.datetime(2026, 10, 27), feature="value")
+    tr.record("m", u, 0.02, dt.datetime(2026, 10, 28), feature="value")
+
+    tr2, _ = _tracker(tmp_path)  # fresh instance reads the same files
+    assert tr2.feature_summary("2026-10")["value"][5] == 0.03
+    assert tr2.feature_summary("2026-10-28")["value"][5] == 0.02
+    assert tr2.feature_summary("")["value"][4] == 2
+    assert tr2.summary("2026-10-28")["m"][4] == 1  # main ledger intact
+
+
+def test_bg_chat_passes_feature_tag_through():
+    """feature flows bg_chat(**kw) -> chat(feature=...) without every caller
+    knowing anything about the ledger."""
+    llm = FakeLLM()
+    import asyncio
+
+    async def run():
+        return await bg_chat(llm, [{"role": "user", "content": "x"}], feature="value")
+
+    assert asyncio.run(run())["content"] == "ok"
