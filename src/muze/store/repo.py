@@ -843,6 +843,29 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    async def owner_messages_between(
+        self, start_ts: int, end_ts: int, *, self_id: int = 0, limit: int = 60
+    ) -> list[dict]:
+        """Messages the OWNER sent in [start_ts, end_ts), across ALL
+        conversations, chronological.
+
+        Backs the follow-up "directives" bypass: delegations are short and
+        sit in quiet chats, which the digest LLM drops from its report
+        entirely. self_id==0 means unknown -> treat the account owner as
+        unknown and return nothing (never guess)."""
+        if not self_id:
+            return []
+        async with self.conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE time >= ? AND time < ? AND recalled = 0 AND sender_id = ?
+            ORDER BY time ASC, message_seq ASC LIMIT ?
+            """,
+            (start_ts, end_ts, int(self_id), limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def coverage_stats(self, scene: str, peer_id: int) -> dict:
         """Local archive coverage for one conversation."""
         async with self.conn.execute(

@@ -3,7 +3,7 @@
 import pytest
 
 from muze.ai.agent import SYSTEM_PROMPT
-from muze.changelog import RELEASE_NOTES, recent_notes
+from muze.changelog import RELEASE_NOTES, recent_notes, validate_notes
 from muze.config import MuzeConfig
 from muze.core.service import ControlContext, ControlService, Runtime
 from muze.ai.tools import ToolRunner, WRITE_TOOLS
@@ -38,6 +38,7 @@ def test_release_notes_newest_first_and_rendered():
     assert RELEASE_NOTES[0]["version"] == BASE_VERSION  # every release appends
     txt = recent_notes(2)
     assert RELEASE_NOTES[0]["version"] in txt and "changes" not in txt
+    assert validate_notes() == []  # shape guard for hand-edited entries
 
 
 # ---------------------------------------------------------------- evolve
