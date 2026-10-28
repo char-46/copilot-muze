@@ -966,6 +966,7 @@ class App:
         indexing (noise never enters the vector space). With llm.batch
         enabled and enough backlog, scoring goes through the async Batch
         API (half price, answered within 24h) instead of inline calls."""
+        from muze.ai.llm import LLMAccountFault
         from muze.perception import ValueScorer
 
         while not self._stop.is_set():
@@ -998,6 +999,10 @@ class App:
                     batch = rows[i:i + vcfg.batch_size]
                     try:
                         scored = await scorer.score(batch)
+                    except LLMAccountFault as e:
+                        log.info("[%s] value scoring paused (account fault): %s",
+                                 self.spec.name, str(e)[:80])
+                        break
                     except Exception as e:
                         log.warning("value scoring batch failed: %s", e)
                         break

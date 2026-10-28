@@ -99,6 +99,51 @@ class _Limiter:
             self._sem.release()
 
 
+# ------------------------------------------------------------- account faults
+# ONE place decides "this failure is about the account, retrying is pointless"
+# (user direction 2026-10-28: 不要每个功能单独维护 llm 402 判断，用统一 layer).
+ACCOUNT_FAULT_MARKERS = (
+    "402", "insufficient", "balance", "quota", "exceeded your",
+    "payment", "arrears", "billing",
+)
+
+
+class LLMAccountFault(RuntimeError):
+    """Raised by `bg_chat` when the endpoint is unusable for account reasons
+    (no balance / no access). Background passes catch this and skip; nothing
+    else in the codebase inspects provider error strings."""
+
+
+def _is_account_fault(ex: Exception) -> bool:
+    s = str(ex).lower()
+    return any(m in s for m in ACCOUNT_FAULT_MARKERS)
+
+
+async def bg_chat(llm, messages: list[dict], **kw):
+    """Background LLM call -- the ONLY entry point background passes use.
+
+    - while the account is faulted it raises LLMAccountFault WITHOUT calling
+      the provider: no spend, no retry storm against a dead account;
+    - otherwise it is a plain chat(); a fresh account fault is recorded on
+      the client (so later passes are short-circuited too) and surfaces as
+      LLMAccountFault for the caller to skip.
+    """
+    if llm is None:
+        raise LLMAccountFault("no llm configured")
+    if getattr(llm, "faulted", False):
+        raise LLMAccountFault(getattr(llm, "_fault_reason", "") or "account fault")
+    try:
+        return await llm.chat(messages, **kw)
+    except LLMAccountFault:
+        raise
+    except Exception as e:
+        if _is_account_fault(e):
+            if hasattr(llm, "note_fault"):
+                llm.note_fault(e)
+            raise LLMAccountFault(str(e)[:160]) from e
+        raise
+
+
 class LLMClient:
     def __init__(self, cfg: LLMConfig, data_dir: str = "") -> None:
         self.cfg = cfg
@@ -114,7 +159,38 @@ class LLMClient:
             CostTracker(Path(data_dir) / "costs.json") if data_dir else None
         )
         self._data_dir = data_dir
+        # account-level fault gate: once the provider says "no money / no
+        # access", every further call fails identically, so background
+        # consumers stop hammering it until the cooldown lapses or a call
+        # succeeds (cost incident 2026-10-28: HTTP 402 drained the balance
+        # while nightly passes retried the dead endpoint)
+        self._fault_until: float = 0.0
+        self._fault_reason: str = ""
         self._load_catalog()
+
+    # ---------------------------------------------------- account fault gate
+    @property
+    def faulted(self) -> bool:
+        """True while the endpoint is known-unusable (background work should
+        skip LLM entirely). Interactive asks still try once: the user may
+        have topped up."""
+        return bool(self._fault_reason) and time.time() < self._fault_until
+
+    def note_fault(self, ex: Exception, cooldown_s: float = 1800.0) -> bool:
+        """Record an account-level failure; returns True if it was one."""
+        if not _is_account_fault(ex):
+            return False
+        self._fault_reason = str(ex)[:160]
+        self._fault_until = time.time() + cooldown_s
+        log.error(
+            "LLM account fault: %s -- background LLM work paused %.0f min",
+            self._fault_reason, cooldown_s / 60,
+        )
+        return True
+
+    def clear_fault(self) -> None:
+        self._fault_reason = ""
+        self._fault_until = 0.0
 
     def _load_catalog(self) -> None:
         from muze.model_catalog import load_user_catalog
@@ -262,13 +338,21 @@ class LLMClient:
             try:
                 await lim.acquire()
                 try:
-                    return await self._round(
+                    out = await self._round(
                         self._client_for(name, e), e, name, messages, tools, on_chunk
                     )
+                    if self._fault_reason:
+                        log.info("LLM account fault cleared (a call succeeded)")
+                        self.clear_fault()
+                    return out
                 finally:
                     lim.release()
             except Exception as ex:
                 last_err = ex
+                if _is_account_fault(ex):
+                    # no point failing over: it is the ACCOUNT, not the model
+                    self.note_fault(ex)
+                    raise
                 if i + 1 < len(chain):
                     log.warning(
                         "LLM failover | %s/%s failed (%s); trying next in role=%s chain",

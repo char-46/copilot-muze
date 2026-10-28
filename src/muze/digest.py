@@ -19,6 +19,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
+from muze.ai.llm import LLMAccountFault, bg_chat
 from muze.chatlog import ChatLog, epoch_iso
 from muze.config import MuzeConfig
 from muze.store.repo import Repository
@@ -572,7 +573,7 @@ async def run_digest(
     )
     if not llm.configured:
         raise RuntimeError("LLM 未配置，无法做梦（检查 llm.chat.*）")
-    msg = await llm.chat([{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
     report = (msg.get("content") or "").strip() or "(做梦结果为空)"
     if len(report) > 8000:
         report = report[:8000] + "\n...(截断)"
@@ -642,6 +643,8 @@ async def dream_night(
     swept = 0
     try:
         swept = await check_followups(repo, llm, cfg, date=target, chatlog=chatlog)
+    except LLMAccountFault as e:
+        chatlog.log.info("DREAM      | sweep skipped (account fault): %s", str(e)[:80])
     except Exception:
         log.exception("followup completion sweep for %s failed", target)
 
@@ -772,7 +775,7 @@ async def _run_rollup(
         scope=scope, key=key, n=len(subs), inputs=inputs, budget=budget,
         owner=await owner_context(repo, cfg),
     )
-    msg = await llm.chat([{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
     report = (msg.get("content") or "").strip() or f"({scope}报告为空)"
     if len(report) > 6000:
         report = report[:6000] + "\n...(截断)"
@@ -905,7 +908,7 @@ async def sync_followups(
         directives=directives or "(无)",
         maxn=cfg.digest.max_memories_per_night,
     )
-    msg = await llm.chat([{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
     raw = (msg.get("content") or "").strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
@@ -1080,7 +1083,7 @@ async def check_followups(
     prompt = FOLLOWUP_CHECK_PROMPT.format(
         date=date, blocks="\n\n".join(blocks)[:12000]
     )
-    msg = await llm.chat([{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
     raw = (msg.get("content") or "").strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
@@ -1151,7 +1154,7 @@ async def extract_memories(
         existing=existing_txt, report=report[:4000], date=date,
         maxn=cfg.digest.max_memories_per_night,
     )
-    msg = await llm.chat([{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
     raw = (msg.get("content") or "").strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
