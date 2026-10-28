@@ -78,16 +78,18 @@ def test_render_png_has_no_paper_margins(tmp_path):
     im = Image.open(_io.BytesIO(png)).convert("RGB")
     # A4 at scale 2 would be ~1190px wide; a content-sized crop is far narrower
     assert im.width < 500
-    # and taller-than-wide is fine; the content must reach the trim padding
+    # content sits inside ONE consistent outer border (user feedback
+    # 2026-10-28: 输出的图片增加总体的 padding) -- not a paper sheet, and
+    # not flush against the edge either
     bg = Image.new("RGB", im.size, "white")
     from PIL import ImageChops
 
     bbox = ImageChops.difference(im, bg).getbbox()
     assert bbox is not None
     l, t, r, b = bbox
-    assert l <= R._PNG_TRIM_PAD + 2 and t <= R._PNG_TRIM_PAD + 2
-    assert im.width - r <= R._PNG_TRIM_PAD + 2
-    assert im.height - b <= R._PNG_TRIM_PAD + 2
+    assert l >= R._PNG_OUTER_PAD - 2 and t >= R._PNG_OUTER_PAD - 2
+    assert im.width - r >= R._PNG_OUTER_PAD - 2
+    assert im.height - b >= R._PNG_OUTER_PAD - 2
 
 def test_render_survives_angle_brackets(tmp_path):
     """Regression (2026-10-26): '/done <id|关键词>' used to break the XHTML

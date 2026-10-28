@@ -268,6 +268,119 @@ async def test_done_keyword_candidates_use_dense_nos(svc):
     assert "#1" in out.text and "#2" in out.text and "#3" not in out.text  # dense, no holes
 
 
+# --------------------------------------------- numbering drift / subtasks
+async def test_done_resolves_what_this_chat_saw_not_todays_positions(svc):
+    """用户问题 2026-10-28: 两次 done 之间序号会变，会删错吗? /done now pins
+    the numbering to the LAST /todo view in this chat: if the list shifted
+    in between (another session, the dream), the number still means the item
+    the user actually saw -- and if that item is gone we refuse instead of
+    silently hitting its successor."""
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    a = await repo.add_followup("", "任务A", "", "dream:d1", "2026-10-20")
+    b = await repo.add_followup("", "任务B", "", "dream:d1", "2026-10-20")
+    c = await repo.add_followup("", "任务C", "", "dream:d1", "2026-10-20")
+
+    out = await service.run_command("todo", ctx)  # view: #1=A #2=B #3=C
+    assert "#1" in out.text and "#3" in out.text
+
+    # between the view and the done, ANOTHER session closes A: positions
+    # shift (B becomes #1, C becomes #2)
+    await repo.close_followup(a, status="done", source="user", closed_date="2026-10-21")
+
+    # /done 2 must close B (what the user saw), not C (today's #2)
+    out = await service.run_command("done 2", ctx)
+    assert not out.is_error and "任务B" in out.text
+    titles = {r["id"]: r for r in await repo.list_followups()}
+    assert c in titles and b not in titles and a not in titles
+
+    # the view is stale but still maps 3 -> C; closing something the user
+    # never saw (C is now #1) must not happen by position
+    out = await service.run_command("done 3", ctx)
+    assert not out.is_error and "任务C" in out.text
+
+
+async def test_done_refuses_when_the_seen_item_is_already_closed(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    b = await repo.add_followup("", "任务B", "", "dream:d1", "2026-10-20")
+    c = await repo.add_followup("", "任务C", "", "dream:d1", "2026-10-20")
+    await service.run_command("todo", ctx)  # #1=B #2=C
+    await repo.close_followup(b, status="done", source="user", closed_date="2026-10-21")
+    # #1 now points at C, but the user saw B there: refuse, do not guess
+    out = await service.run_command("done 1", ctx)
+    assert out.is_error and "刷新" in out.text
+    assert c in {r["id"] for r in await repo.list_followups()}
+
+
+async def test_numbering_is_shared_across_fronts(svc):
+    """用户问题 2026-10-28: 不同会话 /todo 查看后 done 会不会写错? One owner,
+    one last-seen numbering: a list shown in the CLI is what /done in the
+    WebUI resolves against (and vice versa)."""
+    service, repo = svc
+    cli = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    web = ControlContext(source="web", chat_key="web", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup("", "任务A", "", "dream:d1", "2026-10-20")
+    b = await repo.add_followup("", "任务B", "", "dream:d1", "2026-10-20")
+    await service.run_command("todo", cli)  # seen in the CLI: #1=A #2=B
+
+    out = await service.run_command("done 2", web)  # closed from another front
+    assert not out.is_error and "任务B" in out.text
+    assert b not in {r["id"] for r in await repo.list_followups()}
+
+
+async def test_subtasks_display_and_parent_close(svc):
+    """同一任务的子任务用分级的方式表示: #1 -> #1.1, #1.2; closing the parent
+    closes its open subtasks too."""
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    p = await repo.add_followup("", "10-30 大课堂", "", "dream:d1", "2026-10-20")
+    c1 = await repo.add_followup("", "拍照", "", "dream:d1", "2026-10-20", parent_id=p)
+    c2 = await repo.add_followup("", "写稿", "", "dream:d1", "2026-10-20", parent_id=p)
+    c3 = await repo.add_followup("", "排版", "", "dream:d1", "2026-10-20", parent_id=p)
+
+    out = await service.run_command("todo", ctx)
+    assert "#1" in out.text and "#1.1" in out.text and "#1.2" in out.text and "#1.3" in out.text
+
+    out = await service.run_command("done 1", ctx)
+    assert not out.is_error and "子任务" in out.text
+    assert not await repo.list_followups()  # parent + all children closed
+
+
+async def test_todo_add_under_and_dotted_done(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    out = await service.run_command("todo add 11-01 环境学院户外活动", ctx)
+    assert not out.is_error
+    out = await service.run_command(
+        "todo add @小王 负责集合签到 under:1 due:11-01", ctx
+    )
+    assert not out.is_error and "挂在 #1 下" in out.text
+
+    rows = await repo.list_followups()
+    assert len(rows) == 2 and rows[1]["parent_id"] == rows[0]["id"]
+    out = await service.run_command("todo", ctx)
+    assert "#1.1" in out.text
+
+    # dotted number closes ONLY the subtask
+    out = await service.run_command("done 1.1", ctx)
+    assert not out.is_error and "负责集合签到" in out.text
+    rows = await repo.list_followups()
+    assert len(rows) == 1 and rows[0]["title"].startswith("11-01")
+
+
+async def test_orphan_subtask_is_promoted_to_top_level():
+    from muze.digest import numbered_followups
+
+    items = [
+        {"id": 2, "parent_id": 1, "title": "子"},
+        {"id": 5, "parent_id": 0, "title": "另一个"},
+    ]  # parent 1 is closed/absent
+    pairs = dict(numbered_followups(items))
+    assert pairs["1"]["title"] == "子"  # promoted, closable
+    assert pairs["2"]["title"] == "另一个"
+
+
 # ------------------------------------------------- /dream <date> backfills
 async def test_dream_missing_date_is_made_on_the_spot(svc):
     from muze.digest import day_range
@@ -399,7 +512,7 @@ async def test_format_followups_dense_after_close(repo):
     await repo.add_followup("", "事项丙", "", "dream:d1", "2026-10-20")
     await repo.close_followup(f2, status="done", closed_date="2026-10-21")
     rows = await repo.list_followups()
-    assert [n for n, _ in numbered_followups(rows)] == [1, 2]  # no holes
+    assert [n for n, _ in numbered_followups(rows)] == ["1", "2"]  # no holes
     txt = _format_followups(rows)
     assert "#1" in txt and "#2" in txt and "#3" not in txt
     assert "事项甲" in txt and "事项丙" in txt and "事项乙" not in txt
@@ -519,7 +632,7 @@ async def test_followup_tools_use_dense_ids(svc):
     runner = ToolRunner(service, repo, service.adapter, None, inside)
     out = json.loads(await runner.run("followup_list", {}))
     ids = [f["id"] for f in out["followups"]]
-    assert ids == [1, 2]  # dense (db ids are 1 and 3)
+    assert ids == ["1", "2"]  # dense display numbers (db ids are 1 and 3)
 
     # closing dense #2 kills 事项丙 (db 3), not the closed db 2
     out = json.loads(await runner.run("followup_close", {"id": 2, "note": "用户说搞定"}))

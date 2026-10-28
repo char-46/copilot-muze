@@ -414,9 +414,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v16_followup_assignee(conn)
         await _migrate_v17_followup_delivered(conn)
         await _migrate_v18_capability_wishes(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '18')")
+        await _migrate_v19_followup_parent(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '19')")
         await conn.commit()
-        log.info("database created (schema v18)")
+        log.info("database created (schema v19)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -496,6 +497,27 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v18 (capability wishlist)")
         version = 18
+    if version < 19:
+        await _migrate_v19_followup_parent(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '19')")
+        await conn.commit()
+        log.info("database migrated to schema v19 (followup subtasks)")
+        version = 19
+
+
+async def _migrate_v19_followup_parent(conn: aiosqlite.Connection) -> None:
+    """followups.parent_id: one level of subtasks (user request 2026-10-28:
+    同一任务的子任务用分级的方式表示).
+
+    A parent groups related items (one activity -> 拍照/写稿/排版) and is
+    displayed as #3 with children #3.1, #3.2; closing the parent closes its
+    open children. Flat items stay parent_id=0."""
+    async with conn.execute("PRAGMA table_info(followups)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    if "parent_id" not in cols:
+        await conn.execute(
+            "ALTER TABLE followups ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 async def _migrate_v18_capability_wishes(conn: aiosqlite.Connection) -> None:

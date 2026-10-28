@@ -397,13 +397,19 @@ def render_png(
         else:
             from PIL import Image
 
+            # pages stack with a small white gap so the seam is visible
+            gap = _PNG_PAGE_GAP
             w = max(im.width for im in imgs)
-            h = sum(im.height for im in imgs)
+            h = sum(im.height for im in imgs) + gap * (len(imgs) - 1)
             out = Image.new("RGB", (w, h), "white")
             y = 0
             for im in imgs:
                 out.paste(im, (0, y))
-                y += im.height
+                y += im.height + gap
+        # overall breathing room (user feedback 2026-10-28: 输出的图片增加
+        # 总体的 padding) -- the trim above keeps only _PNG_TRIM_PAD around
+        # content, which reads cramped in a chat bubble
+        out = _pad_white(out, _PNG_OUTER_PAD)
         buf = io.BytesIO()
         out.save(buf, format="PNG", optimize=True)
         return buf.getvalue()
@@ -417,6 +423,19 @@ _PNG_PAGE_W = 700.0
 _PNG_PAGE_H = 12000.0  # PDF media box caps at 14400; taller text paginates
 _PNG_PAD = 22.0
 _PNG_TRIM_PAD = 10  # px of breathing room kept around the trimmed content
+_PNG_OUTER_PAD = 26  # uniform white border added to the FINAL image
+_PNG_PAGE_GAP = 8  # white gap between stitched pages
+
+
+def _pad_white(im, pad: int):
+    """Expand the canvas with a uniform white border."""
+    if pad <= 0:
+        return im
+    from PIL import Image
+
+    out = Image.new("RGB", (im.width + pad * 2, im.height + pad * 2), "white")
+    out.paste(im, (pad, pad))
+    return out
 
 
 def _trim_white(im, pad: int = _PNG_TRIM_PAD):
