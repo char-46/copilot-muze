@@ -80,7 +80,8 @@ SYSTEM_PROMPT = """你是 muze，一个运行在用户 QQ 账号（被控号）�
 - 发送图片/文件/表情用 send_media（归档媒体给 media_id 或 会话/seq；本地文件给 path）；图片文字用 ocr_image；画柱状/折线图用 make_chart（再用 send_media 发）。
 - 联网检索用 web_search（要链接）或 research（搜索+抓取正文，推荐）；未配置搜索时如实说明无法联网。
 - 计划任务（"两小时后/每隔…"）用 schedule_task，时间换算是你的职责。
-- 待办闭环：系统跟踪的未结待办（做梦提取+用户委托，followup_list 查，id 为序号）——用户**下达任务/委托/约定**（"这个活动需要写稿""帮我记着周三是 deadline"）时**必须**当场用 followup_add 登记进待办，不要等夜里做梦；**用户布置给别人去办的事**（"让小王写推送""这事交给班长"）同样登记，assignee 填受托人，完成以TA的交付为准；用户说某事已完成/搞定/不用再跟（"交了""这事别记了"）时**必须**用 followup_close 关闭对应条目，这就是完成信号；但完成信号只能来自用户明确表示或档案中的确凿证据，不要凭"挂得久"替用户关闭。
+- 待办闭环：系统跟踪的未结待办（做梦提取+用户委托，followup_list 查，id 为序号）——用户**下达任务/委托/约定**（"这个活动需要写稿""帮我记着周三是 deadline"）时**必须**当场用 followup_add 登记进待办，不要等夜里做梦；**用户布置给别人去办的事**（"让小王写推送""这事交给班长"）同样登记，assignee 填受托人；**交付≠完成**：负责人说交了/发了只是"已交付待验收"，必须等**用户验收确认**（"可以了""收到没问题"）才能 followup_close；用户说某事已完成/搞定/不用再跟（"交了""这事别记了"）时**必须**用 followup_close 关闭对应条目，这就是完成信号；但完成信号只能来自用户明确表示或档案中的确凿证据，不要凭"挂得久"替用户关闭。
+- 回顾过往结论优先用 recall_dream（做梦报告：日报 YYYY-MM-DD / 周报 YYYY-Www / 月报 YYYY-MM，缺省最新日报），比翻原始消息省力；"昨天聊了什么""上周有什么进展"这类问题先查它。
 - 被要求代发消息时调用 send_message；系统通常要求控制者确认后才真正发出，如实转达确认提示。
 - 列出的技能（skills）与任务相关时，先 read_skill 读全文再照做。
 - 长期记忆：写入用 remember；检索用 memory_search；修订/停用用 memory_update/memory_delete（后两者控制者会话外需审批）。
@@ -685,11 +686,12 @@ class Agent:
         except Exception:
             fu_rows = []
         if fu_rows:
-            from muze.digest import followup_due_tag, numbered_followups
+            from muze.digest import followup_due_tag, followup_state_tag, numbered_followups
 
             fu_lines = [
                 f"- #{n} [{r.get('subject') or '全局'}] {r['title']}"
                 + (f" →负责人:{r['assignee']}" if r.get("assignee") else "")
+                + ((f"（{followup_state_tag(r)}）" if followup_state_tag(r) else ""))
                 + ((f"（{followup_due_tag(r)}）" if followup_due_tag(r) else ""))
                 + f"（开于{r['opened_date']}，最后动静{r['last_date'] or r['opened_date']}）"
                 for n, r in numbered_followups(fu_rows)
@@ -699,6 +701,7 @@ class Agent:
                 + "\n谈及其中任何一条时，先用 search_archive / semantic_search / get_recent_messages"
                   "（按条目的 subject 定位会话）拉取该事项的最新消息，把最新下落讲清楚；"
                   "⚠已逾期或临期的，主动提醒用户催办；"
+                  "「待验收」的条目交付已记录，提醒用户验收即可，验收确认才 followup_close；"
                   "用户确认完成或取消时用 followup_close（id 用序号）关闭。"
             )
 

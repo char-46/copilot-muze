@@ -996,7 +996,7 @@ class ControlService:
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
         md_items: list[str] = []
         node_items: list[str] = []
-        from muze.digest import followup_due_tag
+        from muze.digest import followup_due_tag, followup_state_tag
 
         today = _local_date()
         delegated = 0
@@ -1006,10 +1006,13 @@ class ControlService:
             subj = r["subject"] or "全局"
             bits = []
             who = ""
+            state = followup_state_tag(r)
             if r.get("assignee"):
                 delegated += 1
                 who = f" → {r['assignee']}"
                 bits.append(f"负责人 {r['assignee']}（等交付）")
+            if state:
+                bits.append(state + "，等你验收")
             due = followup_due_tag(r, today=today)
             if due:
                 bits.append(due)

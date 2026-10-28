@@ -1051,6 +1051,20 @@ class Repository:
         await self.conn.commit()
         return cur.rowcount > 0
 
+    async def set_followup_delivered(self, item_id: int, delivered_date: str | None) -> bool:
+        """Mark/clear the DELIVERED (awaiting acceptance) flag on an open
+        item. Delivery is not completion: the sweep sets it when the
+        assignee hands something in and clears it when the user rejects;
+        acceptance closes the item via close_followup (schema v17)."""
+        d = (delivered_date or "").strip()
+        async with self.conn.execute(
+            "UPDATE followups SET delivered_date=?, updated_at=? WHERE id=? AND status='open'",
+            (d, _now(), int(item_id)),
+        ) as cur:
+            ok = cur.rowcount > 0
+        await self.conn.commit()
+        return ok
+
     async def expire_followups(self, cutoff_date: str, closed_date: str = "") -> list[dict]:
         """Auto-close open items untouched since before cutoff_date.
 

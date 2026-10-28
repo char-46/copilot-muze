@@ -412,9 +412,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v14_tasks_lease(conn)
         await _migrate_v15_followups(conn)
         await _migrate_v16_followup_assignee(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '16')")
+        await _migrate_v17_followup_delivered(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '17')")
         await conn.commit()
-        log.info("database created (schema v16)")
+        log.info("database created (schema v17)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -482,6 +483,23 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v16 (followup assignee + due date)")
         version = 16
+    if version < 17:
+        await _migrate_v17_followup_delivered(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '17')")
+        await conn.commit()
+        log.info("database migrated to schema v17 (followup delivered/acceptance state)")
+        version = 17
+
+
+async def _migrate_v17_followup_delivered(conn: aiosqlite.Connection) -> None:
+    """followups.delivered_date: acceptance-before-close for delegated items.
+
+    The assignee handing something in does NOT close the item (交付≠完成,
+    user feedback 2026-10-28: 写完了要验收之后才能结). Delivery sets
+    delivered_date and the item waits for the user's acceptance; acceptance
+    evidence (or /done) closes it; a rejection clears the flag again."""
+    await conn.execute("ALTER TABLE followups ADD COLUMN delivered_date TEXT NOT NULL DEFAULT ''")
+    await conn.commit()
 
 
 async def _migrate_v16_followup_assignee(conn: aiosqlite.Connection) -> None:
