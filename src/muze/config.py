@@ -415,13 +415,17 @@ class ProfilesConfig(BaseModel):
     """Per-conversation identity docs ("who is who"), maintained by the LLM."""
 
     auto: bool = True  # periodically (re)build identity docs for active chats
-    interval_min: float = 360.0  # how often the refresh pass runs
+    interval_min: float = 360.0  # legacy 6h loop; only used when ride_dream=False
+    # Nightly rider (2026-10-28, user: 没必要频繁概括，做梦时捎带完成):
+    # profiles refresh once a night as the last dream pass instead of every
+    # interval_min -- a busy chat is re-summarized at most once per day.
+    ride_dream: bool = True
     active_window_h: float = 48.0  # only conversations active within this window
     # Cost guards (2026-10-28): the pass used to re-summarize all 30 active
     # conversations unconditionally every interval -- ~2200 calls/day, two
     # thirds of the whole LLM bill, mostly regenerating identical docs.
-    # Incremental refresh (only chats with newer messages) is the real fix;
-    # these bound the worst case when EVERY chat is genuinely busy.
+    # Delta-only input + nightly cadence is the real fix; these bound the
+    # worst case when EVERY chat is genuinely busy.
     max_convs: int = 30  # conversations considered per pass
     daily_budget: int = 80  # max LLM profile calls per day (0 = unlimited)
     messages_per_conv: int = 80  # messages fed to the summarizer (was 120)

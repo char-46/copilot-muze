@@ -93,7 +93,7 @@ class FakeLLM:
         self.replies = list(replies)
         self.cfg = self._Cfg()
 
-    async def chat(self, messages, tools=None, on_chunk=None):
+    async def chat(self, messages, tools=None, on_chunk=None, **kw):
         return {"role": "assistant", "content": self.replies.pop(0)}
 
 
@@ -250,7 +250,7 @@ async def test_extract_memories_retires_contradicted(repo):
     class RetireLLM:
         configured = True
 
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **kw):
             return {
                 "content": (
                     '[{"action":"retire","id":1,"content":"旧信息已过时"},'

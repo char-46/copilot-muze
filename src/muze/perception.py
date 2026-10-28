@@ -491,6 +491,7 @@ class ValueScorer:
         # bg_chat short-circuits while the account is faulted (402/quota):
         # the caller catches LLMAccountFault and skips the pass
         msg = await bg_chat(
-            self.llm, [{"role": "user", "content": self.build_prompt(rows)}], role="value"
+            self.llm, [{"role": "user", "content": self.build_prompt(rows)}],
+            role="value", feature="value",
         )
         return self.parse_scores(rows, msg.get("content") or "")

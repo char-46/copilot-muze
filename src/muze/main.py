@@ -1115,10 +1115,17 @@ class App:
                             swept, f"{swept_b / (1 << 30):.2f}GiB",
                         )
                     now = time.time()
-                    if getattr(self.cfg.profiles, "auto", True) and self.llm.configured:
-                        if now - self._last_profile_refresh >= self.cfg.profiles.interval_min * 60:
-                            self._last_profile_refresh = now
-                            await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
+                    # profiles ride the nightly dream by default; the 6h
+                    # loop only fires when the rider is switched off
+                    if (
+                        getattr(self.cfg.profiles, "auto", True)
+                        and not getattr(self.cfg.profiles, "ride_dream", True)
+                        and self.llm.configured
+                        and now - self._last_profile_refresh
+                        >= self.cfg.profiles.interval_min * 60
+                    ):
+                        self._last_profile_refresh = now
+                        await refresh_profiles(self.repo, self.llm, self.cfg, self.chatlog)
                 except Exception:
                     log.exception("maintenance cycle failed")
             await self._touch_seen()  # keep the last-operation time fresh

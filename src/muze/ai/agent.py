@@ -479,7 +479,8 @@ class Agent:
                         "content": AUTO_TITLE_PROMPT,
                     },
                     {"role": "user", "content": seed[:1500]},
-                ]
+                ],
+                feature="title",
             )
             title = (msg.get("content") or "").strip().splitlines()[0].strip()
             title = title.strip("。.「」“”\"' ")[:20]
@@ -879,13 +880,13 @@ class Agent:
                 )
                 if not heartbeat:
                     return await self.llm.chat(
-                        messages, tools=tools or SPEC, on_chunk=on_chunk
+                        messages, tools=tools or SPEC, on_chunk=on_chunk, feature="agent"
                     )
                 stop = asyncio.Event()
                 hb = asyncio.create_task(self._heartbeat(ctx, stop, session))
                 try:
                     return await self.llm.chat(
-                        messages, tools=tools or SPEC, on_chunk=on_chunk
+                        messages, tools=tools or SPEC, on_chunk=on_chunk, feature="agent"
                     )
                 finally:
                     stop.set()
@@ -1221,7 +1222,9 @@ class Agent:
         prompt += "\n聊天记录:\n" + transcript
 
         try:
-            msg = await self.llm.chat([{"role": "user", "content": prompt}])
+            msg = await self.llm.chat(
+                [{"role": "user", "content": prompt}], feature="summary"
+            )
             text = (msg.get("content") or "").strip() or "(总结为空)"
         except Exception as e:
             return CommandOutcome(f"总结失败: {e}", is_error=True)

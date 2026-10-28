@@ -183,24 +183,47 @@ class CostTracker:
 
     Cost is computed AT RECORD TIME (the peak/off-peak factor of the
     moment is baked in), so the ledger stays a plain sum of numbers.
+
+    A second, parallel ledger (day -> FEATURE -> totals, e.g. "dream",
+    "value", "profile", "agent") answers "what is this feature actually
+    costing" -- the per-model ledger cannot (the same model serves many
+    features). It lives in <name>.features.json so the original file's
+    shape is untouched.
     """
+
+    ROW = [0, 0, 0, 0.0, 0, 0.0]  # p_tok, c_tok, img, audio_s, calls, cost
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict[str, list]] = {}
+        self._feat: dict[str, dict[str, list]] = {}
         self._load()
 
-    def _load(self) -> None:
-        if self.path is None or not self.path.is_file():
-            return
-        try:
-            import json
+    @property
+    def feat_path(self) -> Path | None:
+        if self.path is None:
+            return None
+        return self.path.with_name(self.path.stem + ".features" + self.path.suffix)
 
-            self._data = json.loads(self.path.read_text("utf-8"))
-        except Exception:
-            log.warning("cost ledger unreadable; starting fresh", exc_info=True)
-            self._data = {}
+    def _load(self) -> None:
+        if self.path is not None and self.path.is_file():
+            try:
+                import json
+
+                self._data = json.loads(self.path.read_text("utf-8"))
+            except Exception:
+                log.warning("cost ledger unreadable; starting fresh", exc_info=True)
+                self._data = {}
+        fp = self.feat_path
+        if fp is not None and fp.is_file():
+            try:
+                import json
+
+                self._feat = json.loads(fp.read_text("utf-8"))
+            except Exception:
+                log.warning("feature cost ledger unreadable; starting fresh", exc_info=True)
+                self._feat = {}
 
     def _flush(self) -> None:
         if self.path is None:
@@ -212,37 +235,63 @@ class CostTracker:
         tmp.write_text(json.dumps(self._data, ensure_ascii=False), "utf-8")
         tmp.replace(self.path)
 
+    def _flush_feat(self) -> None:
+        fp = self.feat_path
+        if fp is None:
+            return
+        import json
+
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._feat, ensure_ascii=False), "utf-8")
+        tmp.replace(fp)
+
     def record(
-        self, model: str, usage: Usage, cost: float | None, when=None
+        self, model: str, usage: Usage, cost: float | None, when=None, feature: str = ""
     ) -> float | None:
         import datetime as _dt
 
         when = when or _dt.datetime.now()
         day = when.strftime("%Y-%m-%d")
         with self._lock:
-            row = self._data.setdefault(day, {}).setdefault(
-                model, [0, 0, 0, 0.0, 0, 0.0]  # p_tok, c_tok, img, audio_s, calls, cost
-            )
-            row[0] += usage.prompt_tokens
-            row[1] += usage.completion_tokens
-            row[2] += usage.images
-            row[3] += usage.audio_sec
-            row[4] += usage.calls
-            if cost is not None:
-                row[5] = round(row[5] + cost, 6)
+            row = self._data.setdefault(day, {}).setdefault(model, list(self.ROW))
+            self._accum(row, usage, cost)
+            if feature:
+                frow = self._feat.setdefault(day, {}).setdefault(feature, list(self.ROW))
+                self._accum(frow, usage, cost)
+                self._flush_feat()
             self._flush()
             return row[5] or None
+
+    @staticmethod
+    def _accum(row: list, usage: Usage, cost: float | None) -> None:
+        row[0] += usage.prompt_tokens
+        row[1] += usage.completion_tokens
+        row[2] += usage.images
+        row[3] += usage.audio_sec
+        row[4] += usage.calls
+        if cost is not None:
+            row[5] = round(row[5] + cost, 6)
 
     def summary(self, day_prefix: str = "") -> dict[str, list]:
         """Rows for days matching the prefix ('2026-10' = month, '' = all),
         merged per model."""
+        return self._merge(self._data, day_prefix)
+
+    def feature_summary(self, day_prefix: str = "") -> dict[str, list]:
+        """Same shape as summary() but merged per FEATURE (dream/value/
+        profile/agent/...). Days before feature tagging landed are absent."""
+        return self._merge(self._feat, day_prefix)
+
+    @staticmethod
+    def _merge(src: dict[str, dict[str, list]], day_prefix: str) -> dict[str, list]:
         out: dict[str, list] = {}
-        with self._lock:
-            for day, models in sorted(self._data.items()):
+        with threading.Lock():
+            for day, keys in sorted(src.items()):
                 if day_prefix and not day.startswith(day_prefix):
                     continue
-                for m, row in models.items():
-                    acc = out.setdefault(m, [0, 0, 0, 0.0, 0, 0.0])
+                for k, row in keys.items():
+                    acc = out.setdefault(k, [0, 0, 0, 0.0, 0, 0.0])
                     for i, v in enumerate(row):
                         acc[i] += v
         return out

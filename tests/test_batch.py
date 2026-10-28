@@ -113,9 +113,12 @@ class _FakeClient:
 class _Costs:
     def __init__(self):
         self.data = {}
+        self.features = {}
 
-    def record(self, model, usage, cost, when=None):
+    def record(self, model, usage, cost, when=None, feature=""):
         self.data[model] = (usage, cost)
+        if feature:
+            self.features[feature] = self.features.get(feature, 0) + 1
 
 
 def _mk_llm(cfg):
@@ -174,6 +177,8 @@ async def test_submit_poll_apply_roundtrip(tmp_path):
     usage, cost = llm.costs.data["m"]
     assert usage.prompt_tokens == 200 and usage.calls == 2
     assert abs(cost - 200 / 1e6 * 2.0 * 0.5) < 1e-9
+    # the batch job carries its kind as the cost feature tag
+    assert llm.costs.features.get("value") == 1
 
     # a fresh runner resumes polling from the persisted state
     items2 = [

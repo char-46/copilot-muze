@@ -305,6 +305,6 @@ class BatchRunner:
         elif callable(pricing):
             cost = float(pricing(usage, None))
         try:
-            self.llm.costs.record(name, usage, cost)
+            self.llm.costs.record(name, usage, cost, feature=str(job.get("kind") or "batch"))
         except Exception:
             log.debug("batch usage recording failed", exc_info=True)

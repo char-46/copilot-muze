@@ -29,7 +29,7 @@ class SyncLLM:
         self.sync_json = sync_json
         self.digest_prompts: list[str] = []
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **kw):
         prompt = messages[-1]["content"]
         if "待办同步" in prompt:
             return {"role": "assistant", "content": self.sync_json}
@@ -147,7 +147,7 @@ async def test_sync_dedupes_identical_adds(repo):
 
 async def test_sync_garbage_is_best_effort(repo):
     class BadLLM(SyncLLM):
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **kw):
             return {"role": "assistant", "content": "模型幻觉，无 JSON"}
 
     await repo.add_followup("", "事项", "", "dream:d1", "2026-10-20")
@@ -157,7 +157,7 @@ async def test_sync_garbage_is_best_effort(repo):
 
 async def test_run_digest_survives_sync_crash(repo):
     class CrashSyncLLM(SyncLLM):
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **kw):
             if "待办同步" in messages[-1]["content"]:
                 raise RuntimeError("sync blew up")
             return await super().chat(messages)
@@ -403,7 +403,7 @@ class CheckLLM(SyncLLM):
         self.check_json = check_json
         self.check_prompts: list[str] = []
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **kw):
         p = messages[-1]["content"]
         if "完成度检查" in p:
             self.check_prompts.append(p)
@@ -442,7 +442,7 @@ async def test_dream_night_sweeps_before_digest(repo):
     from muze.digest import dream_night
 
     class SweepOnly(CheckLLM):
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **kw):
             p = messages[-1]["content"]
             if "完成度检查" in p:
                 self.check_prompts.append(p)

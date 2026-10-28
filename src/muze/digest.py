@@ -573,7 +573,7 @@ async def run_digest(
     )
     if not llm.configured:
         raise RuntimeError("LLM 未配置，无法做梦（检查 llm.chat.*）")
-    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}], feature="dream")
     report = (msg.get("content") or "").strip() or "(做梦结果为空)"
     if len(report) > 8000:
         report = report[:8000] + "\n...(截断)"
@@ -680,8 +680,25 @@ async def dream_night(
             except Exception:
                 log.exception("monthly rollup %s failed", m)
 
+    # profiles rider (2026-10-28, user: 做梦时捎带完成 profile): the ONE
+    # nightly profile refresh -- delta-only input, budget-capped. Runs even
+    # when there are no digest gaps: a quiet day still needs its profiles.
+    profiled = 0
+    if getattr(cfg.profiles, "ride_dream", True) and getattr(cfg.profiles, "auto", True):
+        try:
+            from muze.profiles import refresh_profiles
+
+            profiled = await refresh_profiles(repo, llm, cfg, chatlog)
+        except LLMAccountFault:
+            pass  # already logged by the fault layer
+        except Exception:
+            log.exception("profile rider failed")
+
     if not reports and not rollups:
-        return f"做梦无缺口（{target} 已存在），周/月报告无待补。"
+        return (
+            f"做梦无缺口（{target} 已存在），周/月报告无待补。"
+            + (f"档案更新 {profiled} 个。" if profiled else "")
+        )
 
     new_memories = 0
     if cfg.digest.extract_memories and llm.configured and reports:
@@ -696,6 +713,7 @@ async def dream_night(
         f"做梦完成：补做 {len(reports)} 天"
         + (f"，完成度检查 {swept} 条变动" if swept else "")
         + (f"，新增 {', '.join(rollups)}" if rollups else "")
+        + (f"，档案更新 {profiled} 个" if profiled else "")
         + f"，新记忆 {new_memories} 条。\n\n"
     )
     if not reports:
@@ -775,7 +793,7 @@ async def _run_rollup(
         scope=scope, key=key, n=len(subs), inputs=inputs, budget=budget,
         owner=await owner_context(repo, cfg),
     )
-    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}], feature="rollup")
     report = (msg.get("content") or "").strip() or f"({scope}报告为空)"
     if len(report) > 6000:
         report = report[:6000] + "\n...(截断)"
@@ -908,7 +926,7 @@ async def sync_followups(
         directives=directives or "(无)",
         maxn=cfg.digest.max_memories_per_night,
     )
-    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}], feature="followup-sync")
     raw = (msg.get("content") or "").strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
@@ -1083,7 +1101,7 @@ async def check_followups(
     prompt = FOLLOWUP_CHECK_PROMPT.format(
         date=date, blocks="\n\n".join(blocks)[:12000]
     )
-    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}], feature="followup-check")
     raw = (msg.get("content") or "").strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
@@ -1154,7 +1172,7 @@ async def extract_memories(
         existing=existing_txt, report=report[:4000], date=date,
         maxn=cfg.digest.max_memories_per_night,
     )
-    msg = await bg_chat(llm, [{"role": "user", "content": prompt}])
+    msg = await bg_chat(llm, [{"role": "user", "content": prompt}], feature="memory")
     raw = (msg.get("content") or "").strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:

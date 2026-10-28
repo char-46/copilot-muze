@@ -41,7 +41,7 @@ class FakeLLM:
                 out.append((n, e))
         return out
 
-    async def chat(self, messages, tools=None, on_chunk=None, role="chat"):
+    async def chat(self, messages, tools=None, on_chunk=None, role="chat", **kw):
         return {"role": "assistant", "content": self.reply}
 
     async def vision_describe(self, path, question):

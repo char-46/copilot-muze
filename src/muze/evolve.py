@@ -77,7 +77,7 @@ async def evolve_if_due(repo, llm, cfg, chatlog=None, *, force: bool = False) ->
         maxn=12,
     )
     try:
-        msg = await llm.chat([{"role": "user", "content": prompt}])
+        msg = await llm.chat([{"role": "user", "content": prompt}], feature="evolve")
     except Exception as e:
         log.warning("evolve LLM call failed (will retry next boot): %s", e)
         return 0

@@ -42,13 +42,18 @@ def _transcript(rows: list[dict]) -> str:
 async def refresh_profiles(repo, llm, cfg, chatlog, *, since_h: float | None = None) -> int:
     """(Re)build identity docs for recently-active conversations.
 
-    INCREMENTAL (cost fix 2026-10-28): a conversation is only re-summarized
-    when it actually has messages NEWER than its stored doc. Previously
-    every pass re-summarized all 30 active conversations unconditionally --
-    ~2200 LLM calls/day, two thirds of all spend, mostly regenerating
-    byte-identical docs. Also: a hard failure (e.g. HTTP 402 insufficient
-    balance) aborts the whole pass instead of retrying per-conversation and
-    burning the quota on errors."""
+    Cost shape (user directions 2026-10-28: 没必要频繁概括 / 做梦时捎带 /
+    老的profile+新消息应该足够):
+
+    - DELTA INPUT: an existing doc is merged with ONLY the messages that
+      arrived since it was written (newest-N capped), never a re-read of
+      the whole window -- the call folds in genuinely new material only;
+    - ONCE A NIGHT: the refresh rides the nightly dream (profiles.
+      ride_dream=True); the old 6-hour maintenance loop trigger is off,
+      so a busy chat is re-summarized at most once a day;
+    - guards kept: daily call budget, and an account-level failure (402/
+      quota) aborts the pass instead of retrying per-conversation.
+    """
     if not getattr(cfg.profiles, "auto", True) or not llm.configured:
         return 0
     window = float(since_h if since_h is not None else cfg.profiles.active_window_h)
@@ -65,33 +70,46 @@ async def refresh_profiles(repo, llm, cfg, chatlog, *, since_h: float | None = N
             return 0
     done = 0
     skipped = 0
+    mpc = int(cfg.profiles.messages_per_conv)
     for conv in convs:
         scene, peer = conv["scene"], conv["peer_id"]
-        rows = await repo.messages_between(
-            scene, peer, start, end, limit=int(cfg.profiles.messages_per_conv)
-        )
-        if not rows:
-            continue
-        transcript = _transcript(rows)
-        if len(transcript) < 20:
-            continue
         subject = f"{scene}/{peer}"
         existing = await repo.get_profile(subject)
         prior = (existing or {}).get("content", "")
-        # nothing new since the doc was written -> keep it (the whole point:
-        # a quiet chat must not be re-summarized every single pass)
-        newest_msg = max(int(r.get("time") or 0) for r in rows)
-        if prior and existing and newest_msg <= float(existing.get("updated_at") or 0):
-            skipped += 1
+        prior_ts = float((existing or {}).get("updated_at") or 0)
+        if prior and prior_ts > 0:
+            # DELTA ONLY (user direction 2026-10-28: 老的profile+新消息应该
+            # 足够): the doc plus messages that arrived SINCE the doc. No
+            # window re-reading, no re-summarizing what the doc already
+            # states -- the call only ever merges genuinely new material.
+            rows = await repo.messages_between(scene, peer, int(prior_ts) + 1, end, limit=mpc)
+            if not rows:
+                # nothing new since the doc -> keep it (the whole point: a
+                # quiet chat must not be re-summarized at all)
+                skipped += 1
+                continue
+            if sum(len((r.get("text_content") or "").strip()) for r in rows) < 20:
+                # tiny delta: not worth a call yet -- it stays pending and
+                # folds into a later pass once more has accumulated
+                continue
+            delta_note = "（自档案上次归纳以来的新消息）"
+        else:
+            # bootstrap: no doc yet -> the recent window seeds the first one
+            rows = await repo.messages_between(scene, peer, start, end, limit=mpc)
+            delta_note = ""
+        transcript = _transcript(rows)
+        if len(transcript) < 20:
+            # bootstrap only: a conversation with no substance yet
             continue
         user = f"会话: {subject}（{conv.get('name') or '未命名'}）\n"
         if prior:
             user += f"\n现有档案:\n{prior}\n"
-        user += f"\n最近聊天记录:\n{transcript}"
+        user += f"\n聊天记录{delta_note}:\n{transcript}"
         try:
             msg = await bg_chat(
                 llm,
                 [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": user}],
+                feature="profile",
             )
             content = (msg.get("content") or "").strip()
         except LLMAccountFault as e:

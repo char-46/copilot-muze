@@ -31,7 +31,7 @@ class FakeLLM:
     def __init__(self):
         self.calls: list[str] = []
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, **kw):
         prompt = messages[-1]["content"]
         if "待办同步" in prompt:
             # structured follow-up sync pass (alpha.138): nothing to change
@@ -336,7 +336,7 @@ async def test_memory_crud_and_retire(repo):
 
 async def test_extract_memories_bad_json(repo):
     class BadLLM(FakeLLM):
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, **kw):
             return {"content": "not json at all"}
 
     n = await extract_memories(
