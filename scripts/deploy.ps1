@@ -69,14 +69,20 @@ if ($InstallTask) {
     # incident 2026-10-23). -Background detaches, redirects daemon logs and
     # verifies startup before the script exits.
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`" -Background"
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$startScript`" -Background"
+    # S4U principal: the task runs NON-INTERACTIVE -- a console-app action
+    # (powershell) would otherwise pop a real console window on the user's
+    # desktop every time it fires (the watch fires every 5 minutes; user
+    # feedback 2026-10-28: windows interrupt gaming/work). -WindowStyle
+    # Hidden additionally stops any console flash on manual runs.
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Settings $settings -Force | Out-Null
-    Write-Ok "scheduled task '$TaskName' registered: muze starts at logon (start.ps1 -Background)"
+        -Settings $settings -Principal $principal -Force | Out-Null
+    Write-Ok "scheduled task '$TaskName' registered (S4U, windowless): muze starts at logon (start.ps1 -Background)"
     # watchdog: start.ps1 is idempotent ("already running" -> exit 0), so a
     # 5-minute repeat revives a killed/crashed daemon even though the user
     # session (and therefore the logon trigger) never fires again
@@ -84,8 +90,8 @@ if ($InstallTask) {
         -RepetitionInterval (New-TimeSpan -Minutes 5) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
     Register-ScheduledTask -TaskName "$TaskName-watch" -Action $action `
-        -Trigger $watchTrigger -Settings $settings -Force | Out-Null
-    Write-Ok "scheduled task '$TaskName-watch' registered: every 5 min, starts muze if it is down"
+        -Trigger $watchTrigger -Settings $settings -Principal $principal -Force | Out-Null
+    Write-Ok "scheduled task '$TaskName-watch' registered (S4U, windowless): every 5 min, starts muze if it is down"
     Write-Step "remove them later with: Unregister-ScheduledTask -TaskName $TaskName,'$TaskName-watch' -Confirm:`$false"
 }
 

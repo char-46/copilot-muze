@@ -1035,6 +1035,9 @@ class ControlService:
         back -- the box's muze-autostart-watch then finishes the job."""
         group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        # never pop a console window on the user's desktop (they may be
+        # gaming/working): consoleless child, output still goes to the log
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         argv = [
             "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", str(script), *[str(a) for a in args],
@@ -1045,10 +1048,12 @@ class ControlService:
             kw["stderr"] = subprocess.STDOUT
             if breakaway:
                 try:
-                    return subprocess.Popen(argv, creationflags=group | breakaway, **kw)
+                    return subprocess.Popen(
+                        argv, creationflags=group | breakaway | no_window, **kw
+                    )
                 except OSError:
                     pass  # job without BREAKAWAY_OK (pre-alpha.144 daemon)
-            return subprocess.Popen(argv, creationflags=group, **kw)
+            return subprocess.Popen(argv, creationflags=group | no_window, **kw)
 
     async def _watch_script(self, name: str, proc, log_path: Path) -> None:
         """Best-effort completion notice with the log tail. If the script
@@ -1144,16 +1149,23 @@ class ControlService:
         # via the 5-minute autostart watch). The Task Scheduler owns the
         # process; nothing the service does can kill it.
         try:
-            wrapper = d / "fullrestart-run.cmd"
+            # wscript launcher with window style 0: the scheduled task's
+            # console app must NEVER pop a window on the user's desktop
+            # (user feedback 2026-10-28: "计划任务不要创建新的控制台窗口").
+            # wscript itself is a GUI-subsystem binary -- no console at all,
+            # no flash, regardless of the task's principal.
+            wrapper = d / "fullrestart-run.vbs"
             wrapper.write_text(
-                f'@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass '
-                f'-File "{script}" -Restart >> "{log_path}" 2>&1\r\n',
+                'CreateObject("WScript.Shell").Run '
+                '"cmd /c powershell -NoProfile -ExecutionPolicy Bypass '
+                f'-File ""{script}"" -Restart >> ""{log_path}"" 2>&1", 0, False\n',
                 encoding="ascii", errors="replace",
             )
             st = time.strftime("%H:%M", time.localtime(time.time() + 120))
             cr = subprocess.run(
                 ["schtasks", "/Create", "/TN", "muze-fullrestart", "/F",
-                 "/SC", "ONCE", "/ST", st, "/TR", str(wrapper)],
+                 "/SC", "ONCE", "/ST", st,
+                 "/TR", f'wscript.exe "{wrapper}"'],
                 capture_output=True, text=True, timeout=20,
             )
             if cr.returncode == 0:
