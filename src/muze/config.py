@@ -417,7 +417,14 @@ class ProfilesConfig(BaseModel):
     auto: bool = True  # periodically (re)build identity docs for active chats
     interval_min: float = 360.0  # how often the refresh pass runs
     active_window_h: float = 48.0  # only conversations active within this window
-    messages_per_conv: int = 120  # messages fed to the summarizer
+    # Cost guards (2026-10-28): the pass used to re-summarize all 30 active
+    # conversations unconditionally every interval -- ~2200 calls/day, two
+    # thirds of the whole LLM bill, mostly regenerating identical docs.
+    # Incremental refresh (only chats with newer messages) is the real fix;
+    # these bound the worst case when EVERY chat is genuinely busy.
+    max_convs: int = 30  # conversations considered per pass
+    daily_budget: int = 80  # max LLM profile calls per day (0 = unlimited)
+    messages_per_conv: int = 80  # messages fed to the summarizer (was 120)
     max_chars: int = 1200  # max length of one identity doc
     inject: bool = True  # add a compact "who is who" index to the system prompt
     inject_chars: int = 80  # per-profile snippet injected

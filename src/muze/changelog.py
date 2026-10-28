@@ -14,6 +14,14 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.158",
+        "date": "2026-10-28",
+        "changes": [
+            "身份档案不再每次重建：只有会话有新消息才重新生成（此前每轮无条件重写全部 30 个会话，约占全部开销三分之二），并加每日调用预算与失败熔断。",
+            "LLM 账户故障（402/余额不足/配额）统一层：判定只在 muze/ai/llm.py，后台链路统一走 bg_chat 短路跳过，不再各功能各自判 402。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.157",
         "date": "2026-10-28",
         "changes": [

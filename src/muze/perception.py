@@ -24,7 +24,7 @@ from pathlib import Path
 
 import httpx
 
-from muze.ai.llm import LLMClient
+from muze.ai.llm import LLMClient, bg_chat
 from muze.config import AsrConfig, OcrConfig, ValueConfig
 
 log = logging.getLogger("muze.perception")
@@ -488,7 +488,9 @@ class ValueScorer:
         NOT returned (caller may re-judge them later)."""
         if not rows:
             return []
-        msg = await self.llm.chat(
-            [{"role": "user", "content": self.build_prompt(rows)}], role="value"
+        # bg_chat short-circuits while the account is faulted (402/quota):
+        # the caller catches LLMAccountFault and skips the pass
+        msg = await bg_chat(
+            self.llm, [{"role": "user", "content": self.build_prompt(rows)}], role="value"
         )
         return self.parse_scores(rows, msg.get("content") or "")
