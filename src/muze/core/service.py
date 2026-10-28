@@ -824,6 +824,15 @@ class ControlService:
 
         sub = (args[0].lower() if args else "").strip()
 
+        # user-initiated: treat this as a fresh chance for the account. A
+        # stale 402 gate must not block a dream after a top-up (live
+        # incident 2026-10-28: balance landed at ~15:31, /dream still
+        # refused until 16:00). If the account is still dead, the first
+        # call fails and the gate re-arms immediately.
+        if self.agent is not None and getattr(self.agent.llm, "faulted", False):
+            self.agent.llm.clear_fault()
+            self.chatlog.log.info("DREAM      | fault gate cleared by user request")
+
         if sub == "morning":
             from muze.digest import morning_report
 
@@ -1663,6 +1672,10 @@ class ControlService:
         llm = self.agent.llm if self.agent is not None else None
         if llm is None:
             return CommandOutcome.err("LLM 未装配")
+        # the user is checking the account after a top-up: let the next
+        # background pass try again instead of waiting out the cooldown
+        if getattr(llm, "faulted", False):
+            llm.clear_fault()
         entries = llm._entries()
         names = [a for a in args if a in entries] or list(entries)
         if not names:
