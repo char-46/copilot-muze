@@ -23,7 +23,7 @@ log = logging.getLogger("muze.ai")
 # the controller's session but are routed to the controller for approval in
 # any other conversation (see ControlService.requires_approval).
 # send_message routes itself via ControlService.request_send.
-WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update", "followup_add", "followup_close"}
+WRITE_TOOLS = {"schedule_task", "remember", "memory_update", "memory_delete", "profile_update", "followup_add", "followup_close", "capability_wish"}
 
 SPEC = [
     {
@@ -574,6 +574,27 @@ SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "capability_wish",
+            "description": (
+                "上报能力缺口——完成某项工作时发现缺某个能力，或现有工具能做但实现方式过于曲折"
+                "（多次工具调用拼凑、效果勉强、明显是奇技淫巧）时调用。写清：缺什么能力(title)、"
+                "当时想完成什么(context)、现在是怎么绕的(workaround)。重复缺口自动去重；"
+                "维护者会定期审这张清单决定加新能力还是改进现有能力。这不影响你当前任务，先干活再上报。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "缺的能力（一句话，如：本地音频剪辑）"},
+                    "context": {"type": "string", "description": "当时想完成什么任务"},
+                    "workaround": {"type": "string", "description": "现在用什么方式绕过去的（没有就空）"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "followup_close",
             "description": (
                 "关闭一条跟踪待办——这就是\"完成信号\"。用户说某事已经完成/搞定了/不用再跟了"
@@ -666,6 +687,8 @@ class ToolRunner:
             return f"更新身份档案 [{args.get('subject', '')}]: {str(args.get('content', ''))[:120]}"
         if name == "followup_add":
             return f"登记待办: {str(args.get('title', ''))[:120]}"
+        if name == "capability_wish":
+            return f"上报能力缺口: {str(args.get('title', ''))[:120]}"
         if name == "followup_close":
             st = args.get("status") or "done"
             return f"关闭待办 {'#' + str(args.get('id')) if args.get('id') else str(args.get('query', ''))[:60]} ({st}): {str(args.get('note', ''))[:80]}"
@@ -1500,6 +1523,24 @@ class ToolRunner:
         if assignee:
             hint = f"已入待办（负责人 {assignee}，等TA交付），每晚做梦前自动检查完成度"
         return {"added": True, "title": title, "assignee": assignee, "due_date": due, "hint": hint}
+
+    async def t_capability_wish(self, args: dict) -> dict:
+        title = str(args.get("title", "") or "").strip()
+        if len(title) < 4:
+            return {"error": "title 太短（缺的能力，一句话）"}
+        wid = await self.repo.add_wish(
+            title,
+            str(args.get("context", "") or ""),
+            str(args.get("workaround", "") or ""),
+            source=f"{self.ctx.scene}/{self.ctx.peer_id}" if getattr(self, "ctx", None) else "",
+        )
+        if wid is None:
+            return {"added": False, "hint": "该能力缺口已在清单里（去重）"}
+        log.info("WISH       | + #%s %s (ctx: %.80s)", wid, title, str(args.get("context", "")))
+        return {
+            "added": True, "title": title,
+            "hint": "已记入能力需求清单；维护者会定期审（新增能力/改进现有/拒绝），不影响当前任务",
+        }
 
     async def t_followup_close(self, args: dict) -> dict:
         from muze.digest import numbered_followups

@@ -1072,6 +1072,70 @@ class ControlService:
         cands = "\n".join(f"#{nos[r['id']]} {r['title']}" for r in rows[:8])
         return CommandOutcome.err(f"「{q}」匹配 {len(rows)} 条，请用序号:\n{cands}")
 
+    @slash(
+        "evolve", "/evolve",
+        "手动触发自进化：对照变更日志修自己的习惯记忆（正常随版本启动自动跑一次）", write=True,
+    )
+    async def cmd_evolve(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        from muze.evolve import evolve_if_due
+
+        changed = await evolve_if_due(self.repo, self.llm, self.cfg, self.chatlog, force=True)
+        return CommandOutcome(f"自进化完成：{changed} 条记忆/习惯变更（0 = 本次没有要改的）")
+
+    @slash(
+        "wishes", "/wishes [close <序号> [resolved|rejected] | all]",
+        "能力需求清单（模型工作中自报的缺口；维护时审：新增能力/改进现有/拒绝）",
+    )
+    async def cmd_wishes(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        if args and args[0].lower() == "close":
+            if len(args) < 2 or not args[1].isdigit():
+                return CommandOutcome.err("用法: /wishes close <序号> [resolved|rejected]")
+            st = args[2].lower() if len(args) > 2 else "resolved"
+            if st not in ("resolved", "rejected"):
+                return CommandOutcome.err("状态只能是 resolved（已实现/已解决）或 rejected（不做）")
+            rows = await self.repo.list_wishes(status="open", limit=100)
+            target = rows[int(args[1]) - 1] if 1 <= int(args[1]) <= len(rows) else None
+            if not target:
+                return CommandOutcome.err(f"序号 {args[1]} 不存在（/wishes 看当前序号）")
+            if not await self.repo.close_wish(target["id"], status=st):
+                return CommandOutcome.err(f"序号 {args[1]} 不存在或已关闭")
+            return CommandOutcome(
+                f"已关闭能力需求: {target['title']}\n（{ '已解决' if st == 'resolved' else '拒绝（不做）' }）"
+            )
+        status = "open"
+        if args and args[0].lower() == "all":
+            status = ""
+        if status:
+            rows = await self.repo.list_wishes(status=status, limit=50)
+        else:
+            rows = sorted(
+                await self.repo.list_wishes(status="open", limit=50)
+                + await self.repo.list_wishes(status="resolved", limit=20)
+                + await self.repo.list_wishes(status="rejected", limit=20),
+                key=lambda r: r["id"],
+            )
+        if not rows:
+            return CommandOutcome("能力需求清单为空：模型还没上报过缺口")
+        lines = []
+        n_open = 0
+        for i, r in enumerate(rows, 1):  # dense numbering, stable id order
+            if r["status"] == "open":
+                n_open += 1
+            tag = {"open": "", "resolved": "✅已解决", "rejected": "❌拒绝"}.get(r["status"], r["status"])
+            head = f"#{i} {r['title']}" + (f"（{tag}）" if tag else "")
+            body = []
+            if r["context"]:
+                body.append(f"场景: {str(r['context'])[:80]}")
+            if r["workaround"]:
+                body.append(f"现绕法: {str(r['workaround'])[:80]}")
+            lines.append(head + ("\n" + "\n".join(body) if body else ""))
+        tail = "/wishes close <序号> [resolved|rejected] 关闭"
+        return CommandOutcome(
+            f"# 能力需求清单（未结 {n_open} 条）\n\n" + "\n\n---\n\n".join(lines) + f"\n\n---\n\n{tail}",
+            forward_nodes=[f"能力需求清单（未结 {n_open} 条）"]
+            + [ln.replace("\n", " · ") for ln in lines] + [tail],
+        )
+
     # ------------------------------------------------------- script runner
     SCRIPT_TIMEOUT_SEC = 600
 
