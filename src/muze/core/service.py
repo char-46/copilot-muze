@@ -948,18 +948,35 @@ class ControlService:
         from muze.digest import numbered_followups
 
         if args and args[0].lower() == "add":
-            title = " ".join(args[1:]).strip()
+            from muze.digest import parse_due_date as _parse_due
+
+            rest = args[1:]
+            assignee = ""
+            if rest and rest[0].startswith("@") and len(rest[0]) > 1:
+                assignee = rest[0][1:].strip()
+                rest = rest[1:]
+            title = " ".join(rest).strip()
+            due = ""
+            m = re.search(r"(?:^|\s)due[:：]\s*(\S+)", title, re.IGNORECASE)
+            if m:
+                due = _parse_due(m.group(1))
+                title = (title[: m.start()] + " " + title[m.end():]).strip()
             if len(title) < 4:
                 return CommandOutcome.err(
-                    "用法: /todo add <事项>（写清 谁+什么事+时限，如：/todo add 10月30日15:30 学明楼307 活动写稿）"
+                    "用法: /todo add [@负责人] <事项> [due:10-30]"
+                    "（如：/todo add @小王 10-30前交推送初稿 due:10-30；自办事项不带 @）"
                 )
             fid = await self.repo.add_followup(
-                "", title, "", source="user", opened_date=_local_date()
+                "", title, "", source="user", opened_date=_local_date(),
+                assignee=assignee, due_date=due,
             )
             if fid is None:
                 return CommandOutcome.err("已有一模一样的未结待办，不重复登记")
+            who = f"（负责人 {assignee}，等TA交付）" if assignee else ""
+            when = f"，截止 {due}" if due else ""
             return CommandOutcome(
-                f"已登记待办: {title}\n（/done <序号> 完成后关闭；每晚做梦前自动检查完成度）"
+                f"已登记待办{when}: {title}{who}"
+                "\n（/done <序号> 完成后关闭；每晚做梦前自动检查完成度）"
             )
         if args and args[0].lower() in ("drop", "del", "rm", "off"):
             if len(args) < 2 or not args[1].isdigit():
@@ -979,11 +996,23 @@ class ControlService:
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
         md_items: list[str] = []
         node_items: list[str] = []
+        from muze.digest import followup_due_tag
+
+        today = _local_date()
+        delegated = 0
         # dense display numbering (#1..#N over the open list, stable open
         # order) -- raw DB ids go sparse after closes and read badly
         for n, r in numbered_followups(rows)[:20]:
             subj = r["subject"] or "全局"
             bits = []
+            who = ""
+            if r.get("assignee"):
+                delegated += 1
+                who = f" → {r['assignee']}"
+                bits.append(f"负责人 {r['assignee']}（等交付）")
+            due = followup_due_tag(r, today=today)
+            if due:
+                bits.append(due)
             if r["detail"]:
                 bits.append(str(r["detail"])[:60])
             bits.append(f"开于 {r['opened_date']}")
@@ -991,12 +1020,14 @@ class ControlService:
             if last != r["opened_date"]:
                 bits.append(f"最后动静 {last}")
             meta = " · ".join(bits)
-            md_items.append(f"**#{n}** `{subj}`\n\n{r['title']}\n\n{meta}")
-            node_items.append(f"#{n} [{subj}] {r['title']}\n{meta}")
-        tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add <事项> 登记"
+            md_items.append(f"**#{n}** `{subj}`{who}\n\n{r['title']}\n\n{meta}")
+            node_items.append(f"#{n} [{subj}]{who} {r['title']}\n{meta}")
+        n_all = len(rows)
+        head_plain = f"未结待办（{n_all} 条" + (f"，{delegated} 条已布置给他人" if delegated else "") + "）"
+        tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add [@负责人] <事项> [due:10-30] 登记"
         return CommandOutcome(
-            f"# 未结待办（{len(rows)} 条）\n\n" + "\n\n---\n\n".join(md_items) + f"\n\n---\n\n{tail}",
-            forward_nodes=[f"未结待办（{len(rows)} 条）"] + node_items + [tail],
+            f"# {head_plain}\n\n" + "\n\n---\n\n".join(md_items) + f"\n\n---\n\n{tail}",
+            forward_nodes=[head_plain] + node_items + [tail],
         )
 
     @slash(

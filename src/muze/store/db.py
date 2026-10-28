@@ -411,9 +411,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v13_media_asr_ts(conn)
         await _migrate_v14_tasks_lease(conn)
         await _migrate_v15_followups(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '15')")
+        await _migrate_v16_followup_assignee(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '16')")
         await conn.commit()
-        log.info("database created (schema v15)")
+        log.info("database created (schema v16)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -475,6 +476,25 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v15 (structured follow-up tracking)")
         version = 15
+    if version < 16:
+        await _migrate_v16_followup_assignee(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '16')")
+        await conn.commit()
+        log.info("database migrated to schema v16 (followup assignee + due date)")
+        version = 16
+
+
+async def _migrate_v16_followup_assignee(conn: aiosqlite.Connection) -> None:
+    """followups.assignee/due_date: tasks the user delegates DOWNWARD.
+
+    The user (a part-time counselor) hands tasks to student cadres all day;
+    those are the USER's open items too -- they stay tracked until the
+    assignee delivers. assignee='' means the user does it themself; a name
+    means delegated (催办 target). due_date powers overdue flags and the
+    morning digest's deadline section (user request 2026-10-28)."""
+    await conn.execute("ALTER TABLE followups ADD COLUMN assignee TEXT NOT NULL DEFAULT ''")
+    await conn.execute("ALTER TABLE followups ADD COLUMN due_date TEXT NOT NULL DEFAULT ''")
+    await conn.commit()
 
 
 async def _migrate_v15_followups(conn: aiosqlite.Connection) -> None:

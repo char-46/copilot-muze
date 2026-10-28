@@ -109,7 +109,7 @@ ROLLUP_PROMPT = """你是个人 QQ copilot 的"层级做梦"模块。以下是 {
 FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根据今日做梦报告与现有待办表，输出需要执行的状态变更。
 
 # 规则（从严）
-- add：只加"可行动"的新事项（等被控号回应、约定了时限、承诺/风险）；单纯提及、无需行动的不加。标题 ≤40 字，写清 谁+什么事+时限（如有）。
+- add：只加"可行动"的新事项（等被控号回应、约定了时限、承诺/风险、**用户布置给别人去办的事**）；单纯提及、无需行动的不加。标题 ≤40 字，写清 谁+什么事+时限（如有）；布置给别人的 assignee 填受托人，有明确截止日的填 due_date（YYYY-MM-DD）。
 - close：仅当报告中有**明确证据**该事项已解决或失效（写明依据）；不要因为"挂了几天"就关闭——过期由系统自动处理，用户也会手动关闭。status 用 done（已完成）或 dropped（已失效/不用跟）。
 - keep：今天有新进展但仍未了结的事项（系统会刷新其动静日期）。
 - 拿不准的就不要动它。
@@ -121,7 +121,7 @@ FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根�
 {report}
 
 # 输出（严格 JSON 数组，不要其他文字；最多 {maxn} 条）
-[{{"action":"add","subject":"group/123 或 QQ号 或 空串","title":"…","detail":"…"}},
+[{{"action":"add","subject":"group/123 或 QQ号 或 空串","title":"…","detail":"…","assignee":"布置给谁（用户自己办则空）","due_date":"YYYY-MM-DD 或空"}},
  {{"action":"close","id":1,"status":"done","note":"依据"}},
  {{"action":"keep","id":2}}]"""
 
@@ -348,6 +348,35 @@ def followup_no_map(items: list[dict]) -> dict[int, int]:
     return {n: r["id"] for n, r in numbered_followups(items)}
 
 
+def parse_due_date(s: str, today: str | None = None) -> str:
+    """'2026-10-30' / '10-30' / '10.30' / '10月30日15:30' -> 'YYYY-MM-DD'.
+
+    Missing-year forms borrow the current year. Returns '' when nothing
+    parses -- callers keep the deadline inside the title text then."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    today = today or local_date()
+    m = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.match(r"^(\d{1,2})[-/.月](\d{1,2})", s)
+    if m:
+        return f"{today[:4]}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return ""
+
+
+def followup_due_tag(r: dict, today: str | None = None) -> str:
+    """'' | '截止 10-30' | '截止 10-30 ⚠已逾期' -- due dates are plain
+    YYYY-MM-DD strings so lexicographic compare == chronological."""
+    due = str(r.get("due_date") or "").strip()
+    if not due:
+        return ""
+    if (today or local_date()) >= due:
+        return f"截止 {due} ⚠已逾期"
+    return f"截止 {due}"
+
+
 def _format_followups(items: list[dict]) -> str:
     if not items:
         return "(无)"
@@ -355,6 +384,11 @@ def _format_followups(items: list[dict]) -> str:
     for n, r in numbered_followups(items):
         subj = r.get("subject") or "全局"
         line = f"- #{n} [{subj}] {r['title']}"
+        if r.get("assignee"):
+            line += f" →负责人:{r['assignee']}"
+        due = followup_due_tag(r)
+        if due:
+            line += f"（{due}）"
         if r.get("detail"):
             line += f"（{str(r['detail'])[:60]}）"
         last = r.get("last_date") or r.get("opened_date") or "?"
@@ -825,6 +859,8 @@ async def sync_followups(
                 str(item.get("title", "") or "").strip(),
                 str(item.get("detail", "") or ""),
                 source=f"dream:{date}", opened_date=date,
+                assignee=str(item.get("assignee", "") or ""),
+                due_date=str(item.get("due_date", "") or "")[:10],
             )
             if fid is not None:
                 changed += 1
@@ -849,9 +885,9 @@ async def sync_followups(
 FOLLOWUP_CHECK_PROMPT = """你是个人 QQ copilot 的"待办完成度检查"模块。凌晨漫游已拉全当日消息，下面是每条未结待办与它的【当日证据】（会话原文摘录）。逐条判断它当天是否有完成/失效/新进展。
 
 # 规则（从严）
-- close done：证据中有**明确完成语句**（用户或对方说了"交了/办好了/完成了/通过了"这类话）。
+- close done：证据中有**明确完成/交付语句**——用户自己办的，用户说了算完成；**有负责人的，负责人（或用户确认）说交付/交了/发出来了**即算完成。
 - close dropped：证据明确表明事项取消/不再需要跟。
-- touch：有新进展但仍未了结。
+- touch：有新进展但仍未了结（含负责人承诺在做、提交了初稿待审）。
 - 证据不足或无证据：**不要输出该条**。宁可漏判，不可臆造——依据必须来自消息原文。
 - #N 是序号，输出时原样引用。
 
@@ -945,8 +981,14 @@ async def check_followups(
                 break
         evidence = "\n".join(lines[:40]) or "(当日无相关消息)"
         subj = r.get("subject") or "全局"
+        head = f"## #{no} [{subj}] {r['title']}"
+        if r.get("assignee"):
+            head += f" →负责人:{r['assignee']}"
+        due = followup_due_tag(r, today=date)
+        if due:
+            head += f"（{due}）"
         blocks.append(
-            f"## #{no} [{subj}] {r['title']}"
+            head
             + (f"（{str(r.get('detail') or '')[:60]}）" if r.get("detail") else "")
             + f"\n开于 {r.get('opened_date')}，最后动静 {r.get('last_date') or r.get('opened_date')}"
             + f"\n【当日证据】\n{evidence[:1500]}"
