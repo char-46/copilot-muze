@@ -201,7 +201,12 @@ async def test_todo_and_done_commands(svc):
     assert "已完成" in out.text and "交材料" in out.text
     assert len(await repo.list_followups()) == 1
 
-    out = await service.run_command(f"done {f1}", ctx)  # already closed
+    # digits are DENSE numbers: after the close the survivor renumbers #1
+    out = await service.run_command("todo", ctx)
+    assert "#1" in out.text and "回张三消息" in out.text and "#2" not in out.text
+    out = await service.run_command("done 1", ctx)
+    assert not out.is_error and "回张三消息" in out.text
+    out = await service.run_command("done 5", ctx)  # out of range -> error
     assert out.is_error
 
     await repo.add_followup("", "材料A", "", "dream:d1", "2026-10-20")
@@ -212,6 +217,33 @@ async def test_todo_and_done_commands(svc):
     out = await service.run_command("todo drop 2", ctx)
     assert "不再跟踪" in out.text
     assert await repo.list_followups(status="dropped")
+
+
+async def test_todo_add_registers_user_task(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    out = await service.run_command(
+        "todo add 10月30日15:30 学明楼307 企业家进高校前沿大课堂 活动写稿", ctx
+    )
+    assert not out.is_error and "已登记" in out.text
+    rows = await repo.list_followups()
+    assert len(rows) == 1 and "学明楼307" in rows[0]["title"] and rows[0]["source"] == "user"
+    out = await service.run_command("todo add 10月30日15:30 学明楼307 企业家进高校前沿大课堂 活动写稿", ctx)
+    assert out.is_error  # identical open item -> dedupe
+    out = await service.run_command("todo add 短", ctx)
+    assert out.is_error  # too short to be actionable
+
+
+async def test_done_keyword_candidates_use_dense_nos(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup("", "材料A", "", "dream:d1", "2026-10-20")  # db 1 -> #1
+    f2 = await repo.add_followup("", "中间被关", "", "dream:d1", "2026-10-20")
+    await repo.close_followup(f2, status="done", closed_date="2026-10-21")
+    await repo.add_followup("", "材料B", "", "dream:d1", "2026-10-22")  # db 3 -> #2
+    out = await service.run_command("done 材料", ctx)
+    assert out.is_error
+    assert "#1" in out.text and "#2" in out.text and "#3" not in out.text  # dense, no holes
 
 
 # ------------------------------------------------- /dream <date> backfills
@@ -327,6 +359,150 @@ async def test_todo_builds_ordered_item_per_node_forward(svc):
     got_ids = [int(n.split(" ", 1)[0][1:]) for n in items]
     assert got_ids == sorted([f1, f2, f3])  # ascending id = stable opening order
     assert "**#" in out.text and "# 未结待办" in out.text  # markdown for the image
+
+
+# --------------------------------------------- dense numbering (2026-10-28)
+async def test_repo_orders_by_open_order_even_after_touch(repo):
+    a = await repo.add_followup("", "A事", "", "dream:d1", "2026-10-01")
+    b = await repo.add_followup("", "B事", "", "dream:d1", "2026-10-02")
+    await repo.touch_followup(b, "2026-10-30")  # bumps updated_at
+    assert [r["id"] for r in await repo.list_followups()] == [a, b]  # still open order
+
+
+async def test_format_followups_dense_after_close(repo):
+    from muze.digest import _format_followups, numbered_followups
+
+    await repo.add_followup("", "事项甲", "", "dream:d1", "2026-10-20")
+    f2 = await repo.add_followup("", "事项乙", "", "dream:d1", "2026-10-20")
+    await repo.add_followup("", "事项丙", "", "dream:d1", "2026-10-20")
+    await repo.close_followup(f2, status="done", closed_date="2026-10-21")
+    rows = await repo.list_followups()
+    assert [n for n, _ in numbered_followups(rows)] == [1, 2]  # no holes
+    txt = _format_followups(rows)
+    assert "#1" in txt and "#2" in txt and "#3" not in txt
+    assert "事项甲" in txt and "事项丙" in txt and "事项乙" not in txt
+
+
+async def test_sync_maps_dense_no_to_db_id(repo):
+    f1 = await repo.add_followup("", "事项甲", "", "dream:d1", "2026-10-20")
+    await repo.add_followup("", "事项乙", "", "dream:d1", "2026-10-20")
+    await repo.add_followup("", "事项丙", "", "dream:d1", "2026-10-20")
+    await repo.close_followup(f1, status="dropped", closed_date="2026-10-21")
+    # open list: 事项乙(#1/db2), 事项丙(#2/db3) -- LLM closes #1 -> db 2
+    llm = SyncLLM(sync_json='[{"action":"close","id":1,"status":"done","note":"完成"}]')
+    await sync_followups(repo, llm, MuzeConfig(), date="2026-10-24", report="", chatlog=ChatLog())
+    assert [r["title"] for r in await repo.list_followups()] == ["事项丙"]
+
+
+# ------------------------------------------------ nightly completion sweep
+class CheckLLM(SyncLLM):
+    """Route the completion-check prompt to scripted JSON."""
+
+    def __init__(self, check_json: str = "[]"):
+        super().__init__()
+        self.check_json = check_json
+        self.check_prompts: list[str] = []
+
+    async def chat(self, messages, tools=None):
+        p = messages[-1]["content"]
+        if "完成度检查" in p:
+            self.check_prompts.append(p)
+            return {"role": "assistant", "content": self.check_json}
+        return await super().chat(messages)
+
+
+async def test_check_followups_closes_on_raw_evidence(repo):
+    from muze.digest import check_followups, day_range
+
+    await repo.add_followup("group/4242", "学明楼活动写稿", "下周五前", "user", "2026-10-27")
+    ts = day_range("2026-10-27")[0] + 3600
+    await _seed_day(repo, ts)  # the home conversation talked that day
+    llm = CheckLLM(check_json='[{"no":1,"action":"close","status":"done","note":"已交稿"}]')
+    n = await check_followups(repo, llm, MuzeConfig(), date="2026-10-27", chatlog=ChatLog())
+    assert n == 1
+    assert await repo.list_followups() == []
+    # the prompt carried the task AND its home-conversation day evidence
+    p = llm.check_prompts[0]
+    assert "学明楼活动写稿" in p and "周五前交材料" in p
+
+
+async def test_check_followups_touch_no_evidence(repo):
+    from muze.digest import check_followups
+
+    await repo.add_followup("", "遥远的事", "", "dream:d1", "2026-10-01")
+    llm = CheckLLM(check_json='[{"no":1,"action":"touch","note":"有进展"}]')
+    assert await check_followups(repo, llm, MuzeConfig(), date="2026-10-27", chatlog=ChatLog()) == 1
+    assert (await repo.list_followups())[0]["last_date"] == "2026-10-27"
+    # an empty verdict changes nothing
+    assert await check_followups(repo, CheckLLM(), MuzeConfig(), date="2026-10-27", chatlog=ChatLog()) == 0
+    assert len(await repo.list_followups()) == 1
+
+
+async def test_dream_night_sweeps_before_digest(repo):
+    from muze.digest import dream_night
+
+    class SweepOnly(CheckLLM):
+        async def chat(self, messages, tools=None):
+            p = messages[-1]["content"]
+            if "完成度检查" in p:
+                self.check_prompts.append(p)
+                return {"role": "assistant", "content": "[]"}
+            return {"role": "assistant", "content": "## 概览\n无\n## 需要处理\n无"}
+
+    llm = SweepOnly()
+    await repo.add_followup("", "待查事项", "", "user", "2026-10-27")
+    out = await dream_night(repo, llm, MuzeConfig(), ChatLog())
+    assert llm.check_prompts, "dream_night must run the completion sweep first"
+    assert "做梦" in out
+
+
+# ----------------------------------------------------------- agent tools
+async def test_followup_add_tool_and_gating(svc):
+    import json
+
+    service, repo = svc
+    await repo.add_followup("", "已有事项", "", "dream:d1", "2026-10-20")
+    assert "followup_add" in WRITE_TOOLS
+
+    outside = ControlContext(source="qq", chat_key="qq:group/999", scene="group", peer_id=999)
+    runner = ToolRunner(service, repo, service.adapter, None, outside)
+    out = json.loads(await runner.run(
+        "followup_add", {"title": "10月30日15:30 学明楼307 活动写稿"}
+    ))
+    assert out.get("needs_approval") is True  # gated outside the control ctx
+    assert len(await repo.list_followups()) == 1  # nothing added yet
+
+    inside = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    runner = ToolRunner(service, repo, service.adapter, None, inside)
+    out = json.loads(await runner.run(
+        "followup_add",
+        {"title": "10月30日15:30 学明楼307 活动写稿", "subject": "group/4242", "detail": "前沿大课堂"},
+    ))
+    assert out.get("added") is True
+    rows = await repo.list_followups()
+    assert [r["title"] for r in rows] == ["已有事项", "10月30日15:30 学明楼307 活动写稿"]
+    assert rows[1]["source"] == "user" and rows[1]["subject"] == "group/4242"
+
+
+async def test_followup_tools_use_dense_ids(svc):
+    import json
+
+    service, repo = svc
+    inside = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup("", "事项甲", "", "dream:d1", "2026-10-20")  # db 1
+    f2 = await repo.add_followup("", "中间被关", "", "dream:d1", "2026-10-20")
+    await repo.close_followup(f2, status="done", closed_date="2026-10-21")
+    await repo.add_followup("", "事项丙", "", "dream:d1", "2026-10-22")  # db 3
+
+    runner = ToolRunner(service, repo, service.adapter, None, inside)
+    out = json.loads(await runner.run("followup_list", {}))
+    ids = [f["id"] for f in out["followups"]]
+    assert ids == [1, 2]  # dense (db ids are 1 and 3)
+
+    # closing dense #2 kills 事项丙 (db 3), not the closed db 2
+    out = json.loads(await runner.run("followup_close", {"id": 2, "note": "用户说搞定"}))
+    assert out.get("closed") is True
+    assert [r["title"] for r in await repo.list_followups()] == ["事项甲"]
 
 
 async def test_todo_delivered_as_chain_keeps_order(env_todo):

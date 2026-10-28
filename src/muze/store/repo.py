@@ -993,8 +993,12 @@ class Repository:
         return int(cur.lastrowid)
 
     async def list_followups(self, status: str = "open", limit: int = 100) -> list[dict]:
+        # id ASC = stable open order. It used to be updated_at DESC, which
+        # reshuffled the list on every touch and contradicted the dense
+        # display numbering layered on top (user feedback 2026-10-28:
+        # 待办输出必须按序号稳定排序).
         async with self.conn.execute(
-            "SELECT * FROM followups WHERE status=? ORDER BY updated_at DESC LIMIT ?",
+            "SELECT * FROM followups WHERE status=? ORDER BY id ASC LIMIT ?",
             (status, max(1, int(limit))),
         ) as cur:
             rows = await cur.fetchall()

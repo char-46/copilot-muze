@@ -114,7 +114,7 @@ FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根�
 - keep：今天有新进展但仍未了结的事项（系统会刷新其动静日期）。
 - 拿不准的就不要动它。
 
-# 现有待办（仅 open）
+# 现有待办（仅 open；#N 为序号，引用时原样使用）
 {open}
 
 # 今日报告（{date}）
@@ -332,13 +332,29 @@ async def owner_context(repo: Repository, cfg: MuzeConfig) -> str:
     return txt or "(暂无关于用户本人的记忆；按通用排序，不要臆造画像)"
 
 
+def numbered_followups(items: list[dict]) -> list[tuple[int, dict]]:
+    """Dense 1..N display numbering over open followups, stable open order.
+
+    The DB id stays internal: after closes the raw ids go sparse (#3, #7,
+    #12...) which reads badly and confuses the LLM callers. Every surface
+    (/todo, digest, agent injection, tools) shows THIS number instead, and
+    every resolver maps it back positionally (user feedback 2026-10-28:
+    按序号排序，done 之后避免稀疏)."""
+    return list(enumerate(sorted(items, key=lambda r: r["id"]), 1))
+
+
+def followup_no_map(items: list[dict]) -> dict[int, int]:
+    """display number -> DB id, for mapping LLM/user answers back."""
+    return {n: r["id"] for n, r in numbered_followups(items)}
+
+
 def _format_followups(items: list[dict]) -> str:
     if not items:
         return "(无)"
     out = []
-    for r in items:
+    for n, r in numbered_followups(items):
         subj = r.get("subject") or "全局"
-        line = f"- #{r['id']} [{subj}] {r['title']}"
+        line = f"- #{n} [{subj}] {r['title']}"
         if r.get("detail"):
             line += f"（{str(r['detail'])[:60]}）"
         last = r.get("last_date") or r.get("opened_date") or "?"
@@ -555,6 +571,17 @@ async def dream_night(
     3. distill durable memories from the freshest report.
     """
     target = yesterday_date()
+    # completion sweep FIRST: the 00:05 full roam has pulled the day's
+    # messages by now, and every open followup gets its own evidence check
+    # against the RAW messages (user request 2026-10-28) -- this runs
+    # before any digest pass so the report and the sync pass see an
+    # up-to-date table (a completion found here won't be re-listed as open)
+    swept = 0
+    try:
+        swept = await check_followups(repo, llm, cfg, date=target, chatlog=chatlog)
+    except Exception:
+        log.exception("followup completion sweep for %s failed", target)
+
     # catch up every missing day since the EARLIEST stored day report, not
     # just since the latest: a day whose dream failed while a LATER day
     # succeeded used to become a permanent hole (latest advanced past it,
@@ -599,6 +626,7 @@ async def dream_night(
 
     head = (
         f"做梦完成：补做 {len(reports)} 天"
+        + (f"，完成度检查 {swept} 条变动" if swept else "")
         + (f"，新增 {', '.join(rollups)}" if rollups else "")
         + f"，新记忆 {new_memories} 条。\n\n"
     )
@@ -780,11 +808,17 @@ async def sync_followups(
         return 0
 
     changed = 0
+    # the LLM references items by the dense display number shown in {open}
+    # (#N) -- map back to DB ids positionally before touching the table
+    id_map = followup_no_map(open_items)
     for item in items[: cfg.digest.max_memories_per_night]:
         if not isinstance(item, dict):
             continue
         action = item.get("action")
         mid = item.get("id")
+        if isinstance(mid, bool) or not isinstance(mid, int):
+            mid = None
+        real_id = id_map.get(mid) if mid is not None else None
         if action == "add":
             fid = await repo.add_followup(
                 str(item.get("subject", "") or "").strip(),
@@ -798,17 +832,168 @@ async def sync_followups(
                     "FOLLOW     | + #%s [%s] %s",
                     fid, item.get("subject", ""), str(item.get("title"))[:80],
                 )
-        elif action == "close" and isinstance(mid, int):
+        elif action == "close" and real_id is not None:
             st = item.get("status")
             st = st if st in ("done", "dropped") else "done"
-            if await repo.close_followup(mid, status=st, source=f"dream:{date}", closed_date=date):
+            if await repo.close_followup(real_id, status=st, source=f"dream:{date}", closed_date=date):
                 changed += 1
                 chatlog.log.info(
-                    "FOLLOW     | - #%s closed (%s): %s", mid, st, str(item.get("note", ""))[:80]
+                    "FOLLOW     | - #%s closed (%s): %s", real_id, st, str(item.get("note", ""))[:80]
                 )
-        elif action == "keep" and isinstance(mid, int):
-            if await repo.touch_followup(mid, date):
+        elif action == "keep" and real_id is not None:
+            if await repo.touch_followup(real_id, date):
                 changed += 1
+    return changed
+
+
+FOLLOWUP_CHECK_PROMPT = """你是个人 QQ copilot 的"待办完成度检查"模块。凌晨漫游已拉全当日消息，下面是每条未结待办与它的【当日证据】（会话原文摘录）。逐条判断它当天是否有完成/失效/新进展。
+
+# 规则（从严）
+- close done：证据中有**明确完成语句**（用户或对方说了"交了/办好了/完成了/通过了"这类话）。
+- close dropped：证据明确表明事项取消/不再需要跟。
+- touch：有新进展但仍未了结。
+- 证据不足或无证据：**不要输出该条**。宁可漏判，不可臆造——依据必须来自消息原文。
+- #N 是序号，输出时原样引用。
+
+# 未结待办与当日证据（{date}）
+{blocks}
+
+# 输出（严格 JSON 数组，不要其他文字；可空）
+[{{"no":1,"action":"close","status":"done","note":"依据原话"}},
+ {{"no":2,"action":"touch","note":"进展一句话"}}]"""
+
+
+def _subject_peer(subject: str) -> tuple[str, int] | None:
+    """Parse a followup subject ("group/123", "friend/45" or a bare QQ
+    number -> friend) into (scene, peer) for day-message lookup."""
+    s = (subject or "").strip()
+    if not s:
+        return None
+    if "/" in s:
+        scene, _, peer = s.partition("/")
+        if peer.strip().isdigit():
+            return scene.strip(), int(peer)
+        return None
+    if s.isdigit():
+        return "friend", int(s)
+    return None
+
+
+def _title_keywords(title: str, cap: int = 3) -> list[str]:
+    """Distinctive tokens of a followup title for a LIKE search -- longest
+    tokens first (place/event names carry the signal, and a short verb like
+    写稿/交表 matches too broadly across unrelated chats)."""
+    toks = [t for t in re.split(r"[^\w\u4e00-\u9fff]+", title or "") if len(t) >= 2]
+    toks.sort(key=len, reverse=True)
+    out: list[str] = []
+    for t in toks:
+        if t not in out:
+            out.append(t)
+        if len(out) >= cap:
+            break
+    return out
+
+
+async def check_followups(
+    repo: Repository, llm, cfg: MuzeConfig, *, date: str, chatlog: ChatLog
+) -> int:
+    """Per-task completion sweep over the day's RAW messages.
+
+    Runs in dream_night right after the nightly roam pull and BEFORE any
+    digest pass (user request 2026-10-28: 每天凌晨拉消息后做梦前跟踪所有
+    任务检查完成度). The sync pass inside run_digest only sees the sampled
+    report; this pass gives EVERY open followup its own evidence block --
+    its home conversation's day messages plus keyword hits anywhere -- so a
+    completion mentioned in a quiet chat the report skipped still closes."""
+    if not llm.configured:
+        return 0
+    open_items = await repo.list_followups(status="open", limit=40)
+    if not open_items:
+        return 0
+    start_ts, end_ts = day_range(date)
+
+    blocks: list[str] = []
+    for no, r in numbered_followups(open_items):
+        seen: set[tuple[str, int, int]] = set()
+        lines: list[str] = []
+
+        def _add(rows: list[dict]) -> None:
+            for m in rows:
+                if not (start_ts <= m["time"] <= end_ts):
+                    continue  # searches span all history; keep the day only
+                key = (m["scene"], m["peer_id"], m["message_seq"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(
+                    f"[{m['scene']}/{m['peer_id']}][{epoch_iso(m['time'])}] "
+                    f"[{m['sender_id']}] {m['text_content'] or '(无文本)'}"
+                )
+
+        convo = _subject_peer(r.get("subject") or "")
+        if convo:
+            try:
+                _add(await repo.messages_between(convo[0], convo[1], start_ts, end_ts, limit=80))
+            except Exception:
+                pass
+        for kw in _title_keywords(r.get("title") or ""):
+            try:
+                _add(await repo.search_messages(kw, limit=20))
+            except Exception:
+                pass
+            if len(lines) >= 40:
+                break
+        evidence = "\n".join(lines[:40]) or "(当日无相关消息)"
+        subj = r.get("subject") or "全局"
+        blocks.append(
+            f"## #{no} [{subj}] {r['title']}"
+            + (f"（{str(r.get('detail') or '')[:60]}）" if r.get("detail") else "")
+            + f"\n开于 {r.get('opened_date')}，最后动静 {r.get('last_date') or r.get('opened_date')}"
+            + f"\n【当日证据】\n{evidence[:1500]}"
+        )
+
+    prompt = FOLLOWUP_CHECK_PROMPT.format(
+        date=date, blocks="\n\n".join(blocks)[:12000]
+    )
+    msg = await llm.chat([{"role": "user", "content": prompt}])
+    raw = (msg.get("content") or "").strip()
+    m = re.search(r"\[.*\]", raw, re.S)
+    if not m:
+        log.warning("followup check returned non-JSON, skipped: %.200s", raw)
+        return 0
+    try:
+        items = json.loads(m.group(0))
+    except ValueError:
+        log.warning("followup check JSON parse failed, skipped")
+        return 0
+
+    changed = 0
+    id_map = followup_no_map(open_items)
+    for item in items[:40]:
+        if not isinstance(item, dict):
+            continue
+        no = item.get("no")
+        if isinstance(no, bool) or not isinstance(no, int):
+            continue
+        real_id = id_map.get(no)
+        if real_id is None:
+            continue
+        action = item.get("action")
+        if action == "close":
+            st = item.get("status")
+            st = st if st in ("done", "dropped") else "done"
+            if await repo.close_followup(real_id, status=st, source=f"sweep:{date}", closed_date=date):
+                changed += 1
+                chatlog.log.info(
+                    "FOLLOW     | - #%s swept closed (%s): %s",
+                    real_id, st, str(item.get("note", ""))[:80],
+                )
+        elif action == "touch":
+            if await repo.touch_followup(real_id, date):
+                changed += 1
+                chatlog.log.info(
+                    "FOLLOW     | ~ #%s swept touch: %s", real_id, str(item.get("note", ""))[:80]
+                )
     return changed
 
 
