@@ -377,6 +377,13 @@ def followup_due_tag(r: dict, today: str | None = None) -> str:
     return f"截止 {due}"
 
 
+def followup_state_tag(r: dict) -> str:
+    """'' | '已交付10-30 待验收' -- delegated item handed in, waiting for
+    the USER's acceptance (交付≠完成, schema v17)."""
+    d = str(r.get("delivered_date") or "").strip()
+    return f"已交付{d} 待验收" if d else ""
+
+
 def _format_followups(items: list[dict]) -> str:
     if not items:
         return "(无)"
@@ -386,6 +393,9 @@ def _format_followups(items: list[dict]) -> str:
         line = f"- #{n} [{subj}] {r['title']}"
         if r.get("assignee"):
             line += f" →负责人:{r['assignee']}"
+        state = followup_state_tag(r)
+        if state:
+            line += f"（{state}）"
         due = followup_due_tag(r)
         if due:
             line += f"（{due}）"
@@ -882,12 +892,14 @@ async def sync_followups(
     return changed
 
 
-FOLLOWUP_CHECK_PROMPT = """你是个人 QQ copilot 的"待办完成度检查"模块。凌晨漫游已拉全当日消息，下面是每条未结待办与它的【当日证据】（会话原文摘录）。逐条判断它当天是否有完成/失效/新进展。
+FOLLOWUP_CHECK_PROMPT = """你是个人 QQ copilot 的"待办完成度检查"模块。凌晨漫游已拉全当日消息，下面是每条未结待办与它的【当日证据】（会话原文摘录）。逐条判断它当天是否有完成/失效/交付/新进展。
 
-# 规则（从严）
-- close done：证据中有**明确完成/交付语句**——用户自己办的，用户说了算完成；**有负责人的，负责人（或用户确认）说交付/交了/发出来了**即算完成。
+# 规则（从严，交付≠完成）
+- close done：**用户自己办的**，用户明确说完成；**有负责人的，必须用户验收确认**（"可以了/过了/没问题/收到没问题"这类话）才算完成——负责人自己说"交了/发了"**不算**，那只能 deliver。
+- deliver：有负责人，负责人明确说已交付/交了/发出来了（用户尚未表态验收）→ 记录交付，等用户验收。
+- reject：用户明确打回（"不行/要改/重做"）→ 清除交付标记，继续跟。
 - close dropped：证据明确表明事项取消/不再需要跟。
-- touch：有新进展但仍未了结（含负责人承诺在做、提交了初稿待审）。
+- touch：其他新进展但仍未了结（含承诺在做）。
 - 证据不足或无证据：**不要输出该条**。宁可漏判，不可臆造——依据必须来自消息原文。
 - #N 是序号，输出时原样引用。
 
@@ -895,8 +907,10 @@ FOLLOWUP_CHECK_PROMPT = """你是个人 QQ copilot 的"待办完成度检查"模
 {blocks}
 
 # 输出（严格 JSON 数组，不要其他文字；可空）
-[{{"no":1,"action":"close","status":"done","note":"依据原话"}},
- {{"no":2,"action":"touch","note":"进展一句话"}}]"""
+[{{"no":1,"action":"deliver","note":"负责人原话"}},
+ {{"no":2,"action":"close","status":"done","note":"用户验收原话"}},
+ {{"no":3,"action":"reject","note":"用户打回原话"}},
+ {{"no":4,"action":"touch","note":"进展一句话"}}]"""
 
 
 def _subject_peer(subject: str) -> tuple[str, int] | None:
@@ -984,6 +998,9 @@ async def check_followups(
         head = f"## #{no} [{subj}] {r['title']}"
         if r.get("assignee"):
             head += f" →负责人:{r['assignee']}"
+        state = followup_state_tag(r)
+        if state:
+            head += f"（{state}：只等验收，交付已记录）"
         due = followup_due_tag(r, today=date)
         if due:
             head += f"（{due}）"
@@ -1029,6 +1046,23 @@ async def check_followups(
                 chatlog.log.info(
                     "FOLLOW     | - #%s swept closed (%s): %s",
                     real_id, st, str(item.get("note", ""))[:80],
+                )
+        elif action == "deliver":
+            # 交付≠完成: the assignee handed it in; it now WAITS for the
+            # user's acceptance (schema v17) instead of closing
+            if await repo.set_followup_delivered(real_id, date):
+                changed += 1
+                chatlog.log.info(
+                    "FOLLOW     | = #%s delivered %s, awaiting acceptance: %s",
+                    real_id, date, str(item.get("note", ""))[:80],
+                )
+        elif action == "reject":
+            if await repo.set_followup_delivered(real_id, None):
+                await repo.touch_followup(real_id, date)
+                changed += 1
+                chatlog.log.info(
+                    "FOLLOW     | ! #%s rejected, back to open: %s",
+                    real_id, str(item.get("note", ""))[:80],
                 )
         elif action == "touch":
             if await repo.touch_followup(real_id, date):

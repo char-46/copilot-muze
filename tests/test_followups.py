@@ -699,3 +699,53 @@ async def test_sync_add_passes_assignee_due(repo):
     await sync_followups(repo, llm, MuzeConfig(), date="2026-10-28", report="", chatlog=ChatLog())
     row = (await repo.list_followups())[0]
     assert row["assignee"] == "小王" and row["due_date"] == "2026-10-30"
+
+
+# ------------------------------------------- acceptance-before-close (v17)
+async def test_v17_delivered_column_and_flag(repo):
+    async with repo.conn.execute("PRAGMA table_info(followups)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    assert "delivered_date" in cols
+    fid = await repo.add_followup("", "小王交终稿", "", "user", "2026-10-28", assignee="小王")
+    assert await repo.set_followup_delivered(fid, "2026-10-29") is True
+    row = (await repo.list_followups())[0]
+    assert row["status"] == "open" and row["delivered_date"] == "2026-10-29"  # delivery != close
+    assert await repo.set_followup_delivered(fid, None) is True  # rejection clears it
+    assert (await repo.list_followups())[0]["delivered_date"] == ""
+    assert await repo.set_followup_delivered(999, "x") is False  # closed/unknown id
+
+
+async def test_sweep_deliver_then_accept(repo):
+    from muze.digest import check_followups
+
+    fid = await repo.add_followup("", "小王交推送", "", "user", "2026-10-28", assignee="小王")
+    llm = CheckLLM(check_json='[{"no":1,"action":"deliver","note":"小王：初稿发您邮箱了"}]')
+    assert await check_followups(repo, llm, MuzeConfig(), date="2026-10-28", chatlog=ChatLog()) == 1
+    row = (await repo.list_followups())[0]
+    assert row["id"] == fid and row["delivered_date"] == "2026-10-28" and row["status"] == "open"
+
+    llm2 = CheckLLM(check_json='[{"no":1,"action":"close","status":"done","note":"用户：可以了"}]')
+    assert await check_followups(repo, llm2, MuzeConfig(), date="2026-10-28", chatlog=ChatLog()) == 1
+    assert await repo.list_followups() == []  # acceptance closes it
+
+
+async def test_sweep_reject_reopens(repo):
+    from muze.digest import check_followups
+
+    fid = await repo.add_followup("", "小王交海报", "", "user", "2026-10-28", assignee="小王")
+    await repo.set_followup_delivered(fid, "2026-10-28")
+    llm = CheckLLM(check_json='[{"no":1,"action":"reject","note":"用户：配色不行重做"}]')
+    assert await check_followups(repo, llm, MuzeConfig(), date="2026-10-29", chatlog=ChatLog()) == 1
+    row = (await repo.list_followups())[0]
+    assert row["delivered_date"] == "" and row["last_date"] == "2026-10-29"  # back to open
+
+
+async def test_todo_shows_awaiting_acceptance(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup(
+        "", "小王交推送", "", "user", "2026-10-28", assignee="小王", due_date="2026-10-30"
+    )
+    await repo.set_followup_delivered((await repo.list_followups())[0]["id"], "2026-10-29")
+    out = await service.run_command("todo", ctx)
+    assert "待验收" in out.text and "等你验收" in out.text and "小王" in out.text

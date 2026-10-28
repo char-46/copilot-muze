@@ -580,6 +580,7 @@ SPEC = [
                 "（如「表交了」「这事别记了」）时必须调用。id 与 query 至少给一个；"
                 "id 是 followup_list 显示的序号（稠密编号）；"
                 "query 匹配多条时会返回候选清单。status: done=已完成, dropped=失效/不再跟踪。"
+                "**交付≠完成**：有负责人的待办，负责人说交了不算完成，须等用户验收确认后才能关闭。"
             ),
             "parameters": {
                 "type": "object",
@@ -1466,11 +1467,13 @@ class ToolRunner:
                 {
                     "id": nos[r["id"]], "subject": r["subject"], "title": r["title"],
                     "detail": r["detail"], "opened_date": r["opened_date"],
-                    "last_date": r["last_date"],
+                    "last_date": r["last_date"], "assignee": r.get("assignee") or "",
+                    "due_date": r.get("due_date") or "",
+                    "delivered_date": r.get("delivered_date") or "",
                 }
                 for r in rows[:30]
             ],
-            "hint": "id 为序号；用户确认完成/取消时用 followup_close 关闭；用户委托新任务用 followup_add 登记",
+            "hint": "id 为序号；交付≠完成：有负责人且 delivered_date 非空的在等用户验收，验收确认后才能 followup_close；用户委托新任务用 followup_add 登记",
         }
 
     async def t_followup_add(self, args: dict) -> dict:
