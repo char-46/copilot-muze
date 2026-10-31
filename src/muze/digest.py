@@ -46,6 +46,9 @@ DIGEST_PROMPT = """你是一台个人 QQ copilot 的"做梦/复盘"模块。请�
 # 系统跟踪的待办（结构化状态，不是散文；引用表中事项时带上 #id）
 {followups}
 
+# 今日已结待办（含关闭备注——交接去向/发布说明；重要交接/发布在报告相应位置写明：谁交给了谁、发布了什么）
+{closed}
+
 # 格式
 ## 概览
 （当天整体在聊什么、最重要的事）
@@ -112,7 +115,7 @@ FOLLOWUP_SYNC_PROMPT = """你是个人 QQ copilot 的"待办同步"模块。根�
 - add：【当日原始布置】里每一条**明确的任务布置都要登记**——用户说"这个活动需要XX/记得发我/完成后发我审核/给我备份后向下对接"就是可行动事项，不要替用户判断"可能不用跟"；同一件事布置给了不同人的，按人分别登记（各自 assignee）。标题 ≤40 字，写清 谁+什么事+时限（如有）；布置给别人的 assignee 填受托人（会话号即受托人所在会话）。
 - due_date 判定（从严，用户反馈 2026-10-28：同一活动三条布置只有一条填了日期）：布置原文里写明了活动/交付日期（如"10月30日（下周五）下午3:30 学明楼307"）就**必须**填该日期（取活动当天，YYYY-MM-DD）；"成稿后交/完成后发我/备份后对接"这类表述**不能**成为不填的理由——活动当天就是最晚时限。同一件事布置给多人的，**每一条都要填相同的 due_date**。只有原文完全没有日期线索时才留空。
 - 只有"单纯提及、无任何任务语义"（寒暄、转述、纯信息）才不加；拿不准的按 add 处理，用户可随时 drop。
-- close：仅当报告中有**明确证据**该事项已解决或失效（写明依据）；不要因为"挂了几天"就关闭——过期由系统自动处理，用户也会手动关闭。status 用 done（已完成）或 dropped（已失效/不用跟）。
+- close：仅当报告中有**明确证据**该事项已解决或失效（写明依据）；不要因为"挂了几天"就关闭——过期由系统自动处理，用户也会手动关闭。status 用 done（已完成）或 dropped（已失效/不用跟）。**环节移交即完成**：用户把自己负责的环节交给下一方处理（送审、交接给他人、转平台发布）时即视为该待办完成，按 close 处理并在 note 写明去向与说明；若最终结果还需要跟踪，那是另一条待办（另行登记），不要让本条一直挂着。
 - keep：今天有新进展但仍未了结的事项（系统会刷新其动静日期）。
 
 # 现有待办（仅 open；#N 为序号，子任务为 #3.1 形式，引用时原样使用）
@@ -607,14 +610,30 @@ async def run_digest(
 
     owner_txt = await owner_context(repo, cfg)
     open_items: list[dict] = []
+    closed_items: list[dict] = []
     if dc.followup_extract:
         try:
             open_items = await repo.list_followups(status="open", limit=40)
+            closed_items = await repo.followups_closed_on(date)
         except Exception:
-            open_items = []
+            closed_items = []
+
+    def _format_closed(items: list[dict]) -> str:
+        if not items:
+            return "(无)"
+        out = []
+        for r in items:
+            verb = "完成" if r.get("status") == "done" else "关闭"
+            note = (r.get("close_note") or "").strip()
+            out.append(
+                f"- {verb}: {r['title']}" + (f"（{note[:80]}）" if note else "")
+            )
+        return "\n".join(out[:30])
+
     prompt = DIGEST_PROMPT.format(
         date=date, prior=prior_txt, owner=owner_txt,
         followups=_format_followups(open_items),
+        closed=_format_closed(closed_items),
         transcript="\n\n".join(blocks),
     )
     if not llm.configured:
@@ -1016,7 +1035,10 @@ async def sync_followups(
         elif action == "close" and real_id is not None:
             st = item.get("status")
             st = st if st in ("done", "dropped") else "done"
-            if await repo.close_followup(real_id, status=st, source=f"dream:{date}", closed_date=date):
+            if await repo.close_followup(
+                real_id, status=st, source=f"dream:{date}", closed_date=date,
+                note=str(item.get("note", "") or "").strip(),
+            ):
                 changed += 1
                 chatlog.log.info(
                     "FOLLOW     | - #%s closed (%s): %s", real_id, st, str(item.get("note", ""))[:80]
@@ -1176,7 +1198,10 @@ async def check_followups(
         if action == "close":
             st = item.get("status")
             st = st if st in ("done", "dropped") else "done"
-            if await repo.close_followup(real_id, status=st, source=f"sweep:{date}", closed_date=date):
+            if await repo.close_followup(
+                real_id, status=st, source=f"sweep:{date}", closed_date=date,
+                note=str(item.get("note", "") or "").strip(),
+            ):
                 changed += 1
                 chatlog.log.info(
                     "FOLLOW     | - #%s swept closed (%s): %s",

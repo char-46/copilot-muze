@@ -368,7 +368,7 @@ async def test_migration_v7_to_v10_adds_columns(tmp_path):
     ) as cur:
         assert await cur.fetchone()  # v11 added profiles + RAG tables
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
-        assert (await cur.fetchone())[0] == "19"  # migrated to the LATEST schema
+        assert (await cur.fetchone())[0] == "20"  # migrated to the LATEST schema
     await conn.close()
 
 

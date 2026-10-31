@@ -201,6 +201,12 @@ class IngestConfig(BaseModel):
     asr: AsrConfig = Field(default_factory=AsrConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
     value: ValueConfig = Field(default_factory=ValueConfig)
+    # link-title enrichment: archived http(s) links gain "[链接] <title>" so
+    # tasks/reports can say WHAT a link was about (generic feature; off
+    # switch for privacy-tight setups)
+    link_titles: bool = True
+    link_titles_per_pass: int = 8  # messages resolved per perception pass
+    link_titles_lookback_h: float = 72.0  # only recent messages get resolved
 
 
 class ControlConfig(BaseModel):

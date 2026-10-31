@@ -210,7 +210,7 @@ async def test_schema_v12_value_column(tmp_path):
         async with conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ) as cur:
-            assert (await cur.fetchone())[0] == "19"
+            assert (await cur.fetchone())[0] == "20"
         async with conn.execute("PRAGMA table_info(messages)") as cur:
             cols = {r[1] for r in await cur.fetchall()}
         assert "value" in cols

@@ -415,9 +415,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v17_followup_delivered(conn)
         await _migrate_v18_capability_wishes(conn)
         await _migrate_v19_followup_parent(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '19')")
+        await _migrate_v20_close_note_links(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '20')")
         await conn.commit()
-        log.info("database created (schema v19)")
+        log.info("database created (schema v20)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -503,6 +504,37 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v19 (followup subtasks)")
         version = 19
+    if version < 20:
+        await _migrate_v20_close_note_links(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '20')")
+        await conn.commit()
+        log.info("database migrated to schema v20 (close notes + link titles)")
+        version = 20
+
+
+async def _migrate_v20_close_note_links(conn: aiosqlite.Connection) -> None:
+    """v20 (user feedback 2026-10-31):
+
+    - followups.close_note: what the user said when closing ("docx+pdf已发",
+      "已交老师审", "签字版先留着") -- the group wants completion DETAILS to
+      travel with the closure, into /todo's 最近完成 and the daily report;
+    - link_titles: per-URL <title> cache so archived links stop being bare
+      URLs (不会读链接的标题)."""
+    async with conn.execute("PRAGMA table_info(followups)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    if "close_note" not in cols:
+        await conn.execute(
+            "ALTER TABLE followups ADD COLUMN close_note TEXT NOT NULL DEFAULT ''"
+        )
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS link_titles (
+            url         TEXT PRIMARY KEY,
+            title       TEXT NOT NULL DEFAULT '',
+            fetched_at  REAL NOT NULL DEFAULT 0
+        );
+        """
+    )
 
 
 async def _migrate_v19_followup_parent(conn: aiosqlite.Connection) -> None:

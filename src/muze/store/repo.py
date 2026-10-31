@@ -1055,6 +1055,48 @@ class Repository:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
+    # ------------------------------------------------------- link titles
+    async def get_link_title(self, url: str) -> str | None:
+        """None = never fetched (go fetch); '' = fetched, no title (don't
+        retry -- a non-HTML/JS page will never gain one)."""
+        async with self.conn.execute(
+            "SELECT title FROM link_titles WHERE url=?", (url,)
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else (row[0] or "")
+
+    async def set_link_title(self, url: str, title: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO link_titles (url, title, fetched_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(url) DO UPDATE SET title=excluded.title, fetched_at=excluded.fetched_at",
+            (url, title or "", time.time()),
+        )
+        await self.conn.commit()
+
+    async def messages_with_unresolved_links(
+        self, since_ts: int, limit: int = 8
+    ) -> list[dict]:
+        """Recent messages whose text has an http(s) link but no resolved
+        title marker yet (the enrichment appends "[链接]" once resolved)."""
+        async with self.conn.execute(
+            """
+            SELECT rowid AS _rid, text_content FROM messages
+            WHERE recalled=0 AND time>=?
+              AND text_content LIKE '%http%'
+              AND text_content NOT LIKE '%[链接]%'
+            ORDER BY time DESC LIMIT ?
+            """,
+            (int(since_ts), max(1, int(limit))),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def append_message_text(self, row_id: int, addition: str) -> None:
+        await self.conn.execute(
+            "UPDATE messages SET text_content=COALESCE(text_content,'')||? WHERE rowid=?",
+            (addition, int(row_id)),
+        )
+        await self.conn.commit()
+
     async def list_followups(self, status: str = "open", limit: int = 100) -> list[dict]:
         # id ASC = stable open order. It used to be updated_at DESC, which
         # reshuffled the list on every touch and contradicted the dense
@@ -1084,19 +1126,40 @@ class Repository:
 
     async def close_followup(
         self, item_id: int, status: str = "done", source: str = "user",
-        closed_date: str = "",
+        closed_date: str = "", note: str = "",
     ) -> bool:
+        """`note` is the user's closure remark (what was delivered, where it
+        was handed off) -- it travels into /todo's 最近完成 and the daily
+        report so collaborators see the DETAILS, not just the closure."""
         if status not in ("done", "dropped", "expired"):
             raise ValueError(f"bad followup status: {status}")
         cur = await self.conn.execute(
             """
-            UPDATE followups SET status=?, closed_date=?, close_source=?, updated_at=?
+            UPDATE followups
+            SET status=?, closed_date=?, close_source=?, close_note=?, updated_at=?
             WHERE id=? AND status='open'
             """,
-            (status, closed_date, source, _now(), int(item_id)),
+            (status, closed_date, source, (note or "").strip()[:300], _now(), int(item_id)),
         )
         await self.conn.commit()
         return cur.rowcount > 0
+
+    async def recently_closed(self, limit: int = 5) -> list[dict]:
+        """Latest closures (any close status) for the 最近完成 section."""
+        async with self.conn.execute(
+            "SELECT * FROM followups WHERE status!='open' "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def followups_closed_on(self, date: str) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT * FROM followups WHERE closed_date=? AND status!='open' "
+            "ORDER BY updated_at DESC",
+            (date,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
     async def touch_followup(self, item_id: int, last_date: str) -> bool:
         """Mark an open item as still alive (progress seen on last_date)."""

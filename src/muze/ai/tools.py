@@ -1596,7 +1596,10 @@ class ToolRunner:
             if not target:
                 return {"error": f"序号 {strfid} 不存在（followup_list 查当前序号）"}
             fid = target["id"]
-        ok = await self.repo.close_followup(int(fid), status=st, source="user")
+        ok = await self.repo.close_followup(
+            int(fid), status=st, source="user",
+            note=str(args.get("note", "") or "").strip(),
+        )
         if not ok:
             return {"error": f"待办 #{fid} 不存在或已关闭"}
         kids = await self.repo.list_children(int(fid), status="open")

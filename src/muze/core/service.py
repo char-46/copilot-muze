@@ -1019,7 +1019,34 @@ class ControlService:
             extra = f"\n（含 {len(kids)} 条子任务一并停止跟踪）" if kids else ""
             return CommandOutcome(f"已不再跟踪: {target['title']}{extra}")
         rows = await self.repo.list_followups(status="open", limit=50)
+        # 最近完成：结单详情要跟着走（备注=交接去向/发布说明），群协作
+        # 靠它知道"什么发布到了哪、交给了谁"（用户反馈 2026-10-31）
+        recent_md = ""
+        recent_nodes: list[str] = []
+        try:
+            recent = await self.repo.recently_closed(4)
+        except Exception:
+            recent = []
+        if recent:
+            rl = []
+            for r in recent:
+                verb = "完成" if r["status"] == "done" else "关闭"
+                cn = (r.get("close_note") or "").strip()
+                rl.append(
+                    f"- {verb} {str(r['title'])[:36]}"
+                    + (f"（{cn[:40]}）" if cn else "")
+                    + f" {r.get('closed_date') or ''}"
+                )
+            recent_md = "\n\n**最近完成**\n" + "\n".join(rl)
+            recent_nodes = ["最近完成:"] + rl
         if not rows:
+            # even an EMPTY list still shows what just finished -- the group
+            # reads the closures, not only the backlog
+            if recent:
+                return CommandOutcome(
+                    "待办清空：没有系统跟踪中的未结事项" + recent_md,
+                    forward_nodes=["待办清空"] + recent_nodes,
+                )
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
         # remember what THIS chat saw, so a later /done resolves against the
         # exact ids on screen instead of whatever the list looks like then
@@ -1064,8 +1091,8 @@ class ControlService:
         head_plain = f"未结待办（{n_all} 条" + (f"，{delegated} 条已布置给他人" if delegated else "") + "）"
         tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add [@负责人] <事项> [due:10-30] [under:<序号>] 登记"
         return CommandOutcome(
-            f"# {head_plain}\n\n" + "\n\n---\n\n".join(md_items) + f"\n\n---\n\n{tail}",
-            forward_nodes=[head_plain] + node_items + [tail],
+            f"# {head_plain}\n\n" + "\n\n---\n\n".join(md_items) + recent_md + f"\n\n---\n\n{tail}",
+            forward_nodes=[head_plain] + node_items + recent_nodes + [tail],
         )
 
     # ---------------------------------------------------- todo resolution
@@ -1129,24 +1156,47 @@ class ControlService:
         from muze.digest import local_date as _local_date
 
         if not args:
-            return CommandOutcome.err("用法: /done <序号|关键词>（/todo 看清单）")
-        if re.fullmatch(r"\d+(?:\.\d+)*", args[0]):
-            # resolve against what THIS chat LAST SAW (exact id), not against
-            # today's positions -- otherwise a close/dream in between shifts
-            # every number and /done hits the wrong item
-            target = await self._todo_resolve(ctx, args[0])
-            if not target:
-                return CommandOutcome.err(
-                    f"序号 {args[0]} 不存在或已关闭（清单可能已变化，/todo 刷新后再操作）"
+            return CommandOutcome.err("用法: /done <序号|关键词> [更多序号] [备注]（/todo 看清单）")
+        # leading number tokens (3, 3.1) are targets; the remaining free
+        # text is the closure note ("已发布", 交接去向) and is stored with
+        # the closure so collaborators see the DETAILS (user feedback
+        # 2026-10-31: 他不知道什么活动的稿子发布了)
+        note = ""
+        nums: list[str] = []
+        for i, a in enumerate(args):
+            if re.fullmatch(r"\d+(?:\.\d+)*", a):
+                nums.append(a)
+            else:
+                note = " ".join(args[i:]).strip()
+                break
+        if nums:
+            if not note and len(nums) > 1:
+                return CommandOutcome.err("批量结单请带备注说明结果（/done 3 5 已发布到公众号）")
+            # two phases: resolve EVERY number first, close only when all
+            # resolve -- a mid-batch miss must not leave half the batch done
+            targets: list[dict] = []
+            for no in nums:
+                target = await self._todo_resolve(ctx, no)
+                if not target:
+                    return CommandOutcome.err(
+                        f"序号 {no} 不存在或已关闭，整批未提交（清单可能已变化，/todo 刷新后再操作）"
+                    )
+                targets.append(target)
+            lines: list[str] = []
+            for target in targets:
+                ok = await self.repo.close_followup(
+                    target["id"], status="done", source="user",
+                    closed_date=_local_date(), note=note,
                 )
-            ok = await self.repo.close_followup(
-                target["id"], status="done", source="user", closed_date=_local_date()
-            )
-            if not ok:
-                return CommandOutcome.err(f"序号 {args[0]} 已关闭")
-            kids = await self._close_children(target["id"], "done", _local_date())
-            extra = f"\n（含 {len(kids)} 条子任务一并关闭）" if kids else ""
-            return CommandOutcome(f"已完成: {target['title']}{extra}\n（明早日报不再跟它）")
+                if not ok:
+                    return CommandOutcome.err(f"「{target['title'][:30]}」已关闭，整批未提交")
+                kids = await self._close_children(target["id"], "done", _local_date())
+                tag = f"（含 {len(kids)} 条子任务）" if kids else ""
+                lines.append(f"- 已完成: {target['title']}{tag}")
+            if note:
+                lines.append(f"备注: {note}")
+            lines.append("（明早日报不再跟它）")
+            return CommandOutcome("\n".join(lines))
         q = " ".join(args)
         rows = await self.repo.find_open_followups(q)
         if len(rows) == 1:

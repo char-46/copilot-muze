@@ -381,6 +381,55 @@ async def test_orphan_subtask_is_promoted_to_top_level():
     assert pairs["2"]["title"] == "另一个"
 
 
+# ------------------------------------------- closure notes + batch /done
+async def test_done_stores_note_and_todo_shows_recent(svc):
+    """结单备注要跟着走（用户反馈 2026-10-31: 协作者想知道发布详情）。"""
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup("", "运动会推文", "", "dream:d1", "2026-10-30")
+    await service.run_command("todo", ctx)
+
+    out = await service.run_command("done 1 docx+pdf已发，发布到公众号", ctx)
+    assert not out.is_error and "docx+pdf已发" in out.text
+    rows = await repo.recently_closed(5)
+    assert rows[0]["close_note"] == "docx+pdf已发，发布到公众号"
+
+    out = await service.run_command("todo", ctx)
+    assert "最近完成" in out.text and "docx+pdf已发" in out.text
+
+
+async def test_done_batch_closes_multiple_with_one_note(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup("", "事项甲", "", "dream:d1", "2026-10-30")
+    await repo.add_followup("", "事项乙", "", "dream:d1", "2026-10-30")
+    await repo.add_followup("", "事项丙", "", "dream:d1", "2026-10-30")
+    await service.run_command("todo", ctx)
+
+    out = await service.run_command("done 1 2 已发老师审", ctx)
+    assert not out.is_error
+    assert "事项甲" in out.text and "事项乙" in out.text and "已发老师审" in out.text
+    left = await repo.list_followups()
+    assert len(left) == 1 and left[0]["title"] == "事项丙"
+    for r in await repo.recently_closed(5):
+        assert r["close_note"] == "已发老师审"
+
+    # batch without a note is rejected -- a bare multi-close is how details
+    # get lost
+    out = await service.run_command("done 1 3", ctx)
+    assert out.is_error and "备注" in out.text
+
+
+async def test_done_batch_is_atomic_on_unknown_number(svc):
+    service, repo = svc
+    ctx = ControlContext(source="cli", chat_key="cli", scene="", peer_id=0, auto_confirm=True)
+    await repo.add_followup("", "事项甲", "", "dream:d1", "2026-10-30")
+    await service.run_command("todo", ctx)
+    out = await service.run_command("done 1 9 备注", ctx)
+    assert out.is_error and "整批未提交" in out.text
+    assert len(await repo.list_followups()) == 1  # nothing closed
+
+
 # ------------------------------------------------- /dream <date> backfills
 async def test_dream_missing_date_is_made_on_the_spot(svc):
     from muze.digest import day_range
