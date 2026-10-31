@@ -318,8 +318,9 @@ SPEC = [
         "function": {
             "name": "fetch_url",
             "description": (
-                "抓取 URL 的文本内容（网页/在线文档）。遇到金山文档/腾讯文档等需要 JS 或登录的页面"
-                "会返回具体可行的替代建议；QQ 小程序卡片先读 doc-sources 技能找直链。"
+                "抓取 URL 的正文文本。静态页直接提取；JS 渲染页自动用无头浏览器重试"
+                "（拿不到时才返回替代建议）；金山文档/腾讯文档等需登录的页面看建议走"
+                "（开分享权限 / 导出文件发 QQ 后 read_document）。"
             ),
             "parameters": {
                 "type": "object",
@@ -1327,8 +1328,13 @@ class ToolRunner:
         url = str(args.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return {"error": "仅支持 http(s) URL"}
+        fcfg = getattr(self.service.cfg, "fetch", None)
         try:
-            text = await fetch_url(url)
+            text = await fetch_url(
+                url,
+                render=bool(getattr(fcfg, "render_enabled", True)),
+                browser_cmd=str(getattr(fcfg, "browser_cmd", "") or ""),
+            )
         except Exception as e:
             return {"error": str(e)}
         return {"url": url, "content": text}

@@ -806,14 +806,22 @@ class ControlService:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text)
 
-    @slash("fetch", "/fetch <URL>", "抓取网页/在线文档链接的文本内容", scope="app")
+    @slash(
+        "fetch", "/fetch <URL>",
+        "抓取网页正文（静态直取；JS 页自动无头浏览器重试）", scope="app",
+    )
     async def cmd_fetch(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if not args:
             return CommandOutcome.err("用法: /fetch <URL>")
         from muze.docs import fetch_url
 
+        fcfg = getattr(self.cfg, "fetch", None)
         try:
-            text = await fetch_url(args[0])
+            text = await fetch_url(
+                args[0],
+                render=bool(getattr(fcfg, "render_enabled", True)),
+                browser_cmd=str(getattr(fcfg, "browser_cmd", "") or ""),
+            )
         except Exception as e:
             return CommandOutcome.err(str(e))
         return CommandOutcome(text)
