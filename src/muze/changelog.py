@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.165",
+        "date": "2026-10-31",
+        "changes": [
+            "网页正文能力保证：fetch_url 静态直取不足（正文<400字的反爬壳/JS 页）或被拒（403/412 类）时，自动用系统 Edge/Chrome 无头模式渲染后重提正文（零新依赖，可 fetch.browser_cmd 指定浏览器、fetch.render_enabled 关闭）；两边谁长用谁，仍失败保留原有替代建议。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.164",
         "date": "2026-10-31",
         "changes": [

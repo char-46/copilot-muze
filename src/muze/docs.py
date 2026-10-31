@@ -459,7 +459,62 @@ def read_document(path: str | Path, entry: str | None = None) -> str:
 _JS_HINT_PAGES = ("docs.qq.com", "kdocs.cn", "www.kdocs.cn", "drive.weixin")
 
 
-async def fetch_url(url: str, *, timeout: float = 20.0) -> str:
+async def fetch_url(
+    url: str, *, timeout: float = 20.0, render: bool | None = None,
+    browser_cmd: str = "",
+) -> str:
+    """Page text for one URL.
+
+    Static fetch first; the headless browser retries when the static HTML
+    is a thin shell/anti-bot stub (<_RETRY_MIN_CHARS visible text) or the
+    plain HTTP request is refused (403/412-class) -- whichever side yields
+    more text wins (capability guarantee, user direction 2026-10-31: 不要求
+    对所有页面总结，至少保证能力)."""
+    raw, ctype = b"", ""
+    http_err: Exception | None = None
+    try:
+        raw, ctype = await _http_get(url, timeout)
+    except Exception as e:
+        http_err = e
+
+    if http_err is None and "html" not in ctype:
+        # json / plain / binary: verbatim, exactly as before
+        out = raw.decode("utf-8", errors="replace")
+        if len(out) > MAX_DOC_CHARS:
+            out = out[:MAX_DOC_CHARS] + f"\n...(截断，共超过 {MAX_DOC_CHARS} 字符)"
+        return out
+
+    title, text = "", ""
+    if raw:
+        title, text = html_to_text(_decode_html(raw))
+    if render is not False and (
+        http_err is not None or len(text.strip()) < _RETRY_MIN_CHARS
+    ):
+        # JS page / anti-bot stub / plain refusal: let a real browser try
+        try:
+            dom = await render_dom(url, browser_cmd=browser_cmd)
+            t2, x2 = html_to_text(dom)
+            if len(x2.strip()) > len(text.strip()):
+                title, text = (t2 or title), x2
+        except Exception as e:
+            log.debug("headless render failed for %s: %s", url[:80], e)
+    if len(text.strip()) < 60:
+        if http_err is not None:
+            raise http_err
+        raise RuntimeError(_js_hint(url) or "页面无可见文本（可能需要 JS 渲染或登录）")
+    out = f"[标题] {title}\n\n{text}" if title else text
+    if len(out) > MAX_DOC_CHARS:
+        out = out[:MAX_DOC_CHARS] + f"\n...(截断，共超过 {MAX_DOC_CHARS} 字符)"
+    return out
+
+
+# below this many visible characters the static HTML is treated as a shell
+# (JS app or anti-bot stub like weixin's 参数错误 page, which still carries
+# ~75 chars of junk) and the browser retry kicks in
+_RETRY_MIN_CHARS = 400
+
+
+async def _http_get(url: str, timeout: float) -> tuple[bytes, str]:
     import aiohttp
 
     headers = {
@@ -476,22 +531,91 @@ async def fetch_url(url: str, *, timeout: float = 20.0) -> str:
                 raise RuntimeError(f"HTTP {resp.status}")
             ctype = resp.headers.get("Content-Type", "")
             raw = await resp.read()
+    return raw[:MAX_FETCH_BYTES], ctype
 
-    if len(raw) > MAX_FETCH_BYTES:
-        raw = raw[:MAX_FETCH_BYTES]
-    if "html" in ctype:
-        title, text = html_to_text(raw.decode("utf-8", errors="replace"))
-        if not text or len(text.strip()) < 60:
-            hint = _js_hint(url)
-            raise RuntimeError(hint or "页面无可见文本（可能需要 JS 渲染或登录）")
-        out = f"[标题] {title}\n\n{text}" if title else text
-    elif "json" in ctype:
-        out = raw.decode("utf-8", errors="replace")
-    else:
-        out = raw.decode("utf-8", errors="replace")
-    if len(out) > MAX_DOC_CHARS:
-        out = out[:MAX_DOC_CHARS] + f"\n...(截断，共超过 {MAX_DOC_CHARS} 字符)"
-    return out
+
+def _decode_html(raw: bytes) -> str:
+    """Charset-aware HTML decode: declared charset, then utf-8 strict,
+    then gb18030 (legacy Chinese pages decode as mojibake under utf-8
+    'replace' and the text extractor would still 'succeed' wrongly)."""
+    import re as _re
+
+    head = raw[:2048]
+    m = _re.search(rb"charset=[\"']?([\w-]+)", head, _re.IGNORECASE)
+    if m:
+        try:
+            return raw.decode(m.group(1).decode("ascii", "ignore"), "replace")
+        except LookupError:
+            pass
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("gb18030", "replace")
+
+
+# ------------------------------------------------- headless browser render
+_BROWSER_CANDIDATES = (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+)
+
+
+def find_browser(explicit: str = "") -> str:
+    """A usable Chromium-family browser exe (explicit > PATH > known spots).
+    '' = none found (headless render unavailable)."""
+    if explicit:
+        return explicit if Path(explicit).exists() else ""
+    import shutil
+
+    for name in ("msedge", "chrome", "chromium", "google-chrome"):
+        p = shutil.which(name)
+        if p:
+            return p
+    for p in _BROWSER_CANDIDATES:
+        if Path(p).exists():
+            return p
+    return ""
+
+
+async def render_dom(
+    url: str, *, timeout: float = 30.0, browser_cmd: str = ""
+) -> str:
+    """Run the system browser headless and return the RENDERED DOM html.
+
+    --virtual-time-budget makes the run settle scripts quickly; the hard
+    asyncio timeout guards a hung page and kills the process."""
+    import asyncio as _aio
+
+    exe = find_browser(browser_cmd)
+    if not exe:
+        raise RuntimeError("未找到可用的无头浏览器（Edge/Chrome）")
+    proc = await _aio.create_subprocess_exec(
+        exe,
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--disable-extensions",
+        "--dump-dom",
+        "--virtual-time-budget=8000",
+        url,
+        stdout=_aio.subprocess.PIPE,
+        stderr=_aio.subprocess.DEVNULL,
+    )
+    try:
+        out, _err = await _aio.wait_for(proc.communicate(), timeout=timeout)
+    except _aio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError(f"无头渲染超时（>{timeout:.0f}s）")
+    html = (out or b"").decode("utf-8", errors="replace")
+    if len(html) > MAX_FETCH_BYTES:
+        html = html[:MAX_FETCH_BYTES]
+    return html
 
 
 def _js_hint(url: str) -> str | None:

@@ -388,6 +388,18 @@ class WebConfig(BaseModel):
     tunnel: TunnelConfig = TunnelConfig()
 
 
+class FetchConfig(BaseModel):
+    """URL 正文抓取（fetch_url 工具 / /fetch 命令）。
+
+    Static fetch first; when the HTML carries no visible text (JS-rendered
+    page), retry with the system browser in headless --dump-dom mode --
+    zero extra dependencies (Edge/Chrome ship with Windows; override or
+    disable per deployment)."""
+    render_enabled: bool = True  # headless-browser retry for JS pages
+    render_timeout: float = 30.0  # covers browser start + virtual time budget
+    browser_cmd: str = ""  # explicit browser exe; empty = auto-detect
+
+
 class RemoteConfig(BaseModel):
     """`muze cli --remote` upstream (the *dev machine* side).
 
@@ -584,6 +596,7 @@ class MuzeConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    fetch: FetchConfig = Field(default_factory=FetchConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
