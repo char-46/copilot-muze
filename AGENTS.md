@@ -78,6 +78,11 @@ Build metadata (`+build.g<sha>.<ts>`) is appended automatically by
 
 ## Architecture pointers
 
+- Generality rule (user direction 2026-10-31): the CODE and the built-in
+  prompts stay generic — one user's workflow specifics (review chains,
+  naming, personal habits) belong in config options or in the owner's
+  profile/memories, never hard-coded into rules or prompt examples.
+
 - `src/muze/main.py` — App assembly, event dispatch, maintenance loops.
 - `src/muze/core/service.py` — slash commands (`@slash(...)`), confirm flow.
 - `src/muze/ai/agent.py` — concurrent `::` sessions, SYSTEM_PROMPT, tools loop.

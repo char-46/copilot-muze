@@ -906,6 +906,8 @@ class App:
                     done += await self._asr_pass(asr, voice_re)
                 if ocr is not None:
                     done += await self._ocr_pass(ocr)
+                if getattr(self.cfg.ingest, "link_titles", True):
+                    done += await self._link_title_pass()
                 if done:
                     log.info("[%s] perception pass: %s media enriched", self.spec.name, done)
                 if asr is not None:
@@ -914,6 +916,42 @@ class App:
                 raise
             except Exception:
                 log.exception("perception pass failed")
+
+    async def _link_title_pass(self) -> int:
+        """Resolve <title> for links in recent messages and append
+        "[链接] <title>" to the message text (cache: one fetch per URL ever).
+
+        Generic enrichment -- no JS, no login; pages that need a browser
+        stay untitled (and belong on the capability wishlist)."""
+        import time as _t
+
+        from muze.linkmeta import extract_urls, fetch_title
+
+        icfg = self.cfg.ingest
+        since = int(_t.time() - float(icfg.link_titles_lookback_h) * 3600)
+        rows = await self.repo.messages_with_unresolved_links(
+            since, limit=int(icfg.link_titles_per_pass)
+        )
+        n = 0
+        for r in rows:
+            if self._stop.is_set():
+                break
+            addition = ""
+            for url in extract_urls(r.get("text_content") or "")[:3]:
+                cached = await self.repo.get_link_title(url)
+                if cached is None:
+                    cached = await fetch_title(url)
+                    await self.repo.set_link_title(url, cached)
+                if cached:
+                    addition += f"\n[链接] {cached}"
+            if not addition:
+                continue
+            try:
+                await self.repo.append_message_text(int(r["_rid"]), addition)
+                n += 1
+            except Exception:
+                log.debug("link title append failed for msg %s", r.get("_rid"), exc_info=True)
+        return n
 
     async def _asr_pass(self, asr, voice_re) -> int:
         from muze.perception import transcribe_media_row
