@@ -80,10 +80,16 @@ class QwenAsrBackend:
         self.cfg = cfg
         self._model = None
         self._last_used = 0.0
+        self._device_used = ""  # where the CURRENT weights live
+        # manual override (/model ram|vram): empty = follow cfg/auto rules
+        self._force_device = ""
 
     # -- lifecycle -------------------------------------------------
     def _pick_device(self) -> tuple[str, str]:
         """(device_map, dtype-torch-name)"""
+        if self._force_device:
+            dev = "cuda:0" if self._force_device == "cuda" else "cpu"
+            return dev, ("bfloat16" if dev.startswith("cuda") else "float32")
         want = (self.cfg.qwen_device or "auto").strip().lower()
         if want in ("cpu", ""):
             return "cpu", "float32"
@@ -121,8 +127,45 @@ class QwenAsrBackend:
                 )
             log.info("loading qwen3-asr %s on %s", self.cfg.qwen_model, device)
             self._model = Model.from_pretrained(self.cfg.qwen_model, **kwargs)
+            self._device_used = device
         self._last_used = time.time()
         return self._model
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def device(self) -> str:
+        return self._device_used if self._model is not None else ""
+
+    def unload(self) -> bool:
+        """Drop the weights now (manual /model unload or before a device
+        move). Returns True when something was actually released."""
+        if self._model is None:
+            return False
+        self._model = None
+        self._device_used = ""
+        self.release_gpu()
+        return True
+
+    @staticmethod
+    def release_gpu() -> None:
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def set_device_override(self, device: str) -> None:
+        """'cpu' | 'cuda' | '' (back to config/auto). Applies on the NEXT
+        load; a loaded model is reloaded by the caller via unload()+_load()."""
+        self._force_device = (device or "").strip().lower()
 
     def unload_if_idle(self, now: float | None = None) -> bool:
         limit = self.cfg.qwen_unload_idle_sec
@@ -216,6 +259,72 @@ class AsrChain:
         if self._qwen is not None:
             self._qwen.unload_if_idle()
 
+    # --------------------------------------------- manual model control
+    # (/model load|unload|ram|vram): local weights only -- an api provider
+    # has no footprint here
+    def local_loaded(self) -> bool:
+        if self._qwen is not None and self._qwen.loaded:
+            return True
+        return self._local_model is not None
+
+    def local_device(self) -> str:
+        if self._qwen is not None and self._qwen.loaded:
+            return "gpu" if self._qwen.device.startswith("cuda") else "ram"
+        if self._local_model is not None:
+            return "ram"  # faster-whisper runs CPU int8
+        return ""
+
+    async def load_local(self) -> str:
+        """Warm the local backend up; returns a one-line result."""
+        provider, note = self.resolve()
+        if provider == "qwen":
+            if self._qwen is None:
+                return "qwen-asr 未安装"
+            await _to_thread(self._qwen._load)
+            return f"qwen-asr 已加载（{self._qwen.device}）"
+        if provider == "local":
+            await _to_thread(self._load_whisper)
+            return "faster-whisper 已加载（cpu）"
+        return note or "当前 ASR 不走本地模型"
+
+    def _load_whisper(self):
+        WhisperModel = _faster_whisper()
+        if WhisperModel is None:
+            raise RuntimeError("local: 未安装 faster-whisper")
+        if self._local_model is None:
+            self._local_model = WhisperModel(
+                self.cfg.local_model, device="cpu", compute_type="int8"
+            )
+
+    def unload_local(self) -> str:
+        parts = []
+        if self._qwen is not None and self._qwen.unload():
+            parts.append("qwen-asr")
+        if self._local_model is not None:
+            self._local_model = None
+            parts.append("faster-whisper")
+        QwenAsrBackend.release_gpu()
+        return "、".join(parts)
+
+    async def move_local(self, device: str) -> str:
+        """'cpu' | 'cuda'. faster-whisper is CPU-only; qwen-asr reloads on
+        the requested device (only worth it when it was already loaded --
+        an idle model just records the preference for its next load)."""
+        if self._qwen is not None:
+            was_loaded = self._qwen.loaded
+            self._qwen.set_device_override(device)
+            if device == "cuda" and not _cuda_available():
+                self._qwen.set_device_override("")
+                return "qwen-asr: 无可用 CUDA"
+            if was_loaded:
+                self._qwen.unload()
+                await _to_thread(self._qwen._load)
+                return f"qwen-asr 已迁移到 {self._qwen.device}"
+            return f"qwen-asr 未加载，下次加载用 {device}"
+        if self._local_model is not None:
+            return "faster-whisper 仅支持 CPU（已是内存）"
+        return "本地 ASR 未加载"
+
     async def _transcribe_api(self, p: Path, duration_sec: float = 0.0) -> str:
         chain = self.llm.resolve("asr")
         declared = [(n, e) for n, e in chain if getattr(e.caps, "asr", False)]
@@ -266,6 +375,15 @@ async def _to_thread(fn, *a):
     import asyncio
 
     return await asyncio.to_thread(fn, *a)
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 VOICE_PLACEHOLDER_RE = re.compile(r"\[语音:[\d.]+s?\]")
@@ -431,6 +549,40 @@ class OcrChain:
             return "\n".join(str(line[1]) for line in result).strip()
 
         return await _to_thread(_run)
+
+    # --------------------------------------------- manual model control
+    def local_loaded(self) -> bool:
+        return self._local is not None
+
+    def local_device(self) -> str:
+        return "ram" if self._local is not None else ""  # onnxruntime CPU
+
+    async def load_local(self) -> str:
+        provider, note = self.resolve()
+        if provider != "local":
+            return note or "当前 OCR 不走本地模型"
+        await _to_thread(self._load_rapidocr)
+        return "rapidocr 已加载（cpu）"
+
+    def _load_rapidocr(self):
+        RapidOCR = _rapidocr()
+        if RapidOCR is None:
+            raise RuntimeError("local: 未安装 rapidocr-onnxruntime")
+        if self._local is None:
+            self._local = RapidOCR()
+
+    def unload_local(self) -> str:
+        if self._local is None:
+            return ""
+        self._local = None
+        return "rapidocr"
+
+    async def move_local(self, device: str) -> str:
+        if self._local is None:
+            return "本地 OCR 未加载"
+        if device == "cpu":
+            return "rapidocr 已在 CPU（内存）"
+        return "rapidocr(onnxruntime) 仅支持 CPU，不可迁 GPU"
 
 
 # --------------------------------------------------------- value scoring
