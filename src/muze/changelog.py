@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.166",
+        "date": "2026-11-01",
+        "changes": [
+            "新增 /model 命令统管所有本地模型：无参列出各模型（embedding/ASR/OCR）加载状态与所在设备；load=全部预载；unload=全部卸载并清显存缓存；ram/vram=已加载模型原地迁内存/显存（embedding 原地迁移，qwen-asr 重载迁移；faster-whisper 与 rapidocr 仅支持 CPU 会如实说明）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.165",
         "date": "2026-10-31",
         "changes": [

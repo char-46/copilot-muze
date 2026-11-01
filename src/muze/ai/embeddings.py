@@ -307,6 +307,38 @@ class Embedder:
                     pass
         self._device = device
 
+    # --------------------------------------------- manual model control
+    # (/model load|unload|ram|vram)
+    @property
+    def loaded(self) -> bool:
+        return self._local is not None
+
+    @property
+    def device_label(self) -> str:
+        return ("gpu" if self._device == "cuda" else "ram") if self._local is not None else ""
+
+    async def move(self, device: str, governor=None) -> str:
+        """'cpu' | 'cuda'. A loaded model MOVES in place (sentence-transformers
+        sessions survive .to()); an unloaded one just loads where asked."""
+        dev = "cuda" if device == "cuda" else "cpu"
+        if dev == "cuda":
+            from muze.perception import _cuda_available
+
+            if not _cuda_available():
+                return "无可用 CUDA"
+        async with self._lock:
+            if self._local is None:
+                try:
+                    await self._load_local(dev, governor)
+                    return f"已加载到 {'GPU' if dev == 'cuda' else '内存'}"
+                except Exception as e:
+                    return f"加载失败: {e}"
+            try:
+                await asyncio.to_thread(self._move_local, dev)
+                return f"已迁移到 {'GPU(vram)' if dev == 'cuda' else '内存(ram)'}"
+            except Exception as e:
+                return f"迁移失败: {e}"
+
     # -------------------------------------------------------------- embed
     async def embed(self, texts: list[str], query: bool = False) -> list[list[float]]:
         if not texts:

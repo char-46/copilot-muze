@@ -2486,11 +2486,140 @@ class ControlService:
                 return CommandOutcome.err(f"PDF 已生成但发送失败（{path}）: {e}")
         return CommandOutcome(f"会话 #{session.id} 的 PDF 已生成并发送")
 
-    @slash("embed", "/embed unload", "强制卸载本地 embedding 模型（释放显存/内存；下次使用自动重载）", write=True)
+    @slash(
+        "model", "/model [load|unload|ram|vram]",
+        "本地模型管理：无参=状态清单；load=全部预载；unload=全部卸载；ram/vram=已载模型迁内存/显存（仅支持迁移的模型）",
+        scope="app", write=True,
+    )
+    async def cmd_model(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        from muze.perception import _cuda_available
+
+        rag = getattr(self.runtime, "rag", None)
+        emb = getattr(rag, "embedder", None) if rag is not None else None
+        asr = getattr(self.runtime, "asr", None)
+        ocr = getattr(self.runtime, "ocr", None)
+        gov = getattr(rag, "governor", None) if rag is not None else None
+
+        # ---- status ---------------------------------------------------
+        def _dev_txt(dev: str) -> str:
+            return {"gpu": "显存(vram)", "ram": "内存(ram)"}.get(dev, "—")
+
+        def _status() -> list[str]:
+            lines = ["本地模型状态:"]
+            if emb is not None:
+                if emb.loaded:
+                    lines.append(
+                        f"- embedding({getattr(emb.cfg, 'model', '') or emb.model_id}): "
+                        f"已加载 · {_dev_txt(emb.device_label)}"
+                    )
+                else:
+                    lines.append("- embedding: 未加载")
+            else:
+                lines.append("- embedding: 未启用")
+            if asr is not None:
+                p, note = asr.resolve()
+                who = {"qwen": "qwen-asr", "local": "faster-whisper"}.get(p, "")
+                if who:
+                    state = f"已加载 · {_dev_txt(asr.local_device())}" if asr.local_loaded() else "未加载"
+                    lines.append(f"- ASR({who}): {state}")
+                else:
+                    lines.append(f"- ASR: 不走本地（{note or p or '关闭'}）")
+            else:
+                lines.append("- ASR: 未启用")
+            if ocr is not None:
+                p, note = ocr.resolve()
+                if p == "local":
+                    state = f"已加载 · {_dev_txt(ocr.local_device())}" if ocr.local_loaded() else "未加载"
+                    lines.append(f"- OCR(rapidocr): {state}")
+                else:
+                    lines.append(f"- OCR: 不走本地（{note or p or '关闭'}）")
+            else:
+                lines.append("- OCR: 未启用")
+            lines.append(
+                "CUDA: " + ("可用" if _cuda_available() else "不可用（只能 ram）")
+            )
+            return lines
+
+        sub = (args[0].lower() if args else "").strip()
+        if not sub or sub == "status":
+            return CommandOutcome("\n".join(_status()))
+
+        if sub in ("unload", "free", "release"):
+            done: list[str] = []
+            if emb is not None:
+                try:
+                    if await emb.force_unload():
+                        done.append("embedding")
+                except Exception as e:
+                    done.append(f"embedding(失败:{e})")
+            if asr is not None:
+                try:
+                    r = asr.unload_local()
+                    if r:
+                        done.append(r)
+                except Exception as e:
+                    done.append(f"ASR(失败:{e})")
+            if ocr is not None:
+                try:
+                    r = ocr.unload_local()
+                    if r:
+                        done.append(r)
+                except Exception as e:
+                    done.append(f"OCR(失败:{e})")
+            return CommandOutcome(
+                "已卸载: " + "、".join(done) if done else "当前没有已加载的本地模型"
+                + ("\n（显存缓存已清）" if done else "")
+            )
+
+        if sub == "load":
+            out: list[str] = []
+            if emb is not None:
+                try:
+                    await emb.prepare(gov, force=True)
+                    out.append(f"embedding · {emb.device_label or '加载失败'}")
+                except Exception as e:
+                    out.append(f"embedding(失败:{e})")
+            if asr is not None:
+                try:
+                    out.append(await asr.load_local())
+                except Exception as e:
+                    out.append(f"ASR(失败:{e})")
+            if ocr is not None:
+                try:
+                    out.append(await ocr.load_local())
+                except Exception as e:
+                    out.append(f"OCR(失败:{e})")
+            return CommandOutcome("预载完成:\n- " + "\n- ".join(out))
+
+        if sub in ("ram", "cpu", "mem", "memory"):
+            out = []
+            if emb is not None:
+                out.append("embedding " + await emb.move("cpu", gov))
+            if asr is not None:
+                out.append(await asr.move_local("cpu"))
+            if ocr is not None:
+                out.append(await ocr.move_local("cpu"))
+            return CommandOutcome("\n".join(out) or "没有可控的本地模型")
+
+        if sub in ("vram", "gpu", "cuda", "gram"):
+            if not _cuda_available():
+                return CommandOutcome.err("无可用 CUDA，只能 /model ram")
+            out = []
+            if emb is not None:
+                out.append("embedding " + await emb.move("cuda", gov))
+            if asr is not None:
+                out.append(await asr.move_local("cuda"))
+            if ocr is not None:
+                out.append(await ocr.move_local("cuda"))
+            return CommandOutcome("\n".join(out) or "没有可控的本地模型")
+
+        return CommandOutcome.err("用法: /model [load|unload|ram|vram]（无参看状态）")
+
+    @slash("embed", "/embed unload", "强制卸载本地 embedding 模型（释放显存/内存；下次使用自动重载）；全部本地模型用 /model unload", write=True)
     async def cmd_embed(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         sub = (args[0].lower() if args else "").strip()
         if sub != "unload":
-            return CommandOutcome("用法: /embed unload", is_error=True)
+            return CommandOutcome("用法: /embed unload（全部本地模型用 /model unload）", is_error=True)
         rag = getattr(self.runtime, "rag", None)
         emb = getattr(rag, "embedder", None) if rag is not None else None
         if emb is None:
