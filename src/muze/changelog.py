@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.169",
+        "date": "2026-11-02",
+        "changes": [
+            "负责人列显示收紧：名片式长名（名字 部门 手机号）在表格里只留名字（完整名片仍在合并转发正文行）；修一个回归——assignee 键解析后表格误用解析前的原始键；最近完成的备注列放宽到 60 字，减少截半句。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.168",
         "date": "2026-11-02",
         "changes": [
