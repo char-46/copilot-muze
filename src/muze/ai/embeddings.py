@@ -45,6 +45,13 @@ class Embedder:
         self._last_use = 0.0
         self._last_busy_unload = 0.0  # debounce for busy-unload vs reload churn
         self._BUSY_RELOAD_GRACE = 180.0  # seconds a busy-unloaded model stays down
+        # anti promote/evict ping-pong (live 2026-11-02): after a VRAM
+        # eviction, promotion is refused for promote_cooldown_sec (doubling
+        # per repeat, capped 1h); a promote that survives 30min resets the streak
+        self._last_vram_evict = 0.0
+        self._evict_streak = 0
+        self._promoted_at = 0.0
+        self._PROMOTE_STABLE_SEC = 1800.0
 
     # ------------------------------------------------------------ status
     @property
@@ -259,24 +266,81 @@ class Embedder:
             else:
                 await asyncio.to_thread(self._move_local, "cpu")
                 action = "cpu"
-            log.info("RAG embedder evicted from GPU (%s) -> %s", why, action)
+            now = time.monotonic()
+            if self._promoted_at and now - self._promoted_at >= self._PROMOTE_STABLE_SEC:
+                self._evict_streak = 0  # that promotion had a good run
+            self._evict_streak += 1
+            self._last_vram_evict = now
+            log.info(
+                "RAG embedder evicted from GPU (%s) -> %s [streak %s, promote cooldown %.0fs]",
+                why, action, self._evict_streak,
+                self._promote_cooldown(),
+            )
             return action
+
+    def _promote_cooldown(self) -> float:
+        """Seconds promotion stays refused after the last eviction."""
+        base = float(self.cfg.promote_cooldown_sec or 0)
+        if base <= 0:
+            return 0.0
+        return min(base * (2 ** max(0, self._evict_streak - 1)), 3600.0)
+
+    async def unload_if_on_battery(self, governor=None) -> str | None:
+        """No AC power -> the resident model shouldn't hold RAM/VRAM at all
+        (user direction 2026-11-03: 无ac电源卸载模型). Desktops report None
+        (no battery sensor) and are never touched. Reloads on demand once
+        power returns. Returns "battery" when a drop happened."""
+        if not self.cfg.battery_unload or self._local is None or governor is None:
+            return None
+        try:
+            plugged = governor.power_plugged()
+        except Exception:
+            return None
+        if plugged is not False:
+            return None
+        async with self._lock:
+            if self._local is None:
+                return None
+            self._local = None
+            self._device = ""
+            self._last_busy_unload = time.monotonic()
+            log.info("RAG embedder unloaded (on battery, no AC power)")
+            return "battery"
 
     async def promote_to_gpu_if_fits(self, governor=None) -> bool:
         """The mirror of eviction: once a CPU-resident model fits the
         comfortable GPU tier again (game exited; headroom + util gates give
         natural hysteresis vs the evict threshold), reload it on the GPU —
         reload rather than .to() so dtype/thread choices stay fresh. An
-        explicitly configured cpu device is never promoted."""
+        explicitly configured cpu device is never promoted.
+
+        Three extra guards (live 2026-11-02 ping-pong + user direction
+        2026-11-03): no promotion on battery, none during the post-eviction
+        cooldown, and used% must sit below the promote cap (evict-gap)."""
         if self._local is None or self._device != "cpu" or governor is None:
             return False
         if (self.cfg.device or "auto") not in ("auto", "cuda"):
+            return False
+        if self.cfg.battery_unload:
+            try:
+                if governor.power_plugged() is False:
+                    return False
+            except Exception:
+                pass
+        cd = self._promote_cooldown()
+        if cd > 0 and self._last_vram_evict and time.monotonic() - self._last_vram_evict < cd:
             return False
         try:
             fits, why = governor.gpu_fits()
         except Exception:
             return False
         if not fits:
+            return False
+        try:
+            below_line, why2 = governor.gpu_promote_ok()
+        except Exception:
+            below_line = True  # governor without the newer probe
+        if not below_line:
             return False
         async with self._lock:
             if self._local is None or self._device != "cpu":
@@ -285,6 +349,7 @@ class Embedder:
             self._device = ""
             try:
                 await self._load_local("cuda", governor)
+                self._promoted_at = time.monotonic()
                 log.info("RAG embedder promoted back to GPU (%s)", why)
                 return True
             except Exception as e:

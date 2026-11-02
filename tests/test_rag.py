@@ -593,15 +593,23 @@ class _FakeSTModel:
 
 
 class _PressureGovernor:
-    def __init__(self, pressed, fits=False):
+    def __init__(self, pressed, fits=False, promote_ok=True, plugged=None):
         self.pressed = pressed
         self.fits = fits
+        self.promote_ok = promote_ok
+        self.plugged = plugged
 
     def vram_pressure(self):
         return (self.pressed, "vram 95% >= 85%") if self.pressed else (False, "vram 40%")
 
     def gpu_fits(self):
         return (True, "ok") if self.fits else (False, "no")
+
+    def gpu_promote_ok(self):
+        return (self.promote_ok, "cap") if self.promote_ok else (False, "vram 80% > cap 65%")
+
+    def power_plugged(self):
+        return self.plugged
 
 
 def _st_embedder():
@@ -658,6 +666,101 @@ async def test_gpu_promotion_reloads_on_cuda_when_fits():
     emb3._device = "cpu"
     emb3.cfg.device = "cpu"
     assert await emb3.promote_to_gpu_if_fits(_PressureGovernor(False, fits=True)) is False
+
+
+# ------------------------- anti ping-pong + battery (2026-11-02/03)
+def _cpu_embedder():
+    emb = _st_embedder()
+    emb._device = "cpu"
+    return emb
+
+
+async def test_promotion_refused_above_the_promote_cap():
+    """A game hovering near the evict line: gpu_fits may pass but used% sits
+    above evict%-gap -> no promotion, no ping-pong (live 2026-11-02)."""
+    emb = _cpu_embedder()
+
+    async def boom(device, governor=None, full_threads=False):
+        raise AssertionError("must not reload near the evict line")
+
+    emb._load_local = boom
+    assert await emb.promote_to_gpu_if_fits(
+        _PressureGovernor(False, fits=True, promote_ok=False)
+    ) is False
+
+
+async def test_promotion_cooldown_after_eviction_doubles_per_streak():
+    emb = _st_embedder()  # resident on cuda: eviction acts and starts the cooldown
+    await emb.evict_if_vram_pressure(_PressureGovernor(pressed=True))
+    assert emb._device == "cpu"
+    assert emb._evict_streak == 1 and emb._promote_cooldown() == 900.0
+    # promote refused inside the cooldown even when everything fits
+    assert await emb.promote_to_gpu_if_fits(_PressureGovernor(False, fits=True)) is False
+    # cooldown elapsed -> allowed again
+    import time as _t
+
+    emb._last_vram_evict = _t.monotonic() - 901
+    loads = []
+
+    async def fake_load(device, governor=None, full_threads=False):
+        loads.append(device)
+        emb._device = "cuda"
+        emb._local = _FakeSTModel()  # a real load restores the model handle
+
+    emb._load_local = fake_load
+    assert await emb.promote_to_gpu_if_fits(_PressureGovernor(False, fits=True)) is True
+    # quick re-evict (promote did NOT survive 30min) -> streak grows, doubles
+    await emb.evict_if_vram_pressure(_PressureGovernor(pressed=True))
+    assert emb._evict_streak == 2 and emb._promote_cooldown() == 1800.0
+
+
+async def test_stable_promotion_resets_the_evict_streak():
+    emb = _st_embedder()
+    emb._evict_streak = 3  # had been thrashing
+    import time as _t
+
+    emb._promoted_at = _t.monotonic() - 3600  # last promote lived 1h -> good run
+    await emb.evict_if_vram_pressure(_PressureGovernor(pressed=True))
+    assert emb._evict_streak == 1  # back to the base cooldown
+
+
+async def test_battery_unloads_the_model_and_blocks_promotion():
+    """User direction 2026-11-03: 无ac电源卸载模型."""
+    emb = _st_embedder()  # resident, cuda
+    assert await emb.unload_if_on_battery(
+        _PressureGovernor(False, plugged=False)
+    ) == "battery"
+    assert emb._local is None and emb._device == ""
+    # desktop (no battery sensor) and plugged-in are never touched
+    emb2 = _st_embedder()
+    assert await emb2.unload_if_on_battery(_PressureGovernor(False, plugged=None)) is None
+    assert await emb2.unload_if_on_battery(_PressureGovernor(False, plugged=True)) is None
+    assert emb2._local is not None
+    # promotion is refused while on battery
+    emb3 = _cpu_embedder()
+
+    async def boom(device, governor=None, full_threads=False):
+        raise AssertionError("no GPU residency on battery")
+
+    emb3._load_local = boom
+    assert await emb3.promote_to_gpu_if_fits(
+        _PressureGovernor(False, fits=True, plugged=False)
+    ) is False
+    # the drop honors the config switch
+    emb4 = _st_embedder()
+    emb4.cfg.battery_unload = False
+    assert await emb4.unload_if_on_battery(_PressureGovernor(False, plugged=False)) is None
+
+
+def test_governor_promote_cap_below_evict_line():
+    g = _gov(power=True, cpu=5, gpu=5, free=8)
+    g.gpu_vram_used_pct = lambda: 80.0  # above 85-20=65 -> refuse
+    ok, why = g.gpu_promote_ok()
+    assert ok is False and "promote cap" in why
+    g.gpu_vram_used_pct = lambda: 60.0
+    assert g.gpu_promote_ok() == (True, "ok")
+    g.cfg.embedding.vram_evict_pct = 0
+    assert g.gpu_promote_ok() == (True, "evict off")
 
 
 def test_governor_vram_pressure_and_device_gate():

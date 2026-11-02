@@ -870,6 +870,10 @@ class App:
             if rag is None or not rag.enabled or rag.embedder is None:
                 continue
             try:
+                # order matters: battery drop first (a model on battery
+                # shouldn't be touched by GPU policy at all), then the
+                # evict->promote pair, then load-based unload
+                await rag.embedder.unload_if_on_battery(rag.governor)
                 await rag.embedder.evict_if_vram_pressure(rag.governor)
                 await rag.embedder.promote_to_gpu_if_fits(rag.governor)
                 await rag.embedder.unload_if_busy(rag.governor)
