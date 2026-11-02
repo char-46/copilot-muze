@@ -306,7 +306,10 @@ class MediaStore:
         try:
             url = await self.resolve_url(row, hint_url=prefer_url)
         except Exception as e:
-            await self.repo.update_media(mid, status="failed", error=f"url: {e}")
+            await self.repo.update_media(
+                mid, status="failed", error=f"url: {e}",
+                attempts=int(row.get("attempts") or 0) + 1,
+            )
             log.warning("MEDIA url-fail #%s %s/%s seq=%s: %s", mid, row["scene"], row["peer_id"], row["message_seq"], e)
             return {**row, "status": "failed", "error": f"url: {e}"}
 
@@ -319,8 +322,13 @@ class MediaStore:
             log.warning("MEDIA gone  #%s kind=%s: %s (server no longer has it)", mid, row["kind"], e)
             return {**row, "status": "gone", "error": str(e)[:300]}
         except Exception as e:
-            await self.repo.update_media(mid, status="failed", error=str(e)[:300])
-            log.warning("MEDIA dl-fail #%s %s: %s", mid, url[:120], e)
+            attempts = int(row.get("attempts") or 0) + 1
+            await self.repo.update_media(
+                mid, status="failed", error=str(e)[:300], attempts=attempts
+            )
+            log.warning(
+                "MEDIA dl-fail #%s %s: %s (attempt %s)", mid, url[:120], e, attempts
+            )
             return {**row, "status": "failed", "error": str(e)[:300]}
         if not orig_name:
             lp = _local_path(url)
@@ -641,8 +649,11 @@ class MediaStore:
         return content_hash, total, dest, md5hex
 
     # --------------------------------------------------------------- retry
-    async def retry_failed(self, limit: int = 50) -> int:
-        rows = await self.repo.media_pending(limit)
+    async def retry_failed(self, limit: int = 50, max_attempts: int = 0) -> int:
+        """max_attempts > 0: rows that already failed that many downloads
+        are skipped for good (expired one-time CDN tokens never come back;
+        user feedback 2026-11-03: 过期链接不再重试). 0 = retry forever."""
+        rows = await self.repo.media_pending(limit, max_attempts=max_attempts)
         ok = 0
         for i, row in enumerate(rows):
             if i:

@@ -337,7 +337,7 @@ class Repository:
         self, media_id: int, *, status: str, file_path: str | None = None,
         file_size: int | None = None, error: str | None = None,
         content_hash: str | None = None, summary: str | None = None,
-        asr_ts: str | None = None,
+        asr_ts: str | None = None, attempts: int | None = None,
     ) -> None:
         await self.conn.execute(
             """
@@ -346,10 +346,12 @@ class Repository:
                              content_hash=COALESCE(?, content_hash),
                              summary=COALESCE(?, summary),
                              asr_ts=COALESCE(?, asr_ts),
+                             attempts=COALESCE(?, attempts),
                              error=?, updated_at=?
             WHERE id=?
             """,
-            (status, file_path, file_size, content_hash, summary, asr_ts, error, _now(), media_id),
+            (status, file_path, file_size, content_hash, summary, asr_ts,
+             attempts, error, _now(), media_id),
         )
         await self.conn.commit()
 
@@ -366,16 +368,20 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def media_pending(self, limit: int = 100) -> list[dict]:
+    async def media_pending(self, limit: int = 100, max_attempts: int = 0) -> list[dict]:
         # rows whose URL can never be resolved again (expired sticker temp
         # urls, rows with no resource/file id) are permanent; retrying them
-        # every cycle only produced a burst of identical warnings forever
+        # every cycle only produced a burst of identical warnings forever.
+        # Same for rows that already failed max_attempts downloads (user
+        # feedback 2026-11-03: 过期链接不再重试 -- max_attempts=0 keeps the
+        # old retry-forever behavior).
         async with self.conn.execute(
             "SELECT * FROM media WHERE status IN ('pending','failed') "
             "AND NOT (status='failed' AND error LIKE 'url: %' "
             "AND (error LIKE '%expired%' OR error LIKE '%no way to resolve%')) "
+            "AND NOT (status='failed' AND ? > 0 AND attempts >= ?) "
             "ORDER BY id DESC LIMIT ?",
-            (limit,),
+            (max_attempts, max_attempts, limit),
         ) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]

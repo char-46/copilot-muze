@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import time
+from typing import Awaitable, Callable
 
 from muze.chatlog import ChatLog, epoch_iso
 from muze.core.service import ControlContext, ControlService, is_llm_invocation
@@ -43,6 +44,7 @@ class Scheduler:
         chatlog: ChatLog,
         *,
         ready: asyncio.Event | None = None,
+        gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.repo = repo
         self.service = service
@@ -54,6 +56,16 @@ class Scheduler:
         # messages missed while the process was down has finished, otherwise
         # a due digest reads a DB that still lacks them (see App._release_sched_gate)
         self._ready = ready
+        # recurring gate: "may due tasks run NOW?" -- False while a roaming
+        # pull is in flight (the 00:05 daily full sweep above all): the
+        # nightly dream must not read a half-pulled day, it defers until the
+        # pull lands (user direction 2026-11-03: 每天消息零点五分没拉完的
+        # 时候做梦延期). A broken probe never stalls the schedule.
+        self._gate = gate
+        self._gate_stalls = 0
+        # dream in-flight bookkeeping: /restart defers behind it (user
+        # direction 2026-11-03: 发版要等客户端做完梦)
+        self._digest_runners: dict[int, tuple[asyncio.Task, float]] = {}
 
     # ------------------------------------------------------------- control
     async def start(self) -> None:
@@ -124,14 +136,52 @@ class Scheduler:
 
     async def tick(self) -> int:
         await self._retry_pending_deliveries()
+        if not await self._gate_ok():
+            self._gate_stalls += 1
+            # first miss + every ~5min: visible in the log, not every 20s
+            if self._gate_stalls == 1 or self._gate_stalls % 15 == 0:
+                log.info(
+                    "scheduler tick deferred (%s): message pull still running",
+                    self._gate_stalls,
+                )
+            return 0
+        self._gate_stalls = 0
         rows = await self.repo.claim_due_tasks(LEASE_SECONDS)
         for row in rows:
             if row["id"] in self._inflight:
                 continue
             runner = asyncio.create_task(self._run(row))
             self._inflight[row["id"]] = runner
-            runner.add_done_callback(lambda _t, _id=row["id"]: self._inflight.pop(_id, None))
+            if row.get("note") == self.DIGEST_NOTE:
+                self._digest_runners[row["id"]] = (runner, time.time())
+
+            def _done(_t, _id=row["id"]):
+                self._inflight.pop(_id, None)
+                self._digest_runners.pop(_id, None)
+
+            runner.add_done_callback(_done)
         return len(rows)
+
+    async def _gate_ok(self) -> bool:
+        if self._gate is None:
+            return True
+        try:
+            return bool(await self._gate())
+        except Exception:
+            log.exception("scheduler gate probe failed; allowing the tick")
+            return True
+
+    # ------------------------------------------------------ dream in flight
+    def digest_runner(self) -> asyncio.Task | None:
+        """The in-flight nightly-dream task, if one is running right now."""
+        for runner, _t0 in self._digest_runners.values():
+            return runner
+        return None
+
+    def digest_running_sec(self) -> float:
+        """How long the current dream has been running; 0 = not running."""
+        now = time.time()
+        return max((now - t0) for _r, t0 in self._digest_runners.values()) if self._digest_runners else 0.0
 
     async def _run(self, row: dict) -> None:
         try:

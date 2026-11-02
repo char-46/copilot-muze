@@ -23,6 +23,11 @@ Python 3.11+, dependencies managed with `uv`.
 - The user runs a LIVE instance from this checkout on this machine. Never
   stop/kill muze processes unless explicitly asked; code/config flips go
   through the user's own `/restart`.
+- Release timing: the box runs its nightly dream (做梦) at ~01:00 and may
+  run long; NEVER deploy/flip versions during the dream (user direction
+  2026-11-03). Since a171 `/restart` & `/full-restart` auto-defer behind a
+  running dream, so a deploy in that window shows a stale version after
+  the wait — treat that as "queued", verify again after, don't force it.
 
 ## Test gate
 
