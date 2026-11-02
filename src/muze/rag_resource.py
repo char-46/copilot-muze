@@ -134,6 +134,26 @@ class ResourceGovernor:
             return False, f"gpu busy {util:.0f}%"
         return True, "ok"
 
+    def gpu_promote_ok(self) -> tuple[bool, str]:
+        """Promotion bar, separate from eviction: used% must sit comfortably
+        BELOW the evict line (evict_pct - gap).
+
+        gpu_fits' free-vs-weight check OVERLAPS the evict threshold on big
+        cards (24G: promote at <=90% used vs evict at >=85%) — with a game
+        hovering near the line the model ping-ponged every steward pass,
+        each side a full model load/move (live 2026-11-02, user: 电脑很卡)."""
+        evict = float(self.cfg.embedding.vram_evict_pct or 0)
+        if evict <= 0:
+            return True, "evict off"
+        gap = max(0.0, float(self.cfg.embedding.gpu_promote_gap_pct or 0))
+        used = self.gpu_vram_used_pct()
+        if used is None:
+            return False, "no nvml"
+        cap = evict - gap
+        if used > cap:
+            return False, f"vram {used:.0f}% > promote cap {cap:.0f}% (evict {evict:.0f}%-gap {gap:.0f}%)"
+        return True, "ok"
+
     def vram_pressure(self) -> tuple[bool, str]:
         """True when SYSTEM-WIDE VRAM usage is high (a game started, a model
         in another app, ...) — a GPU-resident embedding model should be

@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.170",
+        "date": "2026-11-03",
+        "changes": [
+            "显存治理防乒乓 + 电池卸载（用户反馈 2026-11-02 电脑很卡：游戏贴着驱逐线时 embedding 每 60s 晋升↔驱逐整模型重载，4 核 + 数 GB 抖动）：晋升需 used% ≤ 驱逐线-20（gpu_promote_gap_pct），被驱逐后 15 分钟内不再晋升（promote_cooldown_sec，连击翻倍封顶 1 小时，稳定驻留 30 分钟复位）；无 AC 电源（psutil 电池）直接卸载本地 embedding 模型并禁止晋升（battery_unload，台式机无电池传感器不受影响）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.169",
         "date": "2026-11-02",
         "changes": [

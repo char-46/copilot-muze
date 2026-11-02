@@ -474,6 +474,14 @@ class RagEmbedding(BaseModel):
     gpu_reserve_gb: float = 0.8  # comfortable tier headroom (squeeze tier eats it)
     gpu_max_util: float = 50.0  # use GPU only while utilisation is below this
     vram_evict_pct: float = 85.0  # system-wide VRAM usage >= this evicts a GPU-resident model to RAM (0=off)
+    # anti ping-pong (live 2026-11-02: a game near the evict line made the
+    # embedder promote->evict->promote every pass, 4 cores + GBs of churn):
+    # promotion additionally requires used% <= vram_evict_pct - gap, and is
+    # refused for promote_cooldown_sec after an eviction (doubling per
+    # repeat up to 1h; 0 disables the cooldown)
+    gpu_promote_gap_pct: float = 20.0
+    promote_cooldown_sec: float = 900.0
+    battery_unload: bool = True  # on battery (psutil) drop the resident model entirely
     cpu_max_threads: int = 4  # cap for CPU inference (dynamic below this)
     unload_idle_sec: float = 1800.0  # free the local model after this idle (0=never)
     # busy unload: a machine grinding at these levels doesn't just skip
