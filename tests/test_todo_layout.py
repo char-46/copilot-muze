@@ -93,6 +93,26 @@ async def test_todo_plain_nodes_one_fact_per_line(svc):
     assert all("group/" not in ln for ln in lines)
 
 
+async def test_todo_assignee_peer_key_shows_a_name(svc):
+    """The dream sync sometimes stores 'friend/123' as the assignee; the
+    负责人 column must show a human name (cached > title prefix > number)."""
+    from muze.digest import local_date
+
+    service, repo = svc
+    await repo.add_followup(
+        "friend/10001", "张宸恺：10-30大课堂拍照，备份后交用户", "", "user",
+        local_date(), assignee="friend/2953047163",
+    )
+    await repo.add_followup(
+        "friend/10001", "无名字前缀的布置", "", "user",
+        local_date(), assignee="friend/88888888",
+    )
+    out = await service.run_command("todo", _cli())
+    assert "| #1 | 张宸恺：10-30大课堂拍照，备份后交用户 | 张宸恺 |" in out.text
+    assert "friend/" not in out.text  # never a raw key in the image
+    assert "| #2 | 无名字前缀的布置 | 好友88888888 |" in out.text  # last resort
+
+
 async def test_todo_node_layout_forces_the_forward_chain(svc, monkeypatch):
     """A short /todo must still ride as ONE merged forward: the
     one-item-per-bubble layout is the point, not the length."""

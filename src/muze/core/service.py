@@ -1137,9 +1137,24 @@ class ControlService:
             subj = label_of.get(r["subject"] or "", "全局")
             who = str(r.get("assignee") or "").strip()
             state = followup_state_tag(r)
+            title = str(r["title"])
             if who:
                 delegated += 1
-            title = str(r["title"])
+                # the dream sync sometimes stores the peer KEY as the
+                # assignee -- show a human name, never friend/123 in a
+                # column meant for a person (user feedback 2026-11-02).
+                # No cached name -> the dream's own "受托人：事项" title
+                # prefix carries it; last resort stays the bare number.
+                if re.fullmatch(r"(?:friend|group)/\d+|\d+", who):
+                    k = "assignee:" + who
+                    if k not in label_of:
+                        label_of[k] = await self._subject_label(who)
+                    resolved = label_of[k]
+                    if re.fullmatch(r"(?:好友|群)\d+", resolved or ""):
+                        m2 = re.match(r"^([\u4e00-\u9fffA-Za-z0-9·]{1,12})[：:]", title)
+                        if m2:
+                            resolved = m2.group(1)
+                    who = resolved or who
             # ---- image row: the table carries the fields, one column each
             # (user feedback 2026-11-02: 全是字混着 friend/qq 号没法看)
             t_title = _todo_cell(title)

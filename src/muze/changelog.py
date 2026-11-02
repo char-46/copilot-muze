@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.168",
+        "date": "2026-11-02",
+        "changes": [
+            "待办负责人列去键化：dream 有时把 friend/号码 存进 assignee——展示层自动换成缓存昵称，无缓存时用标题里的受托人名（受托人：事项 格式），都没有才显示 好友+号码；同时待办同步提示词明确 assignee 一律填人名、号码只进 subject。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.167",
         "date": "2026-11-02",
         "changes": [
