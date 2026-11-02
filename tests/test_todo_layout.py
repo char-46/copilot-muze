@@ -113,6 +113,28 @@ async def test_todo_assignee_peer_key_shows_a_name(svc):
     assert "| #2 | 无名字前缀的布置 | 好友88888888 |" in out.text  # last resort
 
 
+async def test_todo_assignee_card_name_shortened_in_cell(svc):
+    """Friend cards read '名字 部门 手机号' -- the 负责人 cell keeps just the
+    name; the plain node keeps the full card."""
+    from muze.digest import local_date
+
+    service, repo = svc
+
+    class CardAdapter(_NameAdapter):
+        def cached_friend_name(self, uid):
+            return {10001: "张宸恺 内容采编部视频组 17788307167"}.get(uid, "")
+
+    service.adapter = CardAdapter()
+    await repo.add_followup(
+        "friend/10001", "大课堂拍照存档", "", "user", local_date(),
+        assignee="friend/10001",
+    )
+    out = await service.run_command("todo", _cli())
+    assert "| #1 | 大课堂拍照存档 | 张宸恺 | 等交付 |" in out.text
+    node = next(n for n in out.forward_nodes if n.startswith("#1 "))
+    assert "张宸恺 内容采编部视频组" in node  # full card stays in the node
+
+
 async def test_todo_node_layout_forces_the_forward_chain(svc, monkeypatch):
     """A short /todo must still ride as ONE merged forward: the
     one-item-per-bubble layout is the point, not the length."""

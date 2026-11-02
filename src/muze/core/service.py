@@ -61,7 +61,7 @@ def _todo_recent_md(recent: list[dict], today: str = "") -> str:
         note = (r.get("close_note") or "").strip()
         result = _TODO_CLOSE_VERB.get(r.get("status"), "关闭")
         if note:
-            result += "·" + _todo_cell(note[:40])
+            result += "·" + _todo_cell(note[:60])
         rows.append(
             f"| {_todo_cell(str(r['title'])[:24])} | {result} "
             f"| {_short_date(r.get('closed_date'), today)} |"
@@ -1155,6 +1155,11 @@ class ControlService:
                         if m2:
                             resolved = m2.group(1)
                     who = resolved or who
+            who_cell = who  # narrow table cell; may shorten below
+            # friend CARDS read "名字 部门 手机号" -- the narrow 负责人
+            # cell wants the name; the full card stays in the plain node
+            if who and len(who.split()) > 1:
+                who_cell = who.split()[0]
             # ---- image row: the table carries the fields, one column each
             # (user feedback 2026-11-02: 全是字混着 friend/qq 号没法看)
             t_title = _todo_cell(title)
@@ -1174,7 +1179,7 @@ class ControlService:
                 head, _, tail = due_cell.partition("⚠")
                 due_cell = f'{head}<font color="#b00000">⚠{tail}</font>'
             trows.append(
-                f"| #{_todo_cell(n)} | {t_title} | {_todo_cell(who) or '我'} "
+                f"| #{_todo_cell(n)} | {t_title} | {_todo_cell(who_cell) or '我'} "
                 f"| {_todo_cell(status)} | {due_cell} |"
             )
             # ---- plain-text node: one fact per line, no · walls
