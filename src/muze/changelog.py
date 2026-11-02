@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.167",
+        "date": "2026-11-02",
+        "changes": [
+            "/todo 与日报可读性重做：图片改为表格（#/事项/负责人/状态/截止 分列，按内容加权列宽、斑马纹、逾期红字、子任务缩进），正文不再是一整片混着 friend/qq 号的文字；纯文本合并转发改为一条一行（标题/负责·状态·截止/来源·日期 各占一行），来处显示缓存昵称而非裸 friend/12345；明确节点布局的命令无论长短都走合并转发；日报提示词改为手机扫读优先（短行、条目化、一行一个信息点）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.166",
         "date": "2026-11-01",
         "changes": [

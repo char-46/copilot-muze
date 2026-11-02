@@ -542,7 +542,14 @@ async def test_todo_builds_ordered_item_per_node_forward(svc):
     items = [n for n in out.forward_nodes if n.startswith("#")]
     got_ids = [int(n.split(" ", 1)[0][1:]) for n in items]
     assert got_ids == sorted([f1, f2, f3])  # ascending id = stable opening order
-    assert "**#" in out.text and "# 未结待办" in out.text  # markdown for the image
+    # markdown for the image: a table carries the fields, one column each
+    # (user feedback 2026-11-02: 全是字混着 friend/qq 号没法看)
+    assert "| # | 事项 | 负责人 | 状态 | 截止 |" in out.text
+    assert "# 未结待办" in out.text
+    # plain-text node: one fact per line, no raw friend/qq subject keys
+    n1 = next(n for n in out.forward_nodes if n.startswith("#2 第一件\n"))
+    assert "\n  来自 " in n1  # origin+dates on their own line, not a · wall
+    assert all("friend/" not in n and "group/" not in n for n in out.forward_nodes)
 
 
 # --------------------------------------------- dense numbering (2026-10-28)
@@ -831,8 +838,11 @@ async def test_todo_add_assignee_and_due(svc):
 
     await repo.add_followup("", "自办事项", "", "user", local_date())
     out = await service.run_command("todo", ctx)
-    assert "已布置给他人" in out.text and "负责人 小王" in out.text
-    assert "截止 2026-10-30" in out.text
+    assert "已布置给他人" in out.text and "小王" in out.text
+    assert "| 负责人 |" in out.text  # delegated column exists in the image table
+    assert "10-30" in out.text  # due shown short-form in its own column
+    node = next(n for n in out.forward_nodes if "小王交" in n or "交推送" in n)
+    assert "负责人 小王" in node  # plain node keeps the human phrase
     # overdue path: due yesterday
     await repo.close_followup(rows[0]["id"], status="dropped", closed_date=local_date())
     await repo.add_followup(
@@ -1003,4 +1013,6 @@ async def test_todo_shows_awaiting_acceptance(svc):
     )
     await repo.set_followup_delivered((await repo.list_followups())[0]["id"], "2026-10-29")
     out = await service.run_command("todo", ctx)
-    assert "待验收" in out.text and "等你验收" in out.text and "小王" in out.text
+    assert "待验收" in out.text and "小王" in out.text  # image table row
+    node = next(n for n in out.forward_nodes if "交推送" in n)
+    assert "待验收" in node and "等你验收" in node  # plain node spells it out
