@@ -416,9 +416,10 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await _migrate_v18_capability_wishes(conn)
         await _migrate_v19_followup_parent(conn)
         await _migrate_v20_close_note_links(conn)
-        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '20')")
+        await _migrate_v21_media_attempts(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '21')")
         await conn.commit()
-        log.info("database created (schema v20)")
+        log.info("database created (schema v21)")
         return
     async with conn.execute("SELECT value FROM meta WHERE key='schema_version'") as cur:
         row = await cur.fetchone()
@@ -510,6 +511,12 @@ async def migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         log.info("database migrated to schema v20 (close notes + link titles)")
         version = 20
+    if version < 21:
+        await _migrate_v21_media_attempts(conn)
+        await conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '21')")
+        await conn.commit()
+        log.info("database migrated to schema v21 (media retry attempts)")
+        version = 21
 
 
 async def _migrate_v20_close_note_links(conn: aiosqlite.Connection) -> None:
@@ -653,6 +660,19 @@ async def _migrate_v13_media_asr_ts(conn: aiosqlite.Connection) -> None:
     if not cols or "asr_ts" in cols:
         return
     await conn.execute("ALTER TABLE media ADD COLUMN asr_ts TEXT")
+
+
+async def _migrate_v21_media_attempts(conn: aiosqlite.Connection) -> None:
+    """media.attempts: failed download count (user feedback 2026-11-03:
+    过期链接不再重试 -- QQ's file-CDN links are one-time tokens; the same
+    dead rows warned every 10-minute cycle forever)."""
+    async with conn.execute("PRAGMA table_info(media)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if not cols or "attempts" in cols:
+        return
+    await conn.execute(
+        "ALTER TABLE media ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+    )
 
 
 async def _migrate_v12_value(conn: aiosqlite.Connection) -> None:

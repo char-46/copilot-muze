@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.171",
+        "date": "2026-11-03",
+        "changes": [
+            "做梦与发版的时序保护 + 过期链接停试（用户指示 2026-11-03）：①00:05 日全量拉取未完成时调度器不领任务，做梦自动顺延到拉取落地（间隔任务重锚到原时刻，不漂移不重复）；②/restart 与 /full-restart 在做梦进行中自动排队，做完再翻转（上限 30 分钟，防卡死）；③媒体下载失败计数（schema v21 media.attempts），超过 ingest.media_max_retries（默认 3，0=永远重试）不再重试——QQ 文件 CDN 的过期链接不再每 10 分钟刷一遍失败告警。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.170",
         "date": "2026-11-03",
         "changes": [

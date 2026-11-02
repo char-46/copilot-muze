@@ -1565,10 +1565,20 @@ class ControlService:
 
     @slash(
         "full-restart", "/full-restart",
-        "完整重启服务（start.ps1 -Restart：先停 daemon+serve 再拉起，比 /restart 彻底；硬杀，瞬时中断）",
+        "完整重启服务（start.ps1 -Restart：先停 daemon+serve 再拉起，比 /restart 彻底；硬杀，瞬时中断；做梦进行中会自动等它完成）",
         write=True,
     )
     async def cmd_full_restart(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
+        async def _perform() -> None:
+            out = await self._do_full_restart()
+            self.chatlog.log.info("FULLRESTART | queued run: %s", (out.text or "")[:120])
+
+        deferred = await self._defer_restart_behind_dream(_perform, "/full-restart")
+        if deferred is not None:
+            return deferred
+        return await self._do_full_restart()
+
+    async def _do_full_restart(self) -> CommandOutcome:
         script = self._scripts_dir() / "start.ps1"
         if not script.is_file():
             return CommandOutcome.err("scripts\\start.ps1 不存在，无法完整重启")
@@ -2825,12 +2835,58 @@ class ControlService:
             return CommandOutcome("reload 仅在 serve 进程内可用", is_error=True)
         return await reloader.reload()
 
-    @slash("restart", "/restart", "重启服务（由 muze daemon 接管）", local_only=True, scope="app", write=True)
+    @slash("restart", "/restart", "重启服务（由 muze daemon 接管；做梦进行中会自动等它完成）", local_only=True, scope="app", write=True)
     async def cmd_restart(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.runtime.request_restart is None:
             return CommandOutcome.err("重启钩子未装配（直接运行 serve 时请手动重启）")
+
+        async def _perform() -> None:
+            self.runtime.request_restart()
+
+        deferred = await self._defer_restart_behind_dream(_perform, "/restart")
+        if deferred is not None:
+            return deferred
         self.runtime.request_restart()
         return CommandOutcome("已请求重启：进程将重新启动（daemon 监督下由 daemon 拉起，否则自行重启）")
+
+    async def _defer_restart_behind_dream(self, perform, label: str) -> CommandOutcome | None:
+        """User direction 2026-11-03: 发版要等客户端做完梦.
+
+        A restart mid-dream cancels a multi-minute LLM run that would then
+        re-run from scratch after the flip. When the nightly dream is
+        in flight, queue the restart for the moment it completes (hard cap
+        30min -- a wedged dream must not block an operator's restart
+        forever). Returns the "queued" reply, or None to restart now."""
+        sched = getattr(self.runtime, "scheduler", None)
+        runner = sched.digest_runner() if sched is not None else None
+        if runner is None or runner.done():
+            return None
+        elapsed = sched.digest_running_sec()
+        if getattr(self, "_restart_queued", False):
+            return CommandOutcome(
+                f"做梦进行中（已运行 {elapsed / 60:.0f} 分钟）；{label} 已在队列，做梦完成后自动执行"
+            )
+        self._restart_queued = True
+
+        async def _later() -> None:
+            try:
+                await asyncio.wait_for(asyncio.shield(runner), 1800.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("queued %s: dream wait ended oddly; restarting anyway", label)
+            try:
+                await perform()
+            except Exception:
+                log.exception("queued %s failed", label)
+            finally:
+                self._restart_queued = False
+
+        asyncio.create_task(_later())
+        return CommandOutcome(
+            f"做梦进行中（已运行 {elapsed / 60:.0f} 分钟），{label} 已排队："
+            "做梦完成后自动执行（最长再等 30 分钟）"
+        )
 
     @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True, scope="app", write=True)
     async def cmd_shutdown(self, args: list[str], ctx: ControlContext) -> CommandOutcome:

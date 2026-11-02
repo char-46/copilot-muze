@@ -194,6 +194,10 @@ class IngestConfig(BaseModel):
     # in-flight download leftovers (.part) older than this are swept by the
     # maintenance loop — orphaned partials of killed downloads (one was 118GB)
     media_tmp_max_age_sec: float = 21600.0  # 6h
+    # a failed download stops being retried after this many attempts
+    # (QQ's file-CDN links are one-time tokens; live 2026-11-02 the same
+    # dead rows warned every 10-minute cycle forever). 0 = retry forever.
+    media_max_retries: int = 3
     # local QQ client cache dir (QQNT's nt_data etc.): best-effort media
     # dedup/adoption — file rows match by QQ's md5 file_hash, images/videos
     # by md5-embedded cache filenames; empty disables all of it

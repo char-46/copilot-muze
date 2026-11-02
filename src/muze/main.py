@@ -331,7 +331,8 @@ class App:
         else:
             self._sched_gate = asyncio.Event()
             self.scheduler = Scheduler(
-                self.repo, self.service, self.chatlog, ready=self._sched_gate
+                self.repo, self.service, self.chatlog,
+                ready=self._sched_gate, gate=self._backfill_sched_gate,
             )
             self._owns_scheduler = True
             _UIN_SCHED[uin] = self.scheduler
@@ -480,6 +481,16 @@ class App:
 
     # --------------------------------------------------- boot ordering gate
     BOOT_BACKFILL_GATE_SEC = 300.0  # hard deadline: a hung pull must not stall tasks
+
+    async def _backfill_sched_gate(self) -> bool:
+        """May due scheduled tasks run RIGHT NOW? False while a roaming pull
+        is in flight (the 00:05 daily full sweep above all): the nightly
+        dream would read a half-pulled day and call it quiet. Tasks defer
+        until the pull lands -- the interval re-anchor keeps the wall-clock
+        slot, so a deferred dream neither drifts nor doubles (user
+        direction 2026-11-03: 每天消息零点五分没拉完的时候做梦延期)."""
+        bf = getattr(self, "backfiller", None)
+        return bf is None or not getattr(bf, "running", False)
 
     async def _release_sched_gate(self) -> None:
         """Open the scheduler only after the boot roaming pull is done.
@@ -1135,7 +1146,12 @@ class App:
                     gone = await self.repo.retire_gone_media()
                     if gone:
                         log.info("retired %s permanently-gone media row(s) (404/410)", gone)
-                    fixed = await self.media.retry_failed(limit=20)
+                    fixed = await self.media.retry_failed(
+                        limit=20,
+                        max_attempts=int(
+                            getattr(self.cfg.ingest, "media_max_retries", 3) or 0
+                        ),
+                    )
                     if fixed:
                         log.info("media retry recovered %s file(s)", fixed)
                     swept, swept_b = self.blobstore.sweep_tmp(
