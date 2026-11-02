@@ -13,6 +13,7 @@ chains, or None — the framework wraps/兜底 accordingly).
 from __future__ import annotations
 
 import asyncio
+import datetime as _dtm
 import json
 import logging
 import random
@@ -34,6 +35,52 @@ from muze.store.repo import Repository
 from muze.version import epoch_iso, get_version, uptime_since
 
 log = logging.getLogger("muze.core")
+
+
+def _todo_cell(s: str) -> str:
+    """Markdown-table-cell-safe text (| and newlines would break the row)."""
+    return str(s or "").replace("|", "｜").replace("\n", " ").strip()
+
+
+def _short_date(d, today: str = "") -> str:
+    """'2026-10-30' -> '10-30' within the same year (mobile-width dates)."""
+    d = str(d or "")
+    ref = today or _dtm.datetime.now().strftime("%Y-%m-%d")
+    return d[5:] if len(d) == 10 and d[:4] == ref[:4] else d
+
+
+_TODO_CLOSE_VERB = {"done": "完成", "dropped": "关闭", "expired": "过期"}
+
+
+def _todo_recent_md(recent: list[dict], today: str = "") -> str:
+    """最近完成 as a table for the image (note = 交接去向/发布说明)."""
+    if not recent:
+        return ""
+    rows = []
+    for r in recent:
+        note = (r.get("close_note") or "").strip()
+        result = _TODO_CLOSE_VERB.get(r.get("status"), "关闭")
+        if note:
+            result += "·" + _todo_cell(note[:40])
+        rows.append(
+            f"| {_todo_cell(str(r['title'])[:24])} | {result} "
+            f"| {_short_date(r.get('closed_date'), today)} |"
+        )
+    return "\n\n**最近完成**\n\n| 事项 | 结果 | 日期 |\n|---|---|---|\n" + "\n".join(rows)
+
+
+def _todo_recent_nodes(recent: list[dict], today: str = "") -> list[str]:
+    if not recent:
+        return []
+    out = ["最近完成:"]
+    for r in recent:
+        cn = (r.get("close_note") or "").strip()
+        out.append(
+            f"- {_TODO_CLOSE_VERB.get(r.get('status'), '关闭')} {str(r['title'])[:36]}"
+            + (f"（{cn[:40]}）" if cn else "")
+            + f" {_short_date(r.get('closed_date'), today)}"
+        )
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -458,8 +505,13 @@ class ControlService:
         is_long = rc.forward_chars > 0 and len(plain) > rc.forward_chars
         # one merged-forward message (合并转发) beats both a single oversized
         # body (this LLBot's pb builder fails on ~1.8k mixed-unicode texts) and
-        # a burst of separate messages (user requirement 2026-10-24)
-        use_chain = is_long or len(plain) > self.SAFE_SINGLE_CHARS
+        # a burst of separate messages (user requirement 2026-10-24).
+        # An explicit per-item node layout (e.g. /todo) ALSO forces the chain:
+        # that one-item-per-bubble reading order is the point of passing it,
+        # whatever the total length happens to be.
+        use_chain = (
+            is_long or len(plain) > self.SAFE_SINGLE_CHARS or bool(nodes)
+        )
         want_image = (
             rc.image_markdown
             and len(text) <= rc.image_max_chars
@@ -1029,83 +1081,163 @@ class ControlService:
         rows = await self.repo.list_followups(status="open", limit=50)
         # 最近完成：结单详情要跟着走（备注=交接去向/发布说明），群协作
         # 靠它知道"什么发布到了哪、交给了谁"（用户反馈 2026-10-31）
-        recent_md = ""
-        recent_nodes: list[str] = []
         try:
             recent = await self.repo.recently_closed(4)
         except Exception:
             recent = []
-        if recent:
-            rl = []
-            for r in recent:
-                verb = "完成" if r["status"] == "done" else "关闭"
-                cn = (r.get("close_note") or "").strip()
-                rl.append(
-                    f"- {verb} {str(r['title'])[:36]}"
-                    + (f"（{cn[:40]}）" if cn else "")
-                    + f" {r.get('closed_date') or ''}"
-                )
-            recent_md = "\n\n**最近完成**\n" + "\n".join(rl)
-            recent_nodes = ["最近完成:"] + rl
         if not rows:
             # even an EMPTY list still shows what just finished -- the group
             # reads the closures, not only the backlog
             if recent:
                 return CommandOutcome(
-                    "待办清空：没有系统跟踪中的未结事项" + recent_md,
-                    forward_nodes=["待办清空"] + recent_nodes,
+                    "待办清空：没有系统跟踪中的未结事项" + _todo_recent_md(recent),
+                    forward_nodes=["待办清空"] + _todo_recent_nodes(recent),
                 )
             return CommandOutcome("待办清空：没有系统跟踪中的未结事项")
         # remember what THIS chat saw, so a later /done resolves against the
         # exact ids on screen instead of whatever the list looks like then
         await self._todo_save_view(ctx, rows)
-        md_items: list[str] = []
-        node_items: list[str] = []
-        from muze.digest import followup_due_tag, followup_state_tag
+        from muze.digest import followup_state_tag
 
         today = _local_date()
+        today_d = _dtm.datetime.strptime(today, "%Y-%m-%d").date()
         delegated = 0
+        # friendly origin labels -- no raw friend/12345 walls of text
+        # (user feedback 2026-11-02); cache-resolved, one per subject
+        label_of: dict[str, str] = {}
+        for r in rows:
+            s = r["subject"] or ""
+            if s and s not in label_of:
+                label_of[s] = await self._subject_label(s)
+
+        def _due(r: dict) -> str:
+            """'10-30（还剩2天）' / '10-30 ⚠已逾期3天' / '—' -- compact,
+            relative to today, scannable in a narrow column."""
+            due = str(r.get("due_date") or "").strip()
+            if not due or len(due) != 10:
+                return "—"
+            try:
+                left = (_dtm.datetime.strptime(due, "%Y-%m-%d").date() - today_d).days
+            except ValueError:
+                return due
+            short = _short_date(due, today)
+            if left < 0:
+                return f"{short} ⚠已逾期{-left}天"
+            if left == 0:
+                return f"{short}（今天）"
+            if left == 1:
+                return f"{short}（明天）"
+            return f"{short}（{left}天后）"
+
         # dense display numbering with subtasks (#3 -> #3.1, #3.2); raw DB
         # ids go sparse after closes and read badly
+        trows: list[str] = []
+        node_items: list[str] = []
         for n, r in numbered_followups(rows)[:20]:
-            subj = r["subject"] or "全局"
-            bits = []
-            who = ""
+            subj = label_of.get(r["subject"] or "", "全局")
+            who = str(r.get("assignee") or "").strip()
             state = followup_state_tag(r)
-            if r.get("assignee"):
+            if who:
                 delegated += 1
-                who = f" → {r['assignee']}"
-                bits.append(f"负责人 {r['assignee']}（等交付）")
-            if state:
-                bits.append(state + "，等你验收")
-            due = followup_due_tag(r, today=today)
-            if due:
-                bits.append(due)
+            title = str(r["title"])
+            # ---- image row: the table carries the fields, one column each
+            # (user feedback 2026-11-02: 全是字混着 friend/qq 号没法看)
+            t_title = _todo_cell(title)
+            if "." in n:  # subtask: visible indent under its parent row
+                t_title = f"　└ {t_title}"
+            delivered = ""
+            m = re.match(r"已交付(\S+) ", state or " ")
+            if m:
+                delivered = _short_date(m.group(1), today)
+            status = ("待验收" if state else ("等交付" if who else "进行中")) + (
+                f"（{delivered}交）" if delivered else ""
+            )
+            # the overdue flag is the one thing that must pop out of the
+            # table on a phone: render it red (plain-text nodes keep it plain)
+            due_cell = _due(r)
+            if "⚠" in due_cell:
+                head, _, tail = due_cell.partition("⚠")
+                due_cell = f'{head}<font color="#b00000">⚠{tail}</font>'
+            trows.append(
+                f"| #{_todo_cell(n)} | {t_title} | {_todo_cell(who) or '我'} "
+                f"| {_todo_cell(status)} | {due_cell} |"
+            )
+            # ---- plain-text node: one fact per line, no · walls
+            lines = [(f"  ↳ #{n} " if "." in n else f"#{n} ") + title]
+            bits = []
+            if who and not state:
+                bits.append(f"负责人 {who}（等交付）")
+            elif state:
+                state_txt = re.sub(
+                    r"已交付(\d{4}-\d{2}-\d{2})",
+                    lambda m: "已交付" + _short_date(m.group(1), today),
+                    state,
+                )
+                bits.append(f"{state_txt}，等你验收")
+            if _due(r) != "—":
+                bits.append(f"截止 {_due(r)}")
             if r["detail"]:
                 bits.append(str(r["detail"])[:60])
-            bits.append(f"开于 {r['opened_date']}")
+            if bits:
+                lines.append("  " + " · ".join(bits))
+            org = [f"来自 {subj}", f"开于 {_short_date(r['opened_date'], today)}"]
             last = r["last_date"] or r["opened_date"]
             if last != r["opened_date"]:
-                bits.append(f"最后动静 {last}")
-            meta = " · ".join(bits)
-            if "." in n:
-                # subtask: visibly nested under its parent
-                md_items.append(f"↳ **#{n}** `{subj}`{who}\n\n{r['title']}\n\n{meta}")
-                node_items.append(f"  ↳ #{n} [{subj}]{who} {r['title']}\n{meta}")
-            else:
-                md_items.append(f"**#{n}** `{subj}`{who}\n\n{r['title']}\n\n{meta}")
-                node_items.append(f"#{n} [{subj}]{who} {r['title']}\n{meta}")
+                org.append(f"最后动静 {_short_date(last, today)}")
+            lines.append("  " + " · ".join(org))
+            node_items.append("\n".join(lines))
         n_all = len(rows)
         head_plain = f"未结待办（{n_all} 条" + (f"，{delegated} 条已布置给他人" if delegated else "") + "）"
         tail = "/done <序号|关键词> 标记完成 · /todo drop <序号> 不再跟踪 · /todo add [@负责人] <事项> [due:10-30] [under:<序号>] 登记"
+        md = (
+            f"# {head_plain}\n\n"
+            "| # | 事项 | 负责人 | 状态 | 截止 |\n"
+            "|---|---|---|---|---|\n"
+            + "\n".join(trows)
+            + _todo_recent_md(recent, today)
+            + f"\n\n---\n\n{tail}"
+        )
         return CommandOutcome(
-            f"# {head_plain}\n\n" + "\n\n---\n\n".join(md_items) + recent_md + f"\n\n---\n\n{tail}",
-            forward_nodes=[head_plain] + node_items + recent_nodes + [tail],
+            md,
+            forward_nodes=[head_plain] + node_items + _todo_recent_nodes(recent, today) + [tail],
         )
 
     # ---------------------------------------------------- todo resolution
     _TODO_VIEW_TTL = 12 * 3600  # a view older than this is not trusted
     _TODO_VIEW_KEY = "todo_view:last"  # ONE owner: last view wins, any front
+
+    async def _subject_label(self, subject: str) -> str:
+        """Origin label a human reads: cached friend/group display name,
+        not the raw friend/12345 key (user feedback 2026-11-02)."""
+        s = (subject or "").strip()
+        if not s:
+            return "全局"
+        scene, _, num = s.partition("/")
+        if not num:
+            scene, num = "friend", scene
+        if not num.isdigit():
+            return s
+        peer = int(num)
+        name = ""
+        cached = getattr(
+            self.adapter,
+            "cached_group_name" if scene == "group" else "cached_friend_name",
+            None,
+        )
+        if callable(cached):
+            try:
+                name = (cached(peer) or "").strip()
+            except Exception:
+                name = ""
+        if not name:
+            try:
+                if scene == "group":
+                    name = (await self.adapter.ensure_group_name(peer) or "").strip()
+                else:
+                    name = (await self.adapter.ensure_friend_name(peer) or "").strip()
+            except Exception:
+                name = ""
+        return name or (f"群{peer}" if scene == "group" else f"好友{peer}")
 
     async def _todo_save_view(self, ctx: ControlContext, rows: list[dict]) -> None:
         """Remember the numbering the user just saw.

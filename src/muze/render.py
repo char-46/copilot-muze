@@ -81,13 +81,16 @@ _MD_EXTENSIONS = ["fenced_code", "tables", "nl2br", "sane_lists"]
 
 
 def _angle_safe(text: str) -> str:
-    """Escape stray < / > outside fenced-code and inline-code spans.
+    """Escape stray < / > outside fenced-code, inline-code and font spans.
 
     Raw angle brackets travel unescaped into the XHTML parse and kill it
     (live 2026-10-26: "/done <id|关键词>" made the whole /todo image fall
     back to plain text). Our sources (commands, LLM digests) are plain
     markdown and never embed raw HTML, so escaping every bracket outside
-    code is the predictable rule."""
+    code is the predictable rule -- one whitelisted exception: well-formed
+    <font color="...">...</font> spans (the only color markup cells can
+    carry, e.g. /todo's overdue flag; user feedback 2026-11-02)."""
+
     def esc_seg(seg: str) -> str:
         parts: list[str] = []
         last = 0
@@ -99,12 +102,12 @@ def _angle_safe(text: str) -> str:
         return "".join(parts)
 
     out: list[str] = []
-    fences = list(re.finditer(r"```.*?```", text, re.S))
+    safe = re.compile(r"```.*?```|<font[^>]*>.*?</font>", re.S)
     pos = 0
-    for f in fences:
-        out.append(esc_seg(text[pos:f.start()]))
-        out.append(f.group(0))  # fenced content passes through untouched
-        pos = f.end()
+    for m in safe.finditer(text):
+        out.append(esc_seg(text[pos:m.start()]))
+        out.append(m.group(0))  # fenced content / font spans pass untouched
+        pos = m.end()
     out.append(esc_seg(text[pos:]))
     return "".join(out)
 
@@ -215,6 +218,9 @@ def _inline(el) -> str:
         body = f"<font>{text}{kids}</font>"
     elif tag == "br":
         body = "<br/>"
+    elif tag == "font":
+        color = _esc_attr(el.get("color", ""))
+        body = f'<font color="{color}">{text}{kids}</font>' if color else f"{text}{kids}"
     elif tag == "a":
         href = _esc_attr(el.get("href", ""))
         body = f'<a href="{href}" color="#1155cc">{text}{kids}</a>'
@@ -226,26 +232,49 @@ def _inline(el) -> str:
 
 
 def _table_flowable(el, st: dict, page_w: float | None = None) -> Table | None:
-    rows: list[list[Paragraph]] = []
+    """Markdown table -> reportlab Table.
+
+    Columns are weighted by their longest cell (damped so one long cell
+    can't starve the others) with a minimum floor -- even 5-way splits
+    squeezed the 事项 column of /todo's table into unreadable 20% slivers
+    (user feedback 2026-11-02). Ragged rows (LLM-generated tables) are
+    padded so a short row can't crash the layout."""
+    grid: list[list[str]] = []
     for tr in el.iter("tr"):
-        row = [Paragraph(_inline(c), st["cell"])
-               for c in tr if c.tag in ("td", "th")]
+        row = [_inline(c) for c in tr if c.tag in ("td", "th")]
         if row:
-            rows.append(row)
-    if not rows:
+            grid.append(row)
+    if not grid:
         return None
+    ncols = max(len(r) for r in grid)
+    for r in grid:  # pad short rows: reportlab needs a rectangular matrix
+        r.extend([""] * (ncols - len(r)))
     usable = (page_w if page_w else A4[0]) - 80 - 12
-    colw = [usable / len(rows[0])] * len(rows[0])
-    t = Table(rows, colWidths=colw, repeatRows=1, hAlign="LEFT")
+    # width weight per column: longest plain-text cell, square-root damped
+    # (double-length content gets ~1.4x width, not 2x) with a floor
+    weights = []
+    for ci in range(ncols):
+        m = max(len(re.sub(r"<[^>]+>", "", r[ci])) for r in grid)
+        weights.append(max(m, 2) ** 0.55)
+    floor = usable * (0.06 if ncols >= 4 else 0.1)
+    colw = [max(usable * w / sum(weights), floor) for w in weights]
+    t = Table(
+        [[Paragraph(c, st["cell"]) for c in r] for r in grid],
+        colWidths=colw, repeatRows=1, hAlign="LEFT",
+    )
     t.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#999999")),
         ("BACKGROUND", (0, 0), (-1, 0), HexColor("#eeeeee")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [HexColor("#ffffff"), HexColor("#f2f2f2")]),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
+    t.spaceBefore = 6   # breathing room around tables in the image
+    t.spaceAfter = 12
     return t
 
 
