@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.172",
+        "date": "2026-11-03",
+        "changes": [
+            "做梦收尾自愈（实发 2026-11-03 01:08：发版重启打断了做梦，日报已存但待办同步/记忆提炼没跑，此后每晚「无缺口」直接跳过，收尾永远缺失）：每天收尾环节（完成度检查/待办同步/记忆提炼）落 meta 收据 dream_posts:<日期>；被打断的第二天晚上自动从已存报告补跑缺的环节并如实汇报「补跑了上次被打断的收尾」；完成度检查同样按收据去重，不再重复烧一遍全表核查（昨晚实测多花 ~1.4 万 token）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.171",
         "date": "2026-11-03",
         "changes": [
