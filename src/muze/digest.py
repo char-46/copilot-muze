@@ -504,6 +504,12 @@ async def run_digest(
         report = f"{date} 无活跃会话，当日无显著活动。"
         await repo.upsert_digest(date, report, 24.0, stats)
         chatlog.log.info("DREAM      | %s empty (no active conversations)", date)
+        # nothing to sync on an empty day -- close the receipt so the heal
+        # branch never knocks for it
+        try:
+            await mark_dream_posts(repo, date, sync=True)
+        except Exception:
+            log.debug("dream posts marker failed for %s", date, exc_info=True)
         return report
 
     # fetch every conversation's day (capped hard for pathological days);
@@ -678,7 +684,45 @@ async def run_digest(
                 )
         except Exception:
             log.exception("followup expiry for %s failed", date)
+    # post-pass receipt: the day's sync ran (or was config-disabled). The
+    # nightly dream reads this to heal an interrupted tail -- a saved report
+    # whose sync/memory never completed would otherwise be skipped forever
+    # by the "no missing day" fast path (live 2026-11-03, user: 补不上了吗?)
+    try:
+        await mark_dream_posts(repo, date, sync=True)
+    except Exception:
+        log.debug("dream posts marker failed for %s", date, exc_info=True)
     return report
+
+
+# post-pass completion markers, per day: meta "dream_posts:<date>"
+_POSTS_KEY = "dream_posts:{}"
+
+
+async def dream_posts_state(repo: Repository, date: str) -> str:
+    """Which post-passes finished for the day: '' | comma parts of
+    sweep (completion check) / sync (followup sync+expiry) / mem (memory
+    distillation). An interrupted dream leaves parts missing; the next
+    dream_night heals exactly those."""
+    try:
+        return (await repo.get_meta(_POSTS_KEY.format(date)) or "").strip()
+    except Exception:
+        return ""
+
+
+async def mark_dream_posts(
+    repo: Repository, date: str, *, sweep: bool = False, sync: bool = False, mem: bool = False,
+) -> None:
+    state = await dream_posts_state(repo, date)
+    parts = set(x for x in state.split(",") if x)
+    if sweep:
+        parts.add("sweep")
+    if sync:
+        parts.add("sync")
+    if mem:
+        parts.add("mem")
+    ordered = [p for p in ("sweep", "sync", "mem") if p in parts]
+    await repo.set_meta(_POSTS_KEY.format(date), ",".join(ordered))
 
 
 # --------------------------------------------------------------------------
@@ -705,14 +749,21 @@ async def dream_night(
     # messages by now, and every open followup gets its own evidence check
     # against the RAW messages (user request 2026-10-28) -- this runs
     # before any digest pass so the report and the sync pass see an
-    # up-to-date table (a completion found here won't be re-listed as open)
+    # up-to-date table (a completion found here won't be re-listed as open).
+    # Receipt-gated: a dream re-run after an interruption must not repeat
+    # the sweep for a day it already swept (live 2026-11-03: the restarted
+    # dream re-checked every followup and burned a second ~14k-token pass).
     swept = 0
-    try:
-        swept = await check_followups(repo, llm, cfg, date=target, chatlog=chatlog)
-    except LLMAccountFault as e:
-        chatlog.log.info("DREAM      | sweep skipped (account fault): %s", str(e)[:80])
-    except Exception:
-        log.exception("followup completion sweep for %s failed", target)
+    if "sweep" not in await dream_posts_state(repo, target):
+        try:
+            swept = await check_followups(repo, llm, cfg, date=target, chatlog=chatlog)
+            await mark_dream_posts(repo, target, sweep=True)
+        except LLMAccountFault as e:
+            chatlog.log.info("DREAM      | sweep skipped (account fault): %s", str(e)[:80])
+        except Exception:
+            log.exception("followup completion sweep for %s failed", target)
+    else:
+        chatlog.log.info("DREAM      | sweep for %s already done; skipping", target)
 
     # catch up every missing day since the EARLIEST stored day report, not
     # just since the latest: a day whose dream failed while a LATER day
@@ -760,18 +811,70 @@ async def dream_night(
         except Exception:
             log.exception("profile rider failed")
 
+    # interrupted-tail healing (live 2026-11-03: a mid-dream restart saved
+    # the day report but killed sync/memory; the next night's "no missing
+    # day" fast path skipped the tail FOREVER -- user: 补不上了吗? no). When
+    # yesterday's report exists but its post-passes never completed, re-run
+    # them from the STORED report instead of regenerating the day.
+    healed: list[str] = []
+    made_dates = {d for d, r in reports if not r.startswith("(做梦失败")}
+    tgt_row = await repo.get_digest(target)
+    wants_mem = bool(cfg.digest.extract_memories and llm.configured)
+    if tgt_row is not None and target not in made_dates:
+        state = await dream_posts_state(repo, target)
+        need_sync = "sync" not in state and llm.configured
+        need_mem = "mem" not in state and wants_mem
+        if need_sync or need_mem:
+            chatlog.log.info("DREAM      | healing interrupted tail for %s", target)
+            if need_sync:
+                try:
+                    directives = await collect_directives(
+                        repo, cfg, date=target, self_id=self_id
+                    )
+                    await sync_followups(
+                        repo, llm, cfg, date=target, report=tgt_row["report"],
+                        chatlog=chatlog, directives=directives,
+                    )
+                    await mark_dream_posts(repo, target, sync=True)
+                    healed.append("待办同步")
+                except Exception:
+                    log.exception("tail heal: followup sync for %s failed", target)
+            if need_mem:
+                try:
+                    n_mem = await extract_memories(
+                        repo, llm, cfg, date=target, report=tgt_row["report"], chatlog=chatlog
+                    )
+                    await mark_dream_posts(repo, target, mem=True)
+                    healed.append(f"记忆提炼 {n_mem} 条")
+                except Exception:
+                    log.exception("tail heal: memory pass for %s failed", target)
+        elif "mem" not in state:
+            # memory distillation disabled by config: nothing pending,
+            # close the receipt so the branch doesn't knock every night
+            await mark_dream_posts(repo, target, mem=True)
+
     if not reports and not rollups:
+        if healed:
+            return (
+                f"做梦无缺口（{target} 已存在），周/月报告无待补；"
+                f"补跑了上次被打断的收尾：{'、'.join(healed)}。"
+                + (f"档案更新 {profiled} 个。" if profiled else "")
+            )
         return (
             f"做梦无缺口（{target} 已存在），周/月报告无待补。"
             + (f"档案更新 {profiled} 个。" if profiled else "")
         )
 
     new_memories = 0
-    if cfg.digest.extract_memories and llm.configured and reports:
+    ok_dates = [d for d, r in reports if not r.startswith("(做梦失败")]
+    if cfg.digest.extract_memories and llm.configured and ok_dates:
+        last_ok = ok_dates[-1]
         try:
+            report_txt = next(r for d, r in reports if d == last_ok)
             new_memories = await extract_memories(
-                repo, llm, cfg, date=reports[-1][0], report=reports[-1][1], chatlog=chatlog
+                repo, llm, cfg, date=last_ok, report=report_txt, chatlog=chatlog
             )
+            await mark_dream_posts(repo, last_ok, mem=True)
         except Exception:
             log.exception("memory pass failed")
 
@@ -780,6 +883,7 @@ async def dream_night(
         + (f"，完成度检查 {swept} 条变动" if swept else "")
         + (f"，新增 {', '.join(rollups)}" if rollups else "")
         + (f"，档案更新 {profiled} 个" if profiled else "")
+        + (f"，补跑收尾（{target}：{'、'.join(healed)}）" if healed else "")
         + f"，新记忆 {new_memories} 条。\n\n"
     )
     if not reports:

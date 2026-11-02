@@ -325,6 +325,83 @@ async def test_dream_night_first_run(repo):
     assert len([r for r in rows if r["period"] == "day"]) == 1
 
 
+# ------------------------------------------- interrupted-tail healing (a172)
+async def test_run_digest_marks_the_sync_receipt(repo):
+    from muze.digest import dream_posts_state, run_digest, yesterday_date
+
+    t0 = local_midnight(-1) + 200
+    await repo.upsert_message(mk_msg("friend", 1, 2, t0, "当天有消息"), "当天有消息", "event")
+    await run_digest(repo, FakeLLM(), MuzeConfig(), ChatLog(), date=yesterday_date())
+    assert "sync" in await dream_posts_state(repo, yesterday_date())
+
+
+async def test_run_digest_empty_day_also_closes_the_receipt(repo):
+    from muze.digest import dream_posts_state, run_digest, yesterday_date
+
+    await run_digest(repo, FakeLLM(), MuzeConfig(), ChatLog(), date=yesterday_date())
+    assert "sync" in await dream_posts_state(repo, yesterday_date())
+
+
+async def test_dream_night_heals_interrupted_tail(repo, monkeypatch):
+    """Live 2026-11-03: a mid-dream restart saved the day report but killed
+    sync/memory; the next night's fast path skipped the tail forever (user:
+    补不上了吗?). The stored report's missing post-passes must be re-run."""
+    import muze.digest as D
+    from muze.digest import dream_posts_state, mark_dream_posts, yesterday_date
+
+    target = yesterday_date()
+    # simulate the interrupted first run: report saved, sweep done, tail killed
+    await repo.upsert_digest(target, "已存报告", 24.0, {})
+    await mark_dream_posts(repo, target, sweep=True)
+
+    sync_calls: list[str] = []
+    mem_calls: list[str] = []
+    orig_sync, orig_mem = D.sync_followups, D.extract_memories
+
+    async def spy_sync(*a, **kw):
+        sync_calls.append(str(kw.get("date")))
+        return await orig_sync(*a, **kw)
+
+    async def spy_mem(*a, **kw):
+        mem_calls.append(str(kw.get("date")))
+        return await orig_mem(*a, **kw)
+
+    monkeypatch.setattr(D, "sync_followups", spy_sync)
+    monkeypatch.setattr(D, "extract_memories", spy_mem)
+
+    text = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert sync_calls == [target] and mem_calls == [target]
+    assert "补跑了上次被打断的收尾" in text
+    assert "待办同步" in text and "记忆提炼" in text
+    assert "sync,mem" in await dream_posts_state(repo, target)
+
+    # receipt closed -> the next night does NOT re-run the tail
+    text2 = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert "已存在" in text2
+    assert sync_calls == [target] and mem_calls == [target]
+
+
+async def test_sweep_receipt_prevents_a_double_check(repo, monkeypatch):
+    """The restarted dream re-checked every followup and burned a second
+    ~14k-token pass (live 2026-11-03); a swept day is not re-swept."""
+    import muze.digest as D
+    from muze.digest import mark_dream_posts, yesterday_date
+
+    target = yesterday_date()
+    await repo.upsert_digest(target, "r", 24.0, {})
+    await mark_dream_posts(repo, target, sweep=True, sync=True, mem=True)
+    checks: list[str] = []
+
+    async def spy_check(*a, **kw):
+        checks.append(str(kw.get("date")))
+        return 0
+
+    monkeypatch.setattr(D, "check_followups", spy_check)
+    text = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert checks == []
+    assert "已存在" in text
+
+
 async def test_memory_crud_and_retire(repo):
     mid = await repo.add_memory("identity", "owner", "喜欢喝乌龙茶", source="dream:test")
     rows = await repo.list_memories()
