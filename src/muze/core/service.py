@@ -280,6 +280,24 @@ class ControlService:
         name = await self.adapter.ensure_friend_name(peer)
         return f"{conv_id(scene, peer)} {name}".strip()
 
+    def _is_admin_ctx(self, ctx: ControlContext) -> bool:
+        """A controller's own chat or the control group (user direction
+        2026-11-06: 本地命令也可以被管理员使用 -- local_only commands are
+        trust-gated, and an admin conversation is exactly that trust)."""
+        ctl = self.cfg.control
+        try:
+            if ctx.scene == "friend" and ctx.peer_id in (ctl.controller or []):
+                return True
+            if (
+                ctx.scene == "group"
+                and ctl.control_group
+                and ctx.peer_id == ctl.control_group
+            ):
+                return True
+        except Exception:
+            return False
+        return False
+
     # -------------------------------------------------------------- routes
     async def run_command(self, text: str, ctx: ControlContext | None = None) -> CommandOutcome:
         """Execute a command line (with or without leading slash). Commands
@@ -315,8 +333,8 @@ class ControlService:
             return CommandOutcome.err(
                 f"未知命令 /{cmd}。可用命令:\n{COMMANDS.help_text()}"
             )
-        if spec.local_only and not ctx.is_local:
-            return CommandOutcome.err(f"/{cmd} 仅限本地前端（console/WebUI/CLI）使用")
+        if spec.local_only and not ctx.is_local and not self._is_admin_ctx(ctx):
+            return CommandOutcome.err(f"/{cmd} 仅限本地前端（console/WebUI/CLI）或管理员会话使用")
         try:
             raw = await spec.fn(self, args, ctx)
         except (ValueError, IndexError) as e:
@@ -2888,7 +2906,7 @@ class ControlService:
             "做梦完成后自动执行（最长再等 30 分钟）"
         )
 
-    @slash("shutdown", "/shutdown", "停止服务（仅本地前端）", local_only=True, scope="app", write=True)
+    @slash("shutdown", "/shutdown", "停止服务（本地前端或管理员会话）", local_only=True, scope="app", write=True)
     async def cmd_shutdown(self, args: list[str], ctx: ControlContext) -> CommandOutcome:
         if self.runtime.request_stop is None:
             return CommandOutcome.err("停止钩子未装配")

@@ -87,6 +87,24 @@ async def test_run_command_guarantees_reply(tmp_path):
     out = await svc.run_command("restart", ControlContext(source="qq", chat_key="q", scene="friend", peer_id=1))
     assert out.is_error and "本地" in out.text
 
+    # ...but an ADMIN conversation may use local_only commands
+    # (user direction 2026-11-06: 本地命令也可以被管理员使用)
+    svc.cfg.control.controller = [777]
+    svc.cfg.control.control_group = 4242
+    out = await svc.run_command(
+        "restart", ControlContext(source="qq", chat_key="q", scene="friend", peer_id=777)
+    )
+    assert not (out.is_error and "本地" in out.text)  # gate passed (fails later on hook)
+    out = await svc.run_command(
+        "version", ControlContext(source="qq", chat_key="q", scene="group", peer_id=4242)
+    )
+    assert not out.is_error
+    # a stranger in some other group still refused
+    out = await svc.run_command(
+        "restart", ControlContext(source="qq", chat_key="q", scene="group", peer_id=999)
+    )
+    assert out.is_error and "本地" in out.text
+
     # plain string returns are wrapped
     out = await svc.run_command("version")
     assert not out.is_error and out.text.startswith("0.")
