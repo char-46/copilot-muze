@@ -325,6 +325,69 @@ async def test_dream_night_first_run(repo):
     assert len([r for r in rows if r["period"] == "day"]) == 1
 
 
+# ------------------------------------------- stale re-dream (2026-11-06)
+async def test_stale_day_is_redreamed_when_archive_grew(repo):
+    """User stopped LLBot for risk-control; the offline days' reports ran on
+    partial archives. Once the catch-up lands the real messages, the report
+    must be redone -- 无缺口 must not mean 过期不改 (user: 这两天的梦可能
+    白做了)."""
+    import muze.digest as D
+    from muze.digest import yesterday_date
+
+    target = yesterday_date()
+    # partial-archive dream: report saw 0 messages
+    await repo.upsert_digest(target, "旧报告（残缺档案）", 24.0, {"msg_count": 0})
+    # ...then the late catch-up lands the day's real messages
+    t0 = local_midnight(-1) + 300
+    for i in range(D.STALE_MSG_SLACK):
+        await repo.upsert_message(
+            mk_msg("friend", 9, i + 1, t0 + i * 60, f"补拉回来的消息 {i}"), f"补拉回来的消息 {i}", "backfill"
+        )
+    text = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert "重做" in text
+    row = await repo.get_digest(target)
+    assert row["report"] != "旧报告（残缺档案）"
+    # the redo re-ran the sync tail and closed the receipt
+    from muze.digest import dream_posts_state
+
+    assert "sync" in await dream_posts_state(repo, target)
+    # second night: counts now match -> idempotent, no more redo
+    text2 = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert "已存在" in text2
+
+
+async def test_small_growth_and_legacy_reports_are_not_redreamed(repo):
+    import muze.digest as D
+    from muze.digest import yesterday_date
+
+    target = yesterday_date()
+    t0 = local_midnight(-1) + 300
+    for i in range(5):
+        await repo.upsert_message(
+            mk_msg("friend", 9, i + 1, t0 + i * 60, f"消息 {i}"), f"消息 {i}", "event"
+        )
+    # fresh report with the counter: only 5 messages, nothing new
+    await repo.upsert_digest(target, "新鲜报告", 24.0, {"msg_count": 5})
+    text = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert "已存在" in text and (await repo.get_digest(target))["report"] == "新鲜报告"
+
+    # legacy report WITHOUT the counter: untouched unless it's the canned
+    # empty-day artifact
+    await repo.upsert_digest(target, "老报告（无计数）", 24.0, {})
+    await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert (await repo.get_digest(target))["report"] == "老报告（无计数）"
+
+    # ...but the canned degraded artifact IS redone once real messages exist
+    for i in range(5, D.STALE_MSG_SLACK + 5):
+        await repo.upsert_message(
+            mk_msg("friend", 9, i + 1, t0 + i * 60, f"消息 {i}"), f"消息 {i}", "backfill"
+        )
+    await repo.upsert_digest(target, f"{target} 无活跃会话，当日无显著活动。", 24.0, {})
+    text = await dream_night(repo, FakeLLM(), MuzeConfig(), ChatLog())
+    assert "重做" in text
+    assert (await repo.get_digest(target))["report"] != f"{target} 无活跃会话，当日无显著活动。"
+
+
 # ------------------------------------------- interrupted-tail healing (a172)
 async def test_run_digest_marks_the_sync_receipt(repo):
     from muze.digest import dream_posts_state, run_digest, yesterday_date

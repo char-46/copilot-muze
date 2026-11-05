@@ -284,6 +284,43 @@ async def missing_day_holes(repo: Repository, upto: str, limit: int = 7) -> list
     return out
 
 
+# a stored day report is stale when the archive has grown this much beyond
+# what the report saw (live 2026-11-06: LLBot was deliberately stopped for
+# risk-control; the offline days' reports ran on partial archives and would
+# otherwise stay "complete" forever -- 无缺口 must not mean 过期不改)
+STALE_MSG_SLACK = 20
+
+
+async def stale_day_holes(repo: Repository, upto: str, limit: int = 7) -> list[str]:
+    """Days that HAVE a day report but whose archive has since grown well
+    beyond what the report was made from. Counter-less legacy reports are
+    only matched when they are the canned empty-day artifact (a real report
+    made before the counter existed is assumed healthy)."""
+    end = datetime.strptime(upto, "%Y-%m-%d")
+    out: list[str] = []
+    for i in range(1, limit + 1):
+        key = (end - timedelta(days=i - 1)).strftime("%Y-%m-%d")
+        row = await repo.get_digest(key)
+        if row is None:
+            continue
+        try:
+            stats = json.loads(row.get("stats_json") or "{}")
+        except ValueError:
+            stats = {}
+        seen = stats.get("msg_count")
+        if seen is None:
+            # legacy: only flag the canned "no activity" report -- the classic
+            # degraded artifact (protocol side down at dream time)
+            if not str(row.get("report") or "").startswith(f"{key} 无活跃会话"):
+                continue
+            seen = 0
+        s, e = day_range(key)
+        now_n = await repo.day_message_count(s, e)
+        if now_n >= int(seen) + STALE_MSG_SLACK:
+            out.append(key)
+    return sorted(out)
+
+
 # --------------------------------------------------------------------------
 # report generation
 # --------------------------------------------------------------------------
@@ -500,6 +537,12 @@ async def run_digest(
     )
 
     stats: dict = {"date": date, "conversations": len(convs), "sections": []}
+    try:
+        # what the report is made FROM -- the staleness probe compares this
+        # against the archive later (see stale_day_holes)
+        stats["msg_count"] = await repo.day_message_count(start_ts, end_ts)
+    except Exception:
+        pass
     if not convs:
         report = f"{date} 无活跃会话，当日无显著活动。"
         await repo.upsert_digest(date, report, 24.0, stats)
@@ -725,6 +768,15 @@ async def mark_dream_posts(
     await repo.set_meta(_POSTS_KEY.format(date), ",".join(ordered))
 
 
+async def clear_dream_posts(repo: Repository, date: str) -> None:
+    """Wipe the day's post-pass receipts (a stale report being re-dreamed
+    starts its tail from scratch)."""
+    try:
+        await repo.set_meta(_POSTS_KEY.format(date), "")
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # nightly flow: day catch-up + weekly/monthly rollups + memory pass
 # --------------------------------------------------------------------------
@@ -770,6 +822,15 @@ async def dream_night(
     # succeeded used to become a permanent hole (latest advanced past it,
     # missing_dates never returned it again)
     todo = await missing_day_holes(repo, target, limit=7)
+    # ...and RE-dream days whose stored report was made from a partial
+    # archive (protocol side down at dream time): the late catch-up pulls
+    # the day's real messages, the report must not stay stale forever
+    stale = await stale_day_holes(repo, target, limit=7)
+    for d in stale:
+        if d not in todo:
+            todo.append(d)
+            await clear_dream_posts(repo, d)
+    todo.sort()
 
     reports: list[tuple[str, str]] = []
     for d in todo:
@@ -880,6 +941,7 @@ async def dream_night(
 
     head = (
         f"做梦完成：补做 {len(reports)} 天"
+        + (f"，其中 {len(stale)} 天为档案补齐后重做" if stale else "")
         + (f"，完成度检查 {swept} 条变动" if swept else "")
         + (f"，新增 {', '.join(rollups)}" if rollups else "")
         + (f"，档案更新 {profiled} 个" if profiled else "")

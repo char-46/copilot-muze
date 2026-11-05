@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.174",
+        "date": "2026-11-06",
+        "changes": [
+            "停机期日报过期重做（用户 2026-11-06：为防风控手动关掉 LLBot，停机期间的梦基于残缺档案、补拉后永不刷新）：日报落档时记录当日已归档消息数（stats.msg_count）；每晚做梦除了补缺天，还会重做「档案比报告所见多出 20 条以上」的天（收据一并重置、收尾重跑），旧格式无计数器的报告仅识别罐头空日报；重做会在汇报里注明「档案补齐后重做」。LLBot 重开后补拉落地，下一个做梦夜自动重做停机各天。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.173",
         "date": "2026-11-06",
         "changes": [
