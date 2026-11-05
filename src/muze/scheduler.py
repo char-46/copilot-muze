@@ -66,6 +66,7 @@ class Scheduler:
         # dream in-flight bookkeeping: /restart defers behind it (user
         # direction 2026-11-03: 发版要等客户端做完梦)
         self._digest_runners: dict[int, tuple[asyncio.Task, float]] = {}
+        self._inflight_rows: dict[int, dict] = {}  # task_id -> claimed row
 
     # ------------------------------------------------------------- control
     async def start(self) -> None:
@@ -87,15 +88,27 @@ class Scheduler:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-        # cancel in-flight runs and hand their rows straight back to the
-        # pool as due-NOW: the successor process (daemon relaunch after
-        # /restart, or the user's start.ps1) picks them up and re-runs
-        # them from the beginning — restart must not lose a task
+        # cancel in-flight runs and hand their rows back to the pool as
+        # due-NOW: the successor process (daemon relaunch after /restart,
+        # or the user's start.ps1) picks them up and re-runs them from the
+        # beginning — restart must not lose a task.
+        #
+        # Reset CAP (live 2026-11-04 06:00-07:40): a crash-looping serve
+        # re-fired the interrupted morning digest on EVERY boot and the
+        # 5-minute autostart watch kept resurrecting it — the user got a
+        # fresh 📰 copy per cycle. An interval task may re-fire due-now at
+        # most MAX_DUE_NOW_RESETS times per DAY; after that it re-anchors
+        # to its natural next slot (wall-clock re-anchor for the digest/
+        # morning notes, +interval otherwise).
         import time
 
+        from muze.digest import local_date
+
+        day = local_date()
         for task_id, runner in list(self._inflight.items()):
             if runner.done():
                 continue  # finished cleanly; execute() already rescheduled it
+            row = self._inflight_rows.get(task_id) or {}
             runner.cancel()
             try:
                 await runner
@@ -105,11 +118,15 @@ class Scheduler:
                 # completed in the cancellation window: its own finish path
                 # has run — resetting would duplicate the task
                 continue
-            await self.repo.reset_task(task_id, int(time.time()))
-            log.info(
-                "task #%s interrupted by shutdown; reset to due-now (will re-run from scratch)",
-                task_id,
-            )
+            resets = await self._bump_reset_count(task_id, day)
+            if resets > self.MAX_DUE_NOW_RESETS and row.get("kind") == "interval":
+                await self._reanchor_interrupted(task_id, row)
+            else:
+                await self.repo.reset_task(task_id, int(time.time()))
+                log.info(
+                    "task #%s interrupted by shutdown; reset to due-now (will re-run from scratch, reset %s/%s today)",
+                    task_id, resets, self.MAX_DUE_NOW_RESETS,
+                )
         self._inflight.clear()
 
     async def drain(self) -> None:
@@ -152,12 +169,14 @@ class Scheduler:
                 continue
             runner = asyncio.create_task(self._run(row))
             self._inflight[row["id"]] = runner
+            self._inflight_rows[row["id"]] = row
             if row.get("note") == self.DIGEST_NOTE:
                 self._digest_runners[row["id"]] = (runner, time.time())
 
             def _done(_t, _id=row["id"]):
                 self._inflight.pop(_id, None)
                 self._digest_runners.pop(_id, None)
+                self._inflight_rows.pop(_id, None)
 
             runner.add_done_callback(_done)
         return len(rows)
@@ -172,6 +191,50 @@ class Scheduler:
             return True
 
     # ------------------------------------------------------ dream in flight
+    MAX_DUE_NOW_RESETS = 2  # per task per day; then re-anchor (anti spam)
+
+    async def _bump_reset_count(self, task_id: int, day: str) -> int:
+        """How many times this task was reset to due-now today (after this bump)."""
+        key = f"task_resets:{task_id}:{day}"
+        try:
+            n = int((await self.repo.get_meta(key) or "0")) + 1
+            await self.repo.set_meta(key, str(n))
+        except Exception:
+            return 1
+        return n
+
+    async def _reanchor_interrupted(self, task_id: int, row: dict) -> None:
+        """Cap reached: park the task at its natural next slot instead of
+        due-now. A crash-loop must not re-deliver the morning digest on
+        every boot (live 2026-11-04: ~19 📰 copies)."""
+        import time
+
+        try:
+            if row.get("note") in (self.DIGEST_NOTE, self.MORNING_NOTE):
+                from muze.digest import next_run_for_hhmm
+
+                hhmm = (
+                    self.service.cfg.digest.morning_at
+                    if row.get("note") == self.MORNING_NOTE
+                    else self.service.cfg.digest.at
+                )
+                nxt = next_run_for_hhmm(hhmm)
+            else:
+                nxt = int(time.time() + int(row.get("interval_sec") or 3600))
+            await self.repo.finish_task(
+                task_id, "active",
+                f"interrupted {self.MAX_DUE_NOW_RESETS}+x today; re-anchored to the next slot "
+                "to stop the crash-loop re-delivery",
+                next_run_at=nxt,
+            )
+            log.warning(
+                "task #%s interrupted again (cap reached); re-anchored to %s — no more due-now re-fires today",
+                task_id, nxt,
+            )
+        except Exception:
+            log.exception("re-anchor of task #%s failed; falling back to due-now", task_id)
+            await self.repo.reset_task(task_id, int(time.time()))
+
     def digest_runner(self) -> asyncio.Task | None:
         """The in-flight nightly-dream task, if one is running right now."""
         for runner, _t0 in self._digest_runners.values():

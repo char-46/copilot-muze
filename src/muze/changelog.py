@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.173",
+        "date": "2026-11-06",
+        "changes": [
+            "晨报疯发根因修复 + 本地命令开放给管理员（用户指示 2026-11-06）：①被打断的周期任务当天最多重置 due-now 两次（此前进程崩溃循环 + 5 分钟自启守望每轮都把晨报重发一遍，实发 11-04 06:00-07:40 约 19 份），超过即重锚到下一个原定时刻槽；②停机带原因日志（shutting down (原因)，下次崩溃循环一行定位）；③/restart、/shutdown 等本地命令管理员会话（controller 好友/控制群）可直接使用。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.172",
         "date": "2026-11-03",
         "changes": [

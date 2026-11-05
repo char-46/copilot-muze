@@ -357,10 +357,15 @@ class App:
 
     def _request_restart(self) -> None:
         self.restart_requested = True
+        self._stop_reason = "restart requested"
         self._stop.set()
 
-    def _request_stop(self) -> None:
+    def _request_stop(self, reason: str = "") -> None:
         self.restart_requested = False
+        # who asked for the stop — the live 2026-11-04 crash-loop shut down
+        # gracefully every ~60s with NO trace of the trigger; this makes the
+        # next occurrence a one-line diagnosis
+        self._stop_reason = reason or "stop requested"
         self._stop.set()
 
     async def _record_login(self) -> None:
@@ -696,7 +701,7 @@ class App:
             await asyncio.sleep(5)
             if not _parent_alive(pid):
                 log.warning("supervisor pid %s is gone; exiting orphaned serve", pid)
-                self._request_stop()
+                self._request_stop(f"supervisor pid {pid} gone (orphaned serve)")
                 return
 
     # ------------------------------------------------------------- console
@@ -1192,7 +1197,10 @@ class App:
         if getattr(self, "_shutdown_done", False):
             return  # idempotent: run()'s finally and the bootstrap both call it
         self._shutdown_done = True
-        log.info("[%s] shutting down...", self.spec.name)
+        reason = getattr(self, "_stop_reason", "") or (
+            "restart requested" if getattr(self, "restart_requested", False) else "run() ended"
+        )
+        log.info("[%s] shutting down... (%s)", self.spec.name, reason)
         self._stop.set()
         try:
             await self.repo.set_meta("last_shutdown_at", str(time.time()))

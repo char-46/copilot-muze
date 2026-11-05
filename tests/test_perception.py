@@ -304,7 +304,8 @@ def test_risk_backoff_streak_doubles_and_risky_words_trip_immediately():
     # cooldown stands (it is a safety pause, not an error counter)
     bf_mod._note_pull_success()
     assert bf_mod._FAIL_STREAK == 0 and bf_mod._RISK_NEXT_SEC == 0.0
-    assert bf_mod._risk_paused() == (True, left)  # still paused
+    still_paused, left2 = bf_mod._risk_paused()
+    assert still_paused and abs(left2 - left) < 1.0  # still paused (≈ same leftover; clock ticks between reads)
     # ...it expires with time; a risk-control-sounding error then trips a
     # FRESH base-step cooldown immediately (no streak needed)
     bf_mod._RISK_UNTIL = 0.0
