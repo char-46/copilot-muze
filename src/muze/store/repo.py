@@ -834,8 +834,16 @@ class Repository:
             out.append(d)
         return out
 
-    async def messages_between(
-        self, scene: str, peer_id: int, start_ts: int, end_ts: int, limit: int = 50
+    async def day_message_count(self, start_ts: int, end_ts: int) -> int:
+        """Messages archived for [start_ts, end_ts) -- the staleness probe
+        for day reports (a report made while the protocol side was down saw
+        fewer messages than the archive holds after the catch-up)."""
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE time>=? AND time<?", (start_ts, end_ts)
+        ) as cur:
+            return int((await cur.fetchone())[0] or 0)
+
+    async def messages_between(        self, scene: str, peer_id: int, start_ts: int, end_ts: int, limit: int = 50
     ) -> list[dict]:
         """Newest-first window within [start_ts, end_ts); returns chronological."""
         async with self.conn.execute(
