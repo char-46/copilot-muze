@@ -463,6 +463,17 @@ class Scheduler:
     # ------------------------------------------------- delivery retry
     DELIVERY_RETRY_SEC = 60.0
     DELIVERY_KEY = "pending_deliver:"
+    DELIVERY_MAX_TRIES = 12  # ~1h-capped backoff: a day of parking is enough
+
+    @staticmethod
+    def _delivery_head(text: str) -> str:
+        """Content fingerprint for the delivery-evidence probe: the first
+        non-empty line's first 16 chars (the chain title is the first 24, so
+        a chain echo's raw payload also contains this)."""
+        for ln in (text or "").splitlines():
+            if ln.strip():
+                return ln.strip()[:16]
+        return ""
 
     async def _queue_delivery_retry(
         self, task_id: int, scene: str, peer_id: int, text: str
@@ -477,6 +488,7 @@ class Scheduler:
             "scene": scene,
             "peer": int(peer_id),
             "text": text,
+            "head": self._delivery_head(text),
             "next_at": int(time.time() + self.DELIVERY_RETRY_SEC),
             "tries": 0,
         }
@@ -498,6 +510,7 @@ class Scheduler:
         except Exception:
             log.exception("pending delivery scan failed")
             return
+        self_id = int(getattr(getattr(self.service, "runtime", None), "self_id", 0) or 0)
         for key, raw in rows:
             try:
                 payload = json.loads(raw)
@@ -505,6 +518,36 @@ class Scheduler:
                 await self.repo.del_meta(key)
                 continue
             if int(payload.get("next_at") or 0) > now:
+                continue
+            # never-double guard (live 2026-11-07: every parked retry of the
+            # dream digest re-delivered it -- each "failed" send had actually
+            # landed with only the response lost). The protocol side echoes
+            # the bot's own sends back into the store; matching evidence means
+            # delivered, drop instead of re-send.
+            head = str(payload.get("head") or "") or self._delivery_head(
+                payload.get("text") or ""
+            )
+            if head and self_id:
+                try:
+                    seen = await self.repo.delivery_evidence_seen(
+                        payload["scene"], int(payload["peer"]), self_id, head,
+                        int(now - 24 * 3600),
+                    )
+                except Exception:
+                    log.debug("delivery evidence probe failed", exc_info=True)
+                    seen = False
+                if seen:
+                    await self.repo.del_meta(key)
+                    log.warning(
+                        "parked delivery %s: delivery evidence in store; dropping", key
+                    )
+                    continue
+            if int(payload.get("tries") or 0) >= self.DELIVERY_MAX_TRIES:
+                await self.repo.del_meta(key)
+                log.warning(
+                    "parked delivery %s: gave up after %s tries (content stays in the dream archive)",
+                    key, payload["tries"],
+                )
                 continue
             try:
                 ok = await sender(payload["scene"], int(payload["peer"]), payload["text"])

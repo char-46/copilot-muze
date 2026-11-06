@@ -264,6 +264,36 @@ class Repository:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def delivery_evidence_seen(
+        self,
+        scene: str,
+        peer_id: int,
+        sender_id: int,
+        head: str,
+        since_ts: int,
+    ) -> bool:
+        """Evidence that an outbound text already landed in this conversation.
+
+        The protocol side echoes the bot's own sends back as incoming events
+        (and roaming backfill stores them too), so a self-authored message row
+        matching the content head means "delivered" even when the send call
+        itself reported failure -- the classic lost-response case where the
+        send went through but only the ACK died (live 2026-11-07: the dream
+        digest was re-delivered to the control group on every parked retry
+        because each "failed" send had actually landed).
+
+        Matches a self message whose text starts with `head` (plain / chunked
+        sends) or whose raw payload contains it (a forward chain carries the
+        head as the chain title)."""
+        esc = head.replace("/", "//").replace("%", "/%").replace("_", "/_")
+        async with self.conn.execute(
+            "SELECT 1 FROM messages WHERE scene=? AND peer_id=? AND sender_id=? "
+            "AND time>=? AND (text_content LIKE ? ESCAPE '/' OR raw_json LIKE ? ESCAPE '/') "
+            "LIMIT 1",
+            (scene, peer_id, sender_id, since_ts, f"{esc}%", f"%{esc}%"),
+        ) as cur:
+            return await cur.fetchone() is not None
+
     # ------------------------------------------------------- conversations
     async def list_conversations(
         self, active_within_h: float | None = None, limit: int = 200
