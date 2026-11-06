@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.175",
+        "date": "2026-11-06",
+        "changes": [
+            "协议端离线不做梦（用户指示 2026-11-06：没连接到协议实现就不做梦，连接到以后拉消息补做）：调度门控在协议断连/降级启动期间完全不领任务（此前 LLBot 被手动关掉时 01:00 照样空跑出罐头日报，白做）；任务不丢失——到点未领的做梦/晨报在重连补拉完成、门打开的第一个 tick 立即补做，间隔任务重锚不漂移。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.174",
         "date": "2026-11-06",
         "changes": [

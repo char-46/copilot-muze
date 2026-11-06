@@ -158,7 +158,7 @@ class Scheduler:
             # first miss + every ~5min: visible in the log, not every 20s
             if self._gate_stalls == 1 or self._gate_stalls % 15 == 0:
                 log.info(
-                    "scheduler tick deferred (%s): message pull still running",
+                    "scheduler tick deferred (%s): protocol side down or message pull still running",
                     self._gate_stalls,
                 )
             return 0

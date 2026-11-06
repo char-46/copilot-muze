@@ -92,6 +92,53 @@ async def test_gate_probe_failure_never_stalls_the_schedule(env):
     await s.stop()
 
 
+# --------------------------------------------- protocol-offline dream gate
+def test_sched_gate_requires_protocol_online():
+    """User direction 2026-11-06: 没连接到协议实现就不做梦，连接到以后
+    拉消息补做. The gate must defer ALL ticks while the protocol side is
+    down (a dream against a dead socket is a canned waste), and re-open
+    only when online AND the catch-up pull has landed."""
+    from muze.main import App
+
+    a = App.__new__(App)
+
+    a._protocol_online = False
+    a.backfiller = None
+    assert asyncio.run(a._backfill_sched_gate()) is False  # offline: never
+
+    a._protocol_online = True
+    a.backfiller = types.SimpleNamespace(running=True)
+    assert asyncio.run(a._backfill_sched_gate()) is False  # pull in flight: wait
+
+    a.backfiller = types.SimpleNamespace(running=False)
+    assert asyncio.run(a._backfill_sched_gate()) is True  # online + pulled: go
+
+
+async def test_due_task_fires_as_catchup_once_the_gate_reopens(env):
+    """The offline-deferred dream is not lost: its next_run_at passed while
+    the gate was closed, so the first open tick claims it (拉消息补做)."""
+    repo, conn = env
+    svc = GatedSvc()
+    await repo.create_task("once", "/dream night", "friend", 1,
+                           int(time.time()) - 5, 0, "builtin", "")
+    online = asyncio.Event()  # closed = protocol down
+
+    async def gate():
+        return online.is_set()
+
+    s = Scheduler(repo, svc, ChatLog(), gate=gate)
+    assert await s.tick() == 0  # offline: deferred, NOT lost
+    assert svc.entered == 0
+    row = await repo.get_task(1)
+    assert row["status"] == "active"  # never claimed, still due
+
+    online.set()  # LLBot back + catch-up done
+    assert await s.tick() == 1
+    await s.drain()
+    assert svc.entered == 1
+    await s.stop()
+
+
 # ------------------------------------------------- 2. restart waits for dream
 async def _dream_scheduler(repo, svc):
     s = Scheduler(repo, svc, ChatLog())
