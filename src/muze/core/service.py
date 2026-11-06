@@ -510,9 +510,15 @@ class ControlService:
           complete plain text (protocol side without chains -> sequential
           messages, still untruncated)
 
-        Returns True when the content was delivered. A ProtocolError on the
-        single-shot body is recovered by re-sending it as human-sized chunks
-        (see TEXT_CHUNK_CHARS).
+        Returns True when the content was delivered.
+
+        Failure policy (live 2026-11-07): a send refused by the protocol side
+        (retcode/401/404 -- definitely NOT delivered) is recovered by
+        re-sending as human-sized chunks; a network/timeout failure may have
+        actually landed with only the response lost, so it is NOT re-sent
+        here -- re-sending duplicated whole texts on every retry. The
+        scheduler's parked-delivery path re-checks delivery evidence in the
+        store before it re-sends anything.
         """
         if not text or not text.strip():
             return True
@@ -537,7 +543,8 @@ class ControlService:
         )
         try:
             if use_chain:
-                await self._send_chain(scene, peer_id, plain, nodes=nodes)
+                if not await self._send_chain(scene, peer_id, plain, nodes=nodes):
+                    return False
                 if want_image:
                     p = await self._render_png(text)
                     if p:
@@ -571,13 +578,32 @@ class ControlService:
                         log.warning("image follow-up failed: %s", e)
                 self.chatlog.sent(scene, peer_id, res.message_seq, preview or plain[:80])
         except ProtocolError as e:
+            if not self._definitely_rejected(e):
+                # network/timeout: the send may actually have been delivered
+                # (only the response was lost). Synchronously re-sending the
+                # whole text duplicates it -- live 2026-11-07: every parked
+                # retry of the dream digest re-delivered the group copy.
+                log.warning(
+                    "send_text to %s network-failed (not re-sending): %s",
+                    conv_id(scene, peer_id), e,
+                )
+                return False
             log.warning("send_text to %s failed: %s", conv_id(scene, peer_id), e)
             # Big single-shot bodies trip this protocol side's pb builder
             # ("build scratch failed pb=<empty>" -- live incident 2026-10-24:
-            # a 1781-char digest was silently lost). Recover by sending the
-            # same content as human-sized pieces instead of dropping it.
+            # a 1781-char digest was silently lost). The refusal means NOT
+            # delivered, so re-sending as human-sized pieces cannot duplicate.
             return await self._send_text_chunked(scene, peer_id, plain)
         return True
+
+    @staticmethod
+    def _definitely_rejected(e: ProtocolError) -> bool:
+        """True when the protocol side EXPLICITLY refused the call (non-zero
+        retcode, 401, 404): the message was not delivered, so a chunked
+        re-send cannot duplicate it. A network/timeout failure carries no
+        such guarantee."""
+        s = str(e)
+        return "retcode=" in s or "unauthorized" in s or "not implemented" in s
 
     TEXT_CHUNK_CHARS = 600  # single-shot bodies above this size kept failing
     TEXT_CHUNK_GAP = (1.0, 2.0)  # human cadence between split parts
@@ -639,12 +665,14 @@ class ControlService:
                 summary=f"完整文本 {len(plain)} 字 · {len(seg_nodes)} 节",
             )
             self.chatlog.sent(scene, peer_id, res.message_seq, f"[转发链] {head}")
-            return
+            return True
         except NotSupported as e:
             log.warning("forward chain unavailable, sequential fallback: %s", e)
-        for chunk in plain_chunks("\n\n".join(chunks), self.SAFE_SINGLE_CHARS):
-            res = await self._send_segments(scene, peer_id, [out_text(chunk)])
-            self.chatlog.sent(scene, peer_id, res.message_seq, chunk[:80])
+        # sequential fallback via the per-piece tolerant sender: one failed
+        # piece must not re-send the pieces that already landed (the old
+        # bare loop re-raised and send_text's recovery then duplicated the
+        # whole text -- live 2026-11-07).
+        return await self._send_text_chunked(scene, peer_id, "\n\n".join(chunks))
 
     async def request_send(
         self,
@@ -740,21 +768,49 @@ class ControlService:
 
         return resolve_morning_targets(self.cfg)
 
+    MORNING_DONE_KEY = "morning_done:"  # + local date -> "scene/peer,..." tried
+
     async def morning_broadcast(self, text: str) -> tuple[int, int]:
         """Push the dawn briefing to every target (admins privately + admin
         groups). Full text, send_text presentation (chain/image when long).
-        Per-target failures don't abort the rest."""
+        Per-target failures don't abort the rest.
+
+        ONE attempt per target per calendar day (receipt in meta): delivered,
+        refused and crashed all count as attempted. Live 2026-11-07: a target
+        whose send crashed the process made the task re-fire due-now after
+        every daemon relaunch, re-broadcasting the whole briefing to everyone
+        three times before the reset cap stopped it. A re-fire now delivers
+        only to targets not yet attempted today; the briefing stays available
+        in the dream archive regardless."""
+        import datetime as dt
+
+        key = f"{self.MORNING_DONE_KEY}{dt.date.today().isoformat()}"
+        try:
+            done = {t for t in (await self.repo.get_meta(key) or "").split(",") if t}
+        except Exception:
+            done = set()
         sent = failed = 0
         for scene, peer in self.morning_targets():
+            tag = conv_id(scene, peer)
+            if tag in done:
+                log.info("morning: %s already attempted today; skipping", tag)
+                continue
             try:
                 await self.send_text(scene, peer, text)
                 sent += 1
             except ProtocolError as e:
                 failed += 1
-                log.warning("morning broadcast to %s failed: %s", conv_id(scene, peer), e)
-            except Exception:
+                log.warning("morning broadcast to %s failed: %s", tag, e)
+            except Exception as e:
                 failed += 1
-                log.exception("morning broadcast to %s crashed", conv_id(scene, peer))
+                log.exception(
+                    "morning broadcast to %s crashed (%s)", tag, type(e).__name__
+                )
+            done.add(tag)
+            try:
+                await self.repo.set_meta(key, ",".join(sorted(done)))
+            except Exception:
+                log.debug("morning receipt write failed", exc_info=True)
         return sent, failed
 
     async def notify_controller(self, text: str) -> None:
