@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.176",
+        "date": "2026-11-06",
+        "changes": [
+            "重连补拉一批（实发 2026-11-06）：①连接池中毒修复——协议端重启后半开 keep-alive 连接让 POST 永久超时（milky 已恢复但 muze 一直报空错误 get_login_info），网络错误即弃会话、下次重建；②通知只发一次——「✅ 协议端已恢复连接」连发两条，是已送达但响应超时被判定失败后 chunked 兜底又重发了一遍，系统通知改为单次投递；③补拉防风控——重连补拉目标按离线窗口收敛（本地库查活跃会话，刚登录不再拉全名册两个大接口），单 worker 顺序拉取；④协议离线挂起更新——update.ps1 在协议端离线且服务在跑时拒绝更新（data\\protocol_online 标志，-Force 可越过），离线期翻版本无法验证且会掩盖重连回归（本次死连接池 bug 就是活例）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.175",
         "date": "2026-11-06",
         "changes": [

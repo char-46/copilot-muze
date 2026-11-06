@@ -758,12 +758,19 @@ class ControlService:
         return sent, failed
 
     async def notify_controller(self, text: str) -> None:
+        """System notices go out exactly ONCE -- no chunked fallback, no
+        retry. A "failed" send may actually have been delivered (slow
+        protocol response after a restart): the fallback re-send duplicated
+        the reconnect notice back-to-back (live 2026-11-06). An informational
+        notice may drop; it must never double."""
         target = self.control_conversation()
         if target is None:
             return
         scene, peer = target
+        plain = strip_markdown(text) if self.cfg.reply.strip_markdown else text
         try:
-            await self.send_text(scene, peer, text)
+            res = await self._send_segments(scene, peer, [out_text(plain)])
+            self.chatlog.sent(scene, peer, res.message_seq, plain[:80])
         except ProtocolError as e:
             log.warning("notify controller failed: %s", e)
 

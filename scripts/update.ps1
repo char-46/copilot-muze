@@ -12,8 +12,11 @@ Usage (from anywhere, absolute paths are derived):
   powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -SkipPull  # deps only (no git)
   powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel C:\dist\copilot_muze-0.1.0a57-py3-none-any.whl
   powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Wheel https://host/xxx.whl -Extras rag-local
+  powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -Force     # override the offline pause
 
 Notes:
+- SUSPENDS while the protocol side is offline (data\protocol_online absent
+  and the service running): an unverifiable version flip is not worth it.
 - `uv sync` runs while the service may still be running. Pure-python updates
   are fine (already-loaded .py files are not locked), but a NATIVE dependency
   update can hit a locked DLL. If that happens: scripts\start.ps1 -Stop,
@@ -39,7 +42,8 @@ param(
     [string]$Extras = "",       # comma-separated uv extras, e.g. "rag-local"; remembered between runs
     [switch]$SkipPull,          # skip fetch/checkout
     [string]$Wheel = "",        # local .whl path or URL; replaces git+uv sync entirely
-    [string]$Config = "config.yaml"
+    [string]$Config = "config.yaml",
+    [switch]$Force              # update even while the protocol side is offline
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +83,19 @@ if ($PSBoundParameters.ContainsKey('Extras')) {
 $oldVersion = & $Py -m muze version
 Write-Step "current version: $oldVersion"
 $wasRunning = @(Get-MuzeProc).Count -gt 0
+
+# ------------------------------------------------- protocol-offline guard
+# user direction 2026-11-06: a version flipped while the protocol side is
+# offline cannot be verified through QQ, and a restart into the offline
+# window hides reconnect regressions until the side comes back (live case:
+# the poisoned-session reconnect bug would have shipped unseen). The running
+# app maintains data\protocol_online; suspend unless -Force.
+$protoFlag = Join-Path $Repo "data\protocol_online"
+if ($wasRunning -and -not $Force -and -not (Test-Path $protoFlag)) {
+    Write-Step "SUSPENDED: protocol side offline (no data\protocol_online)."
+    Write-Step "An update flipped now cannot be verified; reopen the protocol side first, or pass -Force."
+    exit 0
+}
 
 # ---------------------------------------------------------------- update code
 if ($Wheel) {
