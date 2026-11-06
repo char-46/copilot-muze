@@ -409,7 +409,7 @@ class App:
 
     # ---------------------------------------------------- online / offline
     def _write_protocol_flag(self, online: bool) -> None:
-        """data\protocol_online marker for scripts (update.ps1 suspends while
+        """data/protocol_online marker for scripts (update.ps1 suspends while
         the protocol side is offline -- user direction 2026-11-06: a version
         flipped blind cannot be verified, and a restart into the offline
         window hides reconnect regressions until the side comes back)."""

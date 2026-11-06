@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.177",
+        "date": "2026-11-06",
+        "changes": [
+            "修正 a176 的打包校验问题：main.py 文档字符串里的 data\\protocol_online 是无效转义序列，Python 3.14 的编译校验报 SyntaxWarning 导致 deploy_wheel 断言失败（行为无变化）。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.176",
         "date": "2026-11-06",
         "changes": [
