@@ -183,6 +183,7 @@ class App:
             self.degraded = True
             self.runtime.degraded = True
             self._protocol_online = False
+            self._write_protocol_flag(False)
             log.warning(
                 "[%s] 协议端暂不可达（%s）。以历史账号 %s 降级启动："
                 "控制台/WebUI/本地数据可用，QQ 收发在协议端恢复后自动接上",
@@ -407,9 +408,25 @@ class App:
             log.exception("last_seen update failed")
 
     # ---------------------------------------------------- online / offline
+    def _write_protocol_flag(self, online: bool) -> None:
+        """data\protocol_online marker for scripts (update.ps1 suspends while
+        the protocol side is offline -- user direction 2026-11-06: a version
+        flipped blind cannot be verified, and a restart into the offline
+        window hides reconnect regressions until the side comes back)."""
+        try:
+            p = Path(self.cfg.storage.data_dir) / "protocol_online"
+            if online:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("1", encoding="ascii")
+            else:
+                p.unlink(missing_ok=True)
+        except Exception:
+            log.debug("protocol flag write failed", exc_info=True)
+
     async def _on_bot_offline(self, reason: str) -> None:
         """The account was kicked / the socket dropped: record the gap start."""
         self._protocol_online = False
+        self._write_protocol_flag(False)
         if self.degraded:
             return  # already known offline since boot; reconnect loop owns it
         now = time.time()
@@ -454,6 +471,7 @@ class App:
         started = self._offline_since
         self._offline_since = None
         self._protocol_online = True
+        self._write_protocol_flag(True)
         notice = self._offline_notice_task
         if notice is not None and not notice.done():
             notice.cancel()  # back online: never announce the outage after the fact
@@ -475,12 +493,18 @@ class App:
         return asyncio.create_task(self._catch_up(gap))
 
     async def _catch_up(self, gap: float) -> None:
-        """Incremental roaming pull to recover messages missed while offline."""
+        """Incremental roaming pull to recover messages missed while offline.
+
+        Risk-control shaped (user direction 2026-11-06: 补拉也要防止风控):
+        targets are scoped to conversations ACTIVE around the offline window
+        (local DB -- no live roster pulls right after login), and the pull
+        runs as a single paced worker instead of a parallel burst."""
         if self.backfiller is None or self.backfiller.running:
             return
+        hours = max(24.0, gap / 3600.0 * 1.5 + 24.0)
         try:
-            targets = await self.backfiller.target_conversations()
-            n = await self.backfiller.run_once(targets)
+            targets = await self.backfiller.catchup_targets(active_within_h=hours)
+            n = await self.backfiller.run_once(targets, concurrency=1)
         except Exception:
             log.exception("catch-up backfill failed")
             return
@@ -692,6 +716,7 @@ class App:
             self.degraded = False
             self.runtime.degraded = False
             self._protocol_online = True
+            self._write_protocol_flag(True)
             self._remember_uin(login.user_id)
             log.info(
                 "[%s] 协议端恢复，已登录 %s (%s)", self.spec.name,

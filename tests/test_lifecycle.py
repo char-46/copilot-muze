@@ -143,7 +143,14 @@ class _FakeBackfiller:
     async def target_conversations(self):
         return [("friend", 1), ("group", 2)]
 
-    async def run_once(self, targets=None, reporter=None, force=False, since_ts=None):
+    async def catchup_targets(self, active_within_h):
+        # 补拉防风控: scoped window + single paced worker
+        assert active_within_h >= 24.0
+        return [("friend", 1), ("group", 2)]
+
+    async def run_once(self, targets=None, reporter=None, force=False, since_ts=None,
+                       concurrency=None):
+        assert concurrency == 1  # risk control: no parallel burst after login
         self.calls.append(targets)
         return 5
 

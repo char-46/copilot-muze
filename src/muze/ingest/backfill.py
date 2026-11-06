@@ -405,6 +405,7 @@ class Backfiller:
         force: bool = False,
         since_ts: float | None = None,
         background: bool = False,
+        concurrency: int | None = None,
     ) -> int | None:
         st = _run_state(self.repo.conn)
         if background and not force and since_ts is None:
@@ -443,7 +444,13 @@ class Backfiller:
             note = "（强制全量）" if force else ("（重拉近期）" if since_ts else "")
             await reporter.report_start(f"{len(targets)} 个会话{note}")
 
-            concurrency = max(1, self.cfg.ingest.backfill.concurrency)
+            # the reconnect catch-up passes concurrency=1: right after login
+            # a parallel pull burst across many conversations is the classic
+            # risk-control trigger (user direction 2026-11-06: 补拉也要防风控)
+            concurrency = max(1, int(
+                concurrency if concurrency is not None
+                else self.cfg.ingest.backfill.concurrency
+            ))
             queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
             for t in targets:
                 queue.put_nowait(t)
@@ -704,11 +711,17 @@ class Backfiller:
             except Exception as e:
                 log.warning("rescan failed: %s", e)
 
-    async def _rescan_targets(self) -> list[tuple[str, int]]:
+    async def _rescan_targets(self, active_within_h: float | None = None) -> list[tuple[str, int]]:
         """Rescan recently-active conversations plus control conversations,
-        plus any conversation with an unfinished deep pull (hole to resume)."""
+        plus any conversation with an unfinished deep pull (hole to resume).
+
+        active_within_h overrides the configured window -- the reconnect
+        catch-up passes one sized to its offline gap."""
         bf = self.cfg.ingest.backfill
-        rows = await self.repo.list_conversations(active_within_h=bf.rescan_active_window_h)
+        rows = await self.repo.list_conversations(
+            active_within_h=bf.rescan_active_window_h if active_within_h is None
+            else active_within_h
+        )
         targets = [(r["scene"], r["peer_id"]) for r in rows]
         targets.extend(await self.repo.pending_bf_conversations())
         cfg = self.cfg
@@ -717,6 +730,13 @@ class Backfiller:
         for u in cfg.control.controller:
             targets.append(("friend", u))
         return list(dict.fromkeys(targets))
+
+    async def catchup_targets(self, active_within_h: float) -> list[tuple[str, int]]:
+        """Reconnect catch-up scope (user direction 2026-11-06: 补拉也要防止
+        风控). Unlike target_conversations() this NEVER calls the live roster
+        APIs right after login -- it reads the local DB for conversations
+        active around the offline window, so the pull burst stays small."""
+        return await self._rescan_targets(active_within_h=active_within_h)
 
     async def stop(self) -> None:
         self._stop.set()

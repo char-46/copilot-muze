@@ -69,6 +69,9 @@ Build metadata (`+build.g<sha>.<ts>`) is appended automatically by
 - `update.ps1` ONLY updates code + deps (git checkout latest tag, or `-Wheel`;
   `uv sync`). It must NEVER stop/start/restart the service — flipping the
   running instance is the user's `/restart` (or `scripts\start.ps1`).
+- `update.ps1` SUSPENDS while the protocol side is offline (`data\protocol_online`
+  absent + service running, user direction 2026-11-06): an unverifiable version
+  flip is not worth it. `-Force` overrides.
 - `start.ps1` is the ONLY script that manages processes: default start (with
   startup verification), `-Stop`, `-Restart`.
 - `deploy.ps1` = first install + optional logon task (`muze-autostart`) which

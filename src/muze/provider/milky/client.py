@@ -69,6 +69,16 @@ class MilkyClient:
         except ProtocolError:
             raise
         except Exception as e:  # network / parse
+            # A protocol-side restart leaves half-open keep-alive sockets in
+            # the pool; POSTs are not retried, so every later call can hang
+            # to timeout on the poisoned connection even though the protocol
+            # side is back (live 2026-11-06: milky answered probes while the
+            # app kept logging empty get_login_info timeouts). Drop the
+            # session -- the next call builds a fresh connector.
+            try:
+                await self.close()
+            except Exception:
+                pass
             raise ProtocolError(f"{api}: {e}") from e
 
         if not isinstance(body, dict) or body.get("status") != "ok":
