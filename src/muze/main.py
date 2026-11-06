@@ -112,6 +112,11 @@ class App:
         self._offline_notice_task: asyncio.Task | None = None  # deferred "we are offline" notice
         self._sched_gate: asyncio.Event | None = None  # opened after the boot roaming pull
         self._gate_task: asyncio.Task | None = None
+        # protocol reachability for the scheduler gate (user direction
+        # 2026-11-06: 没连接到协议实现就不做梦): scheduled tasks defer while
+        # the protocol side is down; due tasks fire as catch-up the moment
+        # the reconnect pull lands
+        self._protocol_online = True
         self._last_activity = time.time()  # in-memory clock for the RAG idle governor
         self.conn = None
         self.repo = None
@@ -177,6 +182,7 @@ class App:
                 raise  # first boot for this account: no local identity to fall back on
             self.degraded = True
             self.runtime.degraded = True
+            self._protocol_online = False
             log.warning(
                 "[%s] 协议端暂不可达（%s）。以历史账号 %s 降级启动："
                 "控制台/WebUI/本地数据可用，QQ 收发在协议端恢复后自动接上",
@@ -403,6 +409,7 @@ class App:
     # ---------------------------------------------------- online / offline
     async def _on_bot_offline(self, reason: str) -> None:
         """The account was kicked / the socket dropped: record the gap start."""
+        self._protocol_online = False
         if self.degraded:
             return  # already known offline since boot; reconnect loop owns it
         now = time.time()
@@ -446,6 +453,7 @@ class App:
         now = time.time()
         started = self._offline_since
         self._offline_since = None
+        self._protocol_online = True
         notice = self._offline_notice_task
         if notice is not None and not notice.done():
             notice.cancel()  # back online: never announce the outage after the fact
@@ -488,12 +496,17 @@ class App:
     BOOT_BACKFILL_GATE_SEC = 300.0  # hard deadline: a hung pull must not stall tasks
 
     async def _backfill_sched_gate(self) -> bool:
-        """May due scheduled tasks run RIGHT NOW? False while a roaming pull
-        is in flight (the 00:05 daily full sweep above all): the nightly
-        dream would read a half-pulled day and call it quiet. Tasks defer
-        until the pull lands -- the interval re-anchor keeps the wall-clock
-        slot, so a deferred dream neither drifts nor doubles (user
-        direction 2026-11-03: 每天消息零点五分没拉完的时候做梦延期)."""
+        """May due scheduled tasks run RIGHT NOW? False while the protocol
+        side is down or a roaming pull is in flight (the 00:05 daily full
+        sweep above all): the nightly dream would read a half-pulled day and
+        call it quiet. Tasks defer until the pull lands -- the interval
+        re-anchor keeps the wall-clock slot, so a deferred dream neither
+        drifts nor doubles (user direction 2026-11-03: 每天消息零点五分没
+        拉完的时候做梦延期; 2026-11-06: 没连接到协议实现就不做梦，连接到
+        以后拉消息补做 -- due tasks fire as catch-up the moment the
+        reconnect pull finishes, they never run against a dead socket)."""
+        if not getattr(self, "_protocol_online", True):
+            return False
         bf = getattr(self, "backfiller", None)
         return bf is None or not getattr(bf, "running", False)
 
@@ -678,6 +691,7 @@ class App:
             self.runtime.self_id = login.user_id
             self.degraded = False
             self.runtime.degraded = False
+            self._protocol_online = True
             self._remember_uin(login.user_id)
             log.info(
                 "[%s] 协议端恢复，已登录 %s (%s)", self.spec.name,
