@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.180",
+        "date": "2026-11-07",
+        "changes": [
+            "晨报三连崩根因修复（实锤 2026-11-07 06:00/06:02/06:07 三次进程退出的 traceback）：LLBot 对某好友（3168646311，疑似过期/非好友）的发送返回 status ok 但 message_seq/time 为 null——①发送侧 pydantic 校验炸出 ValidationError（非 ProtocolError，无人捕获）→ 晨报广播 crashed；②LLBot 同时推回的 message_send 回显事件同样 null 字段，Event.from_raw 的 ValidationError 直接杀死事件循环 → run() 结束 → 进程退出 → 守护拉起 → due-now 重跑 → 全员重收。契约边界现在双向容错：发送回执 null 归一为 seq=0（已送达无回执不是错误），坏事件帧告警丢弃、事件流永不被单帧杀死。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.179",
         "date": "2026-11-07",
         "changes": [

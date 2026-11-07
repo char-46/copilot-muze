@@ -49,6 +49,23 @@ def _unwrap(data: Any, *keys: str) -> Any:
     return data
 
 
+def _send_result_data(data: Any) -> dict:
+    """Normalize a send response into SendMessageResult input.
+
+    LLBot accepts a send (status ok) yet returns null message_seq/time for
+    some peers (live 2026-11-07: friend/3168646311 -- likely stale/non-friend
+    on the protocol side). That is a DELIVERED send without a receipt, not an
+    error: normalize to 0 instead of letting pydantic's ValidationError blow
+    up the caller (it was neither a ProtocolError nor caught anywhere -- the
+    morning broadcast 'crashed' on it three times)."""
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "message_seq": data.get("message_seq") or 0,
+        "time": data.get("time") or 0,
+    }
+
+
 class MilkyAdapter(ProtocolAdapter):
     """Talks to LLBot / Lagrange.Milky over the Milky standard interface."""
 
@@ -159,7 +176,19 @@ class MilkyAdapter(ProtocolAdapter):
     # ------------------------------------------------------------- events
     async def events(self) -> AsyncIterator[Event]:
         async for raw in self.client.ws_events():
-            ev = Event.from_raw(raw)
+            try:
+                ev = Event.from_raw(raw)
+            except Exception as e:
+                # A single malformed frame must never kill the event loop.
+                # Live 2026-11-07: LLBot accepts sends to one peer with
+                # status ok but null message_seq/time -- and pushes the
+                # message_send echo with the same nulls; the ValidationError
+                # escaped events(), ended _consume_events, took run() down
+                # and the process exited three times in seven minutes.
+                log.warning(
+                    "unparseable event frame dropped: %s | %.200s", e, raw
+                )
+                continue
             if ev.event_type in ("message_receive", "message_send"):
                 # Assume file segments actually arrive if one shows up.
                 seg_types = {getattr(s, "type", "") for s in ev.data.segments}
@@ -288,7 +317,7 @@ class MilkyAdapter(ProtocolAdapter):
         data = await self.client.call(
             "send_private_message", {"user_id": user_id, "message": segments}
         )
-        return SendMessageResult.model_validate(data or {})
+        return SendMessageResult.model_validate(_send_result_data(data))
 
     async def _send_group_raw(
         self, group_id: int, segments: list[dict]
@@ -296,7 +325,7 @@ class MilkyAdapter(ProtocolAdapter):
         data = await self.client.call(
             "send_group_message", {"group_id": group_id, "message": segments}
         )
-        return SendMessageResult.model_validate(data or {})
+        return SendMessageResult.model_validate(_send_result_data(data))
 
     async def send_forward_message(
         self,
