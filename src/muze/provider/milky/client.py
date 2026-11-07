@@ -62,9 +62,13 @@ class MilkyClient:
         try:
             async with sess.post(url, json=params or {}, headers=self._headers()) as resp:
                 if resp.status == 401:
-                    raise ProtocolError(f"{api}: unauthorized (check milky.access_token)")
+                    raise ProtocolError(
+                        f"{api}: unauthorized (check milky.access_token)", kind="refused"
+                    )
                 if resp.status == 404:
-                    raise ProtocolError(f"{api}: not implemented by protocol side (404)")
+                    raise ProtocolError(
+                        f"{api}: not implemented by protocol side (404)", kind="refused"
+                    )
                 body = await resp.json(content_type=None)
         except ProtocolError:
             raise
@@ -79,12 +83,16 @@ class MilkyClient:
                 await self.close()
             except Exception:
                 pass
-            raise ProtocolError(f"{api}: {e}") from e
+            # kind="network": delivery UNKNOWN -- the call may have landed
+            # with only the response lost (contract semantics, see base.py)
+            raise ProtocolError(f"{api}: {e}", kind="network") from e
 
         if not isinstance(body, dict) or body.get("status") != "ok":
             retcode = body.get("retcode") if isinstance(body, dict) else "?"
             message = body.get("message") if isinstance(body, dict) else str(body)[:200]
-            raise ProtocolError(f"{api}: retcode={retcode} message={message}")
+            raise ProtocolError(
+                f"{api}: retcode={retcode} message={message}", kind="refused"
+            )
         return body.get("data")
 
     # ------------------------------------------------------------- events

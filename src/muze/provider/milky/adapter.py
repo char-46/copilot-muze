@@ -53,6 +53,7 @@ class MilkyAdapter(ProtocolAdapter):
     """Talks to LLBot / Lagrange.Milky over the Milky standard interface."""
 
     def __init__(self, cfg: MilkyEndpoint) -> None:
+        super().__init__()
         self.cfg = cfg
         self.client = MilkyClient(
             cfg.base_url,
@@ -281,7 +282,7 @@ class MilkyAdapter(ProtocolAdapter):
         return self._friend_names.get(user_id, "")
 
     # ----------------------------------------------------------- messaging
-    async def send_private_message(
+    async def _send_private_raw(
         self, user_id: int, segments: list[dict]
     ) -> SendMessageResult:
         data = await self.client.call(
@@ -289,7 +290,7 @@ class MilkyAdapter(ProtocolAdapter):
         )
         return SendMessageResult.model_validate(data or {})
 
-    async def send_group_message(
+    async def _send_group_raw(
         self, group_id: int, segments: list[dict]
     ) -> SendMessageResult:
         data = await self.client.call(

@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.179",
+        "date": "2026-11-07",
+        "changes": [
+            "防风控下沉到协议契约层（用户方向 2026-11-07：连续发相同消息会被风控）：①ProtocolError 增加契约语义 kind（refused=协议明确拒发、肯定没送达；network=传输失败/超时、送达与否未知——「已送达但响应丢失」正是昨晚 11 连发的根源；risk=本地预算拦截），调用方不再靠字符串嗅探；②ProtocolAdapter 公开发送面内置守卫并经 __init_subclass__ 自动包装所有后端实现（Milky 现有，未来 OB11/OB12/Lagrange 同契）——同会话同内容指纹 10 分钟窗口内直接抑制（网络性失败的指纹保留以抑制盲重发，明确拒发的指纹清除允许重发）、同会话发送节奏 ≥0.6s+抖动、滚动小时预算 160 次封顶；③配置新增 risk 段（dupe_window_sec/min_gap_sec/gap_jitter_sec/send_hourly_budget）。即便上层重试逻辑再出错，契约层也兜底不重发。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.178",
         "date": "2026-11-07",
         "changes": [

@@ -32,7 +32,7 @@ from muze.core.service import (
 )
 from muze.ingest.backfill import Backfiller
 from muze.ingest.pipeline import IngestPipeline
-from muze.provider.base import ProtocolError
+from muze.provider.base import ProtocolError, RiskPolicy
 from muze.provider.milky.adapter import MilkyAdapter
 from muze.provider.milky.models import (
     Event,
@@ -173,6 +173,14 @@ class App:
         cfg.storage.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.adapter = MilkyAdapter(self.spec.endpoint)
+        # contract-level outbound risk control (identical-send suppression,
+        # pacing, hourly budget) -- policy from config, guards in base.py
+        self.adapter.risk = RiskPolicy(
+            dupe_window_sec=cfg.risk.dupe_window_sec,
+            min_gap_sec=cfg.risk.min_gap_sec,
+            gap_jitter_sec=cfg.risk.gap_jitter_sec,
+            hourly_budget=cfg.risk.send_hourly_budget,
+        )
         login = None
         try:
             login = await self.adapter.start()
