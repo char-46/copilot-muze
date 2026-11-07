@@ -238,3 +238,51 @@ def test_definitely_rejected_uses_contract_kind():
     # plain errors (non-contract fakes) keep the string fallback
     assert ControlService._definitely_rejected(ProtocolError("x: retcode=500"))
     assert not ControlService._definitely_rejected(ProtocolError("x: "))
+
+
+# ------------------------------------- contract boundary tolerance
+async def test_send_with_null_receipt_does_not_crash():
+    """Live 2026-11-07 06:00/06:02/06:07: LLBot accepts a send to one peer
+    (status ok) but returns null message_seq/time; the pydantic ValidationError
+    was neither a ProtocolError nor caught, and it crashed the morning
+    broadcast three times. A delivered send without a receipt is seq=0."""
+    from muze.provider.milky.adapter import _send_result_data
+    from muze.provider.milky.models import SendMessageResult
+
+    res = SendMessageResult.model_validate(
+        _send_result_data({"message_seq": None, "time": None})
+    )
+    assert res.message_seq == 0 and res.time == 0
+    # well-formed data passes through unchanged
+    ok = SendMessageResult.model_validate(
+        _send_result_data({"message_seq": 123, "time": 456})
+    )
+    assert ok.message_seq == 123 and ok.time == 456
+    # non-dict garbage degrades to zeros, not an exception
+    junk = SendMessageResult.model_validate(_send_result_data("nope"))
+    assert junk.message_seq == 0
+
+
+async def test_malformed_event_frame_is_dropped_not_fatal():
+    """The same null-field peer made LLBot push a message_send echo whose
+    fields failed Event validation; the ValidationError escaped events(),
+    ended _consume_events and the whole process exited. A bad frame must be
+    dropped with a warning while the stream lives on."""
+    from muze.config import MilkyEndpoint
+    from muze.provider.milky.adapter import MilkyAdapter
+
+    ad = MilkyAdapter(MilkyEndpoint())
+
+    async def fake_ws():
+        yield {"event_type": "bot_online", "data": {}}
+        yield {"event_type": "message_send", "data": {"message_seq": None}}  # bad
+        yield {"event_type": "message_receive", "data": {
+            "scene": "friend", "peer": 5, "message_seq": 9,
+            "sender": {"user_id": 5}, "segments": [],
+        }}
+
+    ad.client.ws_events = fake_ws
+    seen = []
+    async for ev in ad.events():
+        seen.append(ev.event_type)
+    assert seen == ["bot_online", "message_receive"]  # bad frame skipped
