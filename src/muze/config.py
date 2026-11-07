@@ -581,6 +581,24 @@ class DigestConfig(BaseModel):
     inject_max_memories: int = 25
 
 
+class RiskConfig(BaseModel):
+    """Outbound risk control enforced INSIDE the protocol adapter contract
+    (user direction 2026-11-07: 连续发相同消息会被风控). Identical-content
+    suppression, per-conversation pacing with jitter, rolling hourly budget;
+    every backend (Milky / OB11 / OB12 / Lagrange) inherits the same guards."""
+
+    # same conversation + same content within this window -> suppressed
+    # (a wire attempt that died network-unknown also leaves its fingerprint,
+    # so blind re-sends of possibly-delivered content are suppressed too)
+    dupe_window_sec: float = 600.0
+    # minimum gap between consecutive sends to the same conversation
+    min_gap_sec: float = 0.6
+    # uniform jitter added to the gap (never metronome-exact)
+    gap_jitter_sec: float = 0.6
+    # rolling hourly ceiling on wire sends (only a runaway trips it)
+    send_hourly_budget: int = 160
+
+
 class ReplyConfig(BaseModel):
     """Outbound QQ replies: no truncation, QQ-safe formatting.
 
@@ -612,6 +630,8 @@ class MuzeConfig(BaseModel):
     log: LogConfig = Field(default_factory=LogConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
+
+    risk: RiskConfig = Field(default_factory=RiskConfig)
     profiles: ProfilesConfig = Field(default_factory=ProfilesConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
 

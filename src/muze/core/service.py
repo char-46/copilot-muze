@@ -598,10 +598,13 @@ class ControlService:
 
     @staticmethod
     def _definitely_rejected(e: ProtocolError) -> bool:
-        """True when the protocol side EXPLICITLY refused the call (non-zero
-        retcode, 401, 404): the message was not delivered, so a chunked
-        re-send cannot duplicate it. A network/timeout failure carries no
-        such guarantee."""
+        """True when the protocol side EXPLICITLY refused the call (contract
+        kind="refused": non-zero retcode, 401, 404): the message was not
+        delivered, so a chunked re-send cannot duplicate it. A network/
+        timeout failure carries no such guarantee. The string checks are a
+        fallback for plain errors raised by non-contract fakes/tests."""
+        if getattr(e, "refused", False):
+            return True
         s = str(e)
         return "retcode=" in s or "unauthorized" in s or "not implemented" in s
 
