@@ -160,6 +160,34 @@ def test_light_app_text_extraction():
     assert plain_text([TextSeg(text="hi"), bad]) == "hi [小程序:x]"
 
 
+def test_light_app_text_tuwen_card_shape():
+    """The live shape (2026-11-08): fields live under meta.news, desc is a URL
+    copy, jumpUrl is a >200-char xiumius preview link and meta.news.uin is the
+    sharer. The title must lead; URLs must not crowd it out."""
+    payload = (
+        '{"app":"com.tencent.tuwen.lua","bizsrc":"qqconnect.sdkshare",'
+        '"config":{"ctime":1794120152,"forward":1,"token":"22314","type":"normal"},'
+        '"extra":{"app_type":1,"appid":100446242,"uin":2958353317},'
+        '"meta":{"news":{"app_type":1,"appid":100446242,"ctime":1794120152,'
+        '"desc":"https://v.xiumius.cn/board/v6/14OKQ3/1mz…",'
+        '"jumpUrl":"https://v.xiumius.cn/board/v6/14OKQ3/1mz5fY?in_preview=true'
+        '&preview_for=normal&stage_ticket=ONq6anLFmwaSb1dZn3g9vzxlWSjEAhOKqGKp0Lz'
+        'JqQFYDWC2L3EmKL0PH5Fp&color_scheme=light",'
+        '"preview":"https://tangram-1251316161.file.myqcloud.com/files/x.png",'
+        '"tag":"","tagIcon":"",'
+        '"title":"砺练团务本领，筑牢支部根基｜我院开展团支书专题培训会",'
+        '"uin":2958353317}},'
+        '"prompt":"[分享] 砺练团务本领","ver":"0.0.0.1","view":"news"}'
+    )
+    text = plain_text([LightAppSeg(app_name="com.tencent.tuwen.lua", json_payload=payload)])
+    # title leads
+    assert text.index("砺练团务本领") < text.index("分享人QQ")
+    assert "分享人QQ:2958353317" in text
+    assert "预览版未发布" in text
+    assert "in_preview=true" in text      # preview link present (truncated ok)
+    assert len(text) <= 210                # bounded projection
+
+
 async def test_blob_lookup_invalidated_by_deleted_file(tmp_path):
     blobs = BlobStore(tmp_path / "blobs")
     await blobs.record("face:GONE", "ab" * 32, str(tmp_path / "nope.gif"), 5, "face")

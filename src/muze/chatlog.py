@@ -168,7 +168,12 @@ def render_message(msg: IncomingMessage, sender_display: str = "") -> str:
 
 
 def _light_app_text(payload: str) -> str:
-    """Best-effort title/desc/url extraction from a light_app json payload."""
+    """Readable summary of a light_app (mini-program share) card.
+
+    A shared card is a real workflow signal (user direction 2026-11-08: an
+    article card sent to the bot marks the corresponding todo delivered), so
+    the TITLE must lead and must never be crowded out by URL noise (the old
+    extractor let two URL copies eat the whole 200-char budget first)."""
     import json as _json
 
     try:
@@ -177,30 +182,41 @@ def _light_app_text(payload: str) -> str:
         return ""
     if not isinstance(data, dict):
         return ""
-    found: list[str] = []
+
+    title = desc = url = ""
+    uin = 0
 
     def walk(node, depth: int) -> None:
-        if depth > 3 or not isinstance(node, dict):
+        nonlocal title, desc, url, uin
+        if depth > 4 or not isinstance(node, dict):
             return
         for k, v in node.items():
             lk = str(k).lower()
             if isinstance(v, str) and v:
-                if lk in ("title", "titletext") and v not in found:
-                    found.append(v)
-                elif lk in ("desc", "desctext", "summary") and len(v) < 120 and v not in found:
-                    found.append(v)
-                elif lk in ("jump_url", "jumpurl", "url") and v.startswith("http"):
-                    found.append(v)
+                if not title and lk in ("title", "titletext"):
+                    title = v
+                elif not desc and lk in ("desc", "desctext") and len(v) < 120:
+                    desc = v
+                elif not url and lk in ("jump_url", "jumpurl", "url") and v.startswith("http"):
+                    url = v
             elif isinstance(v, dict):
                 walk(v, depth + 1)
+            elif isinstance(v, int) and not uin and lk == "uin":
+                uin = v
 
-    # meta_data / metaData usually holds the card fields
-    for key in ("meta_data", "metaData", "extra"):
-        if key in data and isinstance(data[key], dict):
-            walk(data[key], 0)
-    if not found:
-        walk(data, 0)
-    return " ".join(found[:3])[:200]
+    walk(data, 0)
+    parts: list[str] = []
+    if title:
+        parts.append(title[:80])
+    if uin:
+        parts.append(f"分享人QQ:{uin}")
+    if url and ("in_preview=true" in url or "stage_ticket=" in url):
+        parts.append("(预览版未发布)")
+    if desc and not desc.startswith("http"):
+        parts.append(desc[:60])
+    if url:
+        parts.append(url if len(url) <= 90 else url[:87] + "...")
+    return " ".join(parts)[:200]
 
 
 def plain_text(segments: list[Segment]) -> str:
