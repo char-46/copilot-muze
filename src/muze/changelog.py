@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.181",
+        "date": "2026-11-08",
+        "changes": [
+            "分享卡片可读化（用户方向 2026-11-08：读到发给机器人的分享卡片即可结束相应待办）：light_app 小程序卡的文本投影重写——旧提取器只扫 meta_data/metaData/extra 且两条 URL 复本把 200 字预算吃光、标题反被挤掉（实测秀米图文卡 text_content 只剩乱码截断链接）；现在标题优先，附分享人 QQ（meta.news.uin）、预览版标记（in_preview/stage_ticket 即未正式发布）、非 URL 简介、限长链接。做梦日报与待办同步从此能读懂「谁分享了哪篇推文、是否预览版」，结单信号可用。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.180",
         "date": "2026-11-07",
         "changes": [
