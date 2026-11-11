@@ -32,6 +32,17 @@ from muze.config import RagEmbedding
 log = logging.getLogger("muze.llm")
 
 
+def _rss_gb() -> float:
+    """Current process RSS in GiB (-1 when unknown); logged on load failures
+    so allocator growth is visible in the log next time."""
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / 1024**3
+    except Exception:
+        return -1.0
+
+
 class Embedder:
     def __init__(self, cfg: RagEmbedding) -> None:
         self.cfg = cfg
@@ -121,8 +132,15 @@ class Embedder:
                     self._device = ""
                 await self._load_local(device, governor, full_threads=force)
         except Exception as e:  # surfaced again by embed(); keep it non-fatal
-            self._device = ""
-            log.warning("local embedding model load failed (%s): %s", device, e)
+            log.warning(
+                "local embedding model load failed (%s): %s (rss=%.2fG)",
+                device, e, _rss_gb(),
+            )
+            # a failed load must tear down completely: half-built models and
+            # allocator-cached blocks survived dozens of retries and grew the
+            # process to 8G RSS while every probe said "not loaded" (live
+            # 2026-11-10/11)
+            self._teardown_local()
 
     async def _load_local(self, device: str, governor=None, full_threads: bool = False) -> None:
         if governor is not None:
@@ -182,14 +200,32 @@ class Embedder:
         log.info("RAG embedder | fastembed model=%s providers=%s",
                  self.cfg.model, providers)
 
+    # ---------------------------------------------------------- teardown
+    def _teardown_local(self) -> None:
+        """Drop the model object and return torch caches to the OS. Setting
+        _local=None alone leaves allocator-cached host blocks behind (torch's
+        CPU allocator rarely returns them), so repeated load/unload cycles
+        ratchet RSS upward."""
+        self._local = None
+        self._device = ""
+        import gc
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def unload_if_idle(self, now: float | None = None) -> bool:
         if self._local is None or self.cfg.unload_idle_sec <= 0:
             return False
         now = now or time.time()
         if now - self._last_use < self.cfg.unload_idle_sec:
             return False
-        self._local = None
-        self._device = ""
+        self._teardown_local()
         log.info("RAG embedder unloaded after idle")
         return True
 
@@ -200,8 +236,7 @@ class Embedder:
         async with self._lock:
             if self._local is None:
                 return False
-            self._local = None
-            self._device = ""
+            self._teardown_local()
             log.info("RAG embedder force-unloaded by command")
             return True
 
@@ -236,8 +271,7 @@ class Embedder:
         async with self._lock:
             if self._local is None:
                 return None
-            self._local = None
-            self._device = ""
+            self._teardown_local()
             self._last_busy_unload = time.monotonic()
             log.info("RAG embedder unloaded under load (%s)", " & ".join(why))
             return " & ".join(why)
@@ -260,8 +294,7 @@ class Embedder:
             if self._local is None or self._device != "cuda":
                 return None
             if self.cfg.backend == "fastembed":
-                self._local = None
-                self._device = ""
+                self._teardown_local()
                 action = "unloaded"
             else:
                 await asyncio.to_thread(self._move_local, "cpu")
@@ -301,8 +334,7 @@ class Embedder:
         async with self._lock:
             if self._local is None:
                 return None
-            self._local = None
-            self._device = ""
+            self._teardown_local()
             self._last_busy_unload = time.monotonic()
             log.info("RAG embedder unloaded (on battery, no AC power)")
             return "battery"
@@ -470,18 +502,32 @@ class Embedder:
         return out
 
     # ---------------------------------------------------------- back-off
+    COOLDOWN_MAX_SEC = 6 * 3600.0  # escalating backoff ceiling
+
     def _ok(self) -> None:
         self._fails = 0
+        self._cooldown_streak = 0
         self._last_use = time.time()
 
     def _fail(self) -> None:
         self._fails += 1
         if self._fails >= max(1, int(self.cfg.max_retries)):
             self._fails = 0
-            self._cooldown_until = time.time() + float(self.cfg.cooldown_sec)
+            # ESCALATING cooldown: consecutive cooldowns double, up to 6h.
+            # The old flat 300s turned a day-long network outage into a
+            # 13-minute retry storm -- dozens of failed loads, each leaving
+            # allocator residue (live 2026-11-10: hf-mirror unreachable all
+            # day, load retried ~80 times, RSS 8G by morning).
+            streak = getattr(self, "_cooldown_streak", 0) + 1
+            self._cooldown_streak = streak
+            cd = min(
+                float(self.cfg.cooldown_sec) * (2 ** (streak - 1)),
+                self.COOLDOWN_MAX_SEC,
+            )
+            self._cooldown_until = time.time() + cd
             log.warning(
-                "local embedder cooling down for %.0fs after repeated failures",
-                self.cfg.cooldown_sec,
+                "local embedder cooling down for %.0fs after repeated failures (streak %s)",
+                cd, streak,
             )
 
     @property

@@ -780,6 +780,30 @@ async def clear_dream_posts(repo: Repository, date: str) -> None:
 # --------------------------------------------------------------------------
 # nightly flow: day catch-up + weekly/monthly rollups + memory pass
 # --------------------------------------------------------------------------
+def dream_summary_head(
+    *, ok_days: list, bad_days: list, stale, swept, rollups, profiled,
+    healed, target, new_memories,
+) -> str:
+    """The dream summary opener. Never claims 做梦完成 while days failed
+    (live 2026-11-11: the 02:36 relay storm failed one day, the digest header
+    still said 做梦完成 and the user read both phrases as a contradiction)."""
+    head = (
+        (
+            f"做梦完成：补做 {len(ok_days)} 天"
+            if not bad_days
+            else f"做梦部分完成：补做 {len(ok_days)} 天，失败 {len(bad_days)} 天"
+            f"（{'、'.join(bad_days)}，明晚自动补做）"
+        )
+        + (f"，其中 {len(stale)} 天为档案补齐后重做" if stale else "")
+        + (f"，完成度检查 {swept} 条变动" if swept else "")
+        + (f"，新增 {', '.join(rollups)}" if rollups else "")
+        + (f"，档案更新 {profiled} 个" if profiled else "")
+        + (f"，补跑收尾（{target}：{'、'.join(healed)}）" if healed else "")
+        + f"，新记忆 {new_memories} 条。\n\n"
+    )
+    return head
+
+
 async def dream_night(
     repo: Repository,
     llm,
@@ -939,14 +963,11 @@ async def dream_night(
         except Exception:
             log.exception("memory pass failed")
 
-    head = (
-        f"做梦完成：补做 {len(reports)} 天"
-        + (f"，其中 {len(stale)} 天为档案补齐后重做" if stale else "")
-        + (f"，完成度检查 {swept} 条变动" if swept else "")
-        + (f"，新增 {', '.join(rollups)}" if rollups else "")
-        + (f"，档案更新 {profiled} 个" if profiled else "")
-        + (f"，补跑收尾（{target}：{'、'.join(healed)}）" if healed else "")
-        + f"，新记忆 {new_memories} 条。\n\n"
+    head = dream_summary_head(
+        ok_days=ok_dates,
+        bad_days=[d for d, r in reports if d not in ok_dates],
+        stale=stale, swept=swept, rollups=rollups, profiled=profiled,
+        healed=healed, target=target, new_memories=new_memories,
     )
     if not reports:
         return head + "（今日日梦已存在，仅补链周/月报告）"
