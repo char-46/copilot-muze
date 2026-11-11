@@ -327,6 +327,9 @@ class MilkyAdapter(ProtocolAdapter):
         )
         return SendMessageResult.model_validate(_send_result_data(data))
 
+    _FORWARD_FAIL_STRIKES = 2       # consecutive refusals before degrading
+    _FORWARD_REARM_SEC = 3600.0     # degraded: one probe attempt per hour
+
     async def send_forward_message(
         self,
         scene: str,
@@ -338,9 +341,25 @@ class MilkyAdapter(ProtocolAdapter):
         summary: str = "",
         prompt: str = "",
     ) -> SendMessageResult:
-        """Merged-forward chain (Milky v1.2+ outbound forward segment)."""
+        """Merged-forward chain (Milky v1.2+ outbound forward segment).
+
+        Degradation policy (live 2026-11-11: ONE network blip at 02:36 while
+        the relay flapped permanently killed merged sends -- every digest
+        after it arrived as separate chunk messages): a NETWORK failure says
+        nothing about the capability (delivery unknown; the never-double
+        policy upstream owns the follow-up) and must not degrade. An explicit
+        refusal only degrades after consecutive strikes, and the marker
+        re-arms for one probe per hour so a transient storm cannot disable
+        chains for the whole process lifetime."""
         if not self.caps.send_forward:
-            raise NotSupported("forward send marked unavailable on this protocol side")
+            now = time.monotonic()
+            if now - getattr(self, "_forward_degraded_at", 0.0) < self._FORWARD_REARM_SEC:
+                raise NotSupported("forward send marked unavailable on this protocol side")
+            self.caps.send_forward = True  # re-armed: this call is the probe
+            self.caps.notes = [
+                n for n in self.caps.notes if "forward send degraded" not in n
+            ]
+            self.caps.notes.append("forward send re-armed for a probe")
         seg = out_forward(
             nodes,
             user_id=self.self_id,
@@ -352,12 +371,22 @@ class MilkyAdapter(ProtocolAdapter):
         )
         try:
             if scene == "group":
-                return await self.send_group_message(peer_id, [seg])
-            return await self.send_private_message(peer_id, [seg])
+                res = await self.send_group_message(peer_id, [seg])
+            else:
+                res = await self.send_private_message(peer_id, [seg])
         except ProtocolError as e:
-            self.caps.send_forward = False
-            self._degrade(f"forward send degraded: {e}")
+            if not e.refused and "retcode=" not in str(e):
+                raise  # network-unknown: capability intact; send_text decides
+            self._forward_strikes = getattr(self, "_forward_strikes", 0) + 1
+            if self._forward_strikes >= self._FORWARD_FAIL_STRIKES:
+                self.caps.send_forward = False
+                self._forward_degraded_at = time.monotonic()
+                self._degrade(
+                    f"forward send degraded after {self._forward_strikes} refusals: {e}"
+                )
             raise NotSupported(str(e)) from e
+        self._forward_strikes = 0
+        return res
 
     async def send_file(self, scene: str, peer_id: int, path: str, name: str = "") -> str:
         """Real file delivery via the upload APIs (LLBot extension; Milky
