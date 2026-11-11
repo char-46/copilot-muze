@@ -1305,7 +1305,13 @@ class App:
         if self.adapter is not None:
             await _safe("adapter.close", self.adapter.close(), 5)
         if self.conn is not None:
-            # pooled connection: close only when the last sharer is gone
+            # pooled connection: close only when the last sharer is gone.
+            # NOTE: only evaluate conn.close() when we did NOT hand the
+            # connection off -- the call is an ARGUMENT to _safe, so it runs
+            # before _safe's try/except; after self.conn = None it raised
+            # AttributeError('NoneType' ... 'close') on every stop/restart of
+            # a shared-DB setup and run() reported the account task as
+            # crashed (issue #1, mattabate).
             entry = _DB_POOL.get(getattr(self, "_db_path", ""))
             if entry is not None:
                 entry["refs"] -= 1
@@ -1313,7 +1319,8 @@ class App:
                     self.conn = None  # someone else still uses it
                 else:
                     _DB_POOL.pop(self._db_path, None)
-            await _safe("conn.close", self.conn.close(), 5)
+            if self.conn is not None:
+                await _safe("conn.close", self.conn.close(), 5)
 
 
 RESTART_EXIT = 100  # daemon contract: rc=100 -> relaunch serve

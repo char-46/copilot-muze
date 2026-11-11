@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.183",
+        "date": "2026-11-11",
+        "changes": [
+            "修复 issue #1（mattabate 报告）：双账号实例共享同一池化 DB 连接时，先退出的实例把 self.conn 置 None（移交连接）后仍求值 self.conn.close() 作为 _safe(...) 的实参——实参求值发生在 _safe 的 try/except 之前，于是每次 stop/restart 都抛 AttributeError('NoneType' object has no attribute 'close')、run() 把账号任务报为 crashed。现在仅在连接未被移交时才调用 close（按报告者建议的修法），并补齐回归测试：先退出的分片不崩不关连接、最后退出的关连接并出池、私有连接照常关闭、shutdown 幂等。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.182",
         "date": "2026-11-11",
         "changes": [
