@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.185",
+        "date": "2026-11-19",
+        "changes": [
+            "清除仓库中的真实运维信息：scripts/deploy_wheel.ps1 自 a143 起硬编码真实跳板地址（root@中继域名）、盒子账号、端口与 webui token——现全部移入 gitignored 的 scripts/deploy_wheel.local.ps1（本机已生成，部署流程不变），脚本缺失该文件时报清晰错误；config.py 注释中的真实中继域名改为 relay.example.com；changelog/adapter 注释里第三方好友的完整 QQ 号打码为 3168646***；测试里的真实群号换成随机号。注意：git 历史中 a143 起的旧提交仍含上述端点信息，是否清洗历史另议。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.184",
         "date": "2026-11-19",
         "changes": [

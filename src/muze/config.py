@@ -370,7 +370,7 @@ class TunnelConfig(BaseModel):
     """
 
     enabled: bool = False
-    host: str = ""  # relay, e.g. relay.example.com
+    host: str = ""  # relay host, e.g. relay.example.com (never a real one)
     port: int = 22
     user: str = "root"
     key_file: str = ""  # default: <data_dir>/.ssh/muze_tunnel (create by hand)

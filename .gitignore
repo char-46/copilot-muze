@@ -22,6 +22,7 @@ htmlcov/
 # secrets
 config.yaml
 *.local.yaml
+scripts/deploy_wheel.local.ps1
 .env
 
 # os

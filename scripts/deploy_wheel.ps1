@@ -26,11 +26,19 @@ $ErrorActionPreference = "Stop"
 
 $SshKey  = "$env:USERPROFILE\.ssh\id_ed25519"
 $SshOpts = @("-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes")  # array: each token is its own argv
-$Jump    = "root@relay.example.com"
-$Box     = "box@127.0.0.1"
-$BoxPort = "18301"
-$BoxDir  = "D:/muze"
-$RelayApiBase = "http://127.0.0.1:18300/api"
+# Deployment endpoints (relay host, box account, webui token) are SECRETS:
+# they live in scripts\deploy_wheel.local.ps1 -- gitignored, never in the
+# repo (a real relay FQDN + token shipped here once and had to be scrubbed
+# from history). That file must set:
+#   $Jump, $Box, $BoxPort, $BoxDir, $RelayApiBase, $RelayToken
+$Local = Join-Path $PSScriptRoot "deploy_wheel.local.ps1"
+if (Test-Path $Local) { . $Local }
+foreach ($v in @("Jump", "Box", "BoxPort", "BoxDir", "RelayApiBase", "RelayToken")) {
+    $val = Get-Variable -Name $v -ValueOnly -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace("$val")) {
+        throw ("define ${v} in scripts\deploy_wheel.local.ps1 (gitignored)")
+    }
+}
 
 # ---- 1. resolve version (src/muze/version.py -> pyproject form) ----------
 if (-not $Version) {
@@ -110,12 +118,12 @@ Write-Host "[deploy] install ok"
 # ---- 4. flip via the box's own /restart API ------------------------------
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"text":"/restart"}'))
 Write-Host "[deploy] requesting /restart (graceful flip)"
-$null = ssh -o BatchMode=yes $Jump "echo $b64 | base64 -d | curl -s -m 20 -X POST '$RelayApiBase/command?token=LOCAL_TOKEN' --data @- -H Content-Type:application/json"
+$null = ssh -o BatchMode=yes $Jump "echo $b64 | base64 -d | curl -s -m 20 -X POST '$RelayApiBase/command?token=$RelayToken' --data @- -H Content-Type:application/json"
 
 # ---- 5. wait and verify ---------------------------------------------------
 Write-Host "[deploy] waiting 85s for boot + schema migration..."
 Start-Sleep -Seconds 85
-$info = ssh -o BatchMode=yes $Jump "curl -s -m 12 '$RelayApiBase/info?token=LOCAL_TOKEN'" 2>$null |
+$info = ssh -o BatchMode=yes $Jump "curl -s -m 12 '$RelayApiBase/info?token=$RelayToken'" 2>$null |
     Select-Object -First 1
 if (-not $info) { throw "no /api/info response" }
 # the box reports the version.py form (0.1.0-alpha.144); accept both it and
