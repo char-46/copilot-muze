@@ -414,10 +414,17 @@ async def test_done_batch_closes_multiple_with_one_note(svc):
     for r in await repo.recently_closed(5):
         assert r["close_note"] == "已发老师审"
 
-    # batch without a note is rejected -- a bare multi-close is how details
-    # get lost
-    out = await service.run_command("done 1 3", ctx)
-    assert out.is_error and "备注" in out.text
+    # batch without a note still CLOSES -- the note is a nudge in the reply,
+    # never a gate (user feedback 2026-11-19: 手动done不应该被阻止)
+    await repo.add_followup("", "事项丁", "", "dream:d1", "2026-10-30")
+    await repo.add_followup("", "事项戊", "", "dream:d1", "2026-10-30")
+    await service.run_command("todo", ctx)  # #1=丙 #2=丁 #3=戊
+    out = await service.run_command("done 1 2 3", ctx)
+    assert not out.is_error
+    assert "事项丁" in out.text and "事项戊" in out.text and "备注" in out.text
+    assert not await repo.list_followups()  # everything closed, nothing blocked
+    by_title = {r["title"]: r for r in await repo.recently_closed(10)}
+    assert not by_title["事项丁"]["close_note"] and not by_title["事项戊"]["close_note"]
 
 
 async def test_done_batch_is_atomic_on_unknown_number(svc):

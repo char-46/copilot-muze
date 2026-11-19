@@ -14,6 +14,13 @@ wording (what changed for the USER and for YOU, the model), short.
 
 RELEASE_NOTES: list[dict] = [
     {
+        "version": "0.1.0-alpha.184",
+        "date": "2026-11-19",
+        "changes": [
+            "手动批量结单不再强制备注（用户反馈 2026-11-19：手动done不应该被阻止）：此前 /done 3 5 不带备注会被硬拦截报「批量结单请带备注说明结果」，把合法的手动结单挡在门外；现在照常结单，仅在回复里轻提示「下次可 /done 3 5 已发布到公众号 顺带说明结果」。带备注的行为不变：备注仍随关闭入库，进 /todo 最近完成与日报。",
+        ],
+    },
+    {
         "version": "0.1.0-alpha.183",
         "date": "2026-11-11",
         "changes": [

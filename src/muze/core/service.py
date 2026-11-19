@@ -1404,7 +1404,9 @@ class ControlService:
         # leading number tokens (3, 3.1) are targets; the remaining free
         # text is the closure note ("已发布", 交接去向) and is stored with
         # the closure so collaborators see the DETAILS (user feedback
-        # 2026-10-31: 他不知道什么活动的稿子发布了)
+        # 2026-10-31: 他不知道什么活动的稿子发布了). The note stays a
+        # NUDGE, never a gate: a manual batch /done without one must still
+        # close (user feedback 2026-11-19: 手动done不应该被阻止).
         note = ""
         nums: list[str] = []
         for i, a in enumerate(args):
@@ -1414,8 +1416,6 @@ class ControlService:
                 note = " ".join(args[i:]).strip()
                 break
         if nums:
-            if not note and len(nums) > 1:
-                return CommandOutcome.err("批量结单请带备注说明结果（/done 3 5 已发布到公众号）")
             # two phases: resolve EVERY number first, close only when all
             # resolve -- a mid-batch miss must not leave half the batch done
             targets: list[dict] = []
@@ -1439,6 +1439,8 @@ class ControlService:
                 lines.append(f"- 已完成: {target['title']}{tag}")
             if note:
                 lines.append(f"备注: {note}")
+            elif len(targets) > 1:
+                lines.append("（本次未带备注；下次可 /done 3 5 已发布到公众号 顺带说明结果）")
             lines.append("（明早日报不再跟它）")
             return CommandOutcome("\n".join(lines))
         q = " ".join(args)
